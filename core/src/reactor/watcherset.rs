@@ -343,8 +343,7 @@ mod tests {
         let path = PropertyPath::registered(property, "data", vec!["nested".into(), "key".into()]);
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([3; 32]));
         let pending = LocalTrxEntity::new(
-            None,
-            proto::AuthorId::Unknown,
+            proto::Identity::Ed25519([1; 32]),
             CatalogEpoch::allocate(),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );

@@ -1,5 +1,5 @@
 use super::*;
-use ankurah_proto::{AuthorId, EventId, EventStructureError};
+use ankurah_proto::{EventId, EventStructureError, Identity};
 use std::sync::Mutex;
 
 /// Serves the staged event and records attempts to read any other history.
@@ -31,10 +31,10 @@ impl GetEvents for IncomingOnlyGetter {
 /// A direct extension checks every parent's generation without reading their payloads.
 #[tokio::test]
 async fn an_update_checks_each_parent_without_reading_its_event() -> anyhow::Result<()> {
-    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
-    let older = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
-    let sibling = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
-    let newer = Event::update(genesis.entity_id, Clock::singleton(&sibling), AuthorId::Unknown, OperationSet::default());
+    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let older = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
+    let sibling = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
+    let newer = Event::update(genesis.entity_id, Clock::singleton(&sibling), OperationSet::default());
     // An accepted snapshot supplies the two tip generations without retaining their events.
     let head = Clock::from_events([&older, &newer]);
     let state = EntityState::empty();
@@ -45,7 +45,6 @@ async fn an_update_checks_each_parent_without_reading_its_event() -> anyhow::Res
         let update = Event::update(
             genesis.entity_id,
             Clock::new(vec![(claimed, older.id()), (newer.generation(), newer.id())])?,
-            AuthorId::Unknown,
             OperationSet::default(),
         );
         assert_eq!(update.generation(), 4);
@@ -63,14 +62,14 @@ async fn an_update_checks_each_parent_without_reading_its_event() -> anyhow::Res
         assert_eq!(state.head(), head);
     }
 
-    let honest = Event::update(genesis.entity_id, head, AuthorId::Unknown, OperationSet::default());
+    let honest = Event::update(genesis.entity_id, head, OperationSet::default());
     assert_eq!(state.apply_events(&IncomingOnlyGetter::new(&honest), &[&honest]).await?, vec![true]);
     Ok(())
 }
 
 #[tokio::test]
 async fn equal_snapshot_rejects_conflicting_generations_without_changing_state() -> anyhow::Result<()> {
-    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
     let state = EntityState::empty();
     state.set_head(Clock::singleton(&genesis));
     let before = state.to_state()?;
@@ -141,15 +140,11 @@ impl GetEvents for ServedGetter {
 /// concurrent update within the bound still applies.
 #[tokio::test]
 async fn an_update_claiming_more_than_one_above_the_head_is_refused_before_any_read() -> anyhow::Result<()> {
-    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
-    let tip = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
-    let forged = Event::update(
-        genesis.entity_id,
-        Clock::new(vec![(tip.generation(), tip.id()), (1000, genesis.id())])?,
-        AuthorId::Unknown,
-        OperationSet::default(),
-    );
-    let concurrent = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
+    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let tip = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
+    let forged =
+        Event::update(genesis.entity_id, Clock::new(vec![(tip.generation(), tip.id()), (1000, genesis.id())])?, OperationSet::default());
+    let concurrent = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
     assert_eq!((tip.generation(), forged.generation(), concurrent.generation()), (2, 1001, 2));
 
     let served = ServedGetter::of(&[&genesis, &tip, &forged, &concurrent]);
@@ -180,10 +175,10 @@ async fn an_update_claiming_more_than_one_above_the_head_is_refused_before_any_r
 /// the chain is applied link by link, which then brings the head to it.
 #[tokio::test]
 async fn an_update_above_a_lagging_head_is_refused_until_its_chain_is_applied() -> anyhow::Result<()> {
-    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
-    let first = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
-    let second = Event::update(genesis.entity_id, Clock::singleton(&first), AuthorId::Unknown, OperationSet::default());
-    let third = Event::update(genesis.entity_id, Clock::singleton(&second), AuthorId::Unknown, OperationSet::default());
+    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let first = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
+    let second = Event::update(genesis.entity_id, Clock::singleton(&first), OperationSet::default());
+    let third = Event::update(genesis.entity_id, Clock::singleton(&second), OperationSet::default());
     assert_eq!(third.generation(), 4);
 
     let served = ServedGetter::of(&[&genesis, &first, &second, &third]);
@@ -203,16 +198,15 @@ async fn an_update_above_a_lagging_head_is_refused_until_its_chain_is_applied() 
 #[tokio::test]
 async fn multi_layer_application_advances_head_only_after_success() -> anyhow::Result<()> {
     // G -> A -> B -> C; G -> X -> Y. Start at [A, Y], then apply B and C together.
-    let g = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
-    let a = Event::update(g.entity_id, Clock::singleton(&g), AuthorId::Unknown, OperationSet::default());
-    let b = Event::update(g.entity_id, Clock::singleton(&a), AuthorId::Unknown, OperationSet::default());
-    let c = Event::update(g.entity_id, Clock::singleton(&b), AuthorId::Unknown, OperationSet::default());
-    let x = Event::update(g.entity_id, Clock::singleton(&g), AuthorId::Unknown, OperationSet::default());
-    let y = Event::update(g.entity_id, Clock::singleton(&x), AuthorId::Unknown, OperationSet::default());
+    let g = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let a = Event::update(g.entity_id, Clock::singleton(&g), OperationSet::default());
+    let b = Event::update(g.entity_id, Clock::singleton(&a), OperationSet::default());
+    let c = Event::update(g.entity_id, Clock::singleton(&b), OperationSet::default());
+    let x = Event::update(g.entity_id, Clock::singleton(&g), OperationSet::default());
+    let y = Event::update(g.entity_id, Clock::singleton(&x), OperationSet::default());
     let invalid = Event::update(
         g.entity_id,
         Clock::singleton(&b),
-        AuthorId::Unknown,
         OperationSet::from_backends(BTreeMap::from([("missing".into(), vec![ankurah_proto::BackendOperation { diff: vec![] }])])),
     );
     let served = ServedGetter::of(&[&g, &a, &b, &c, &x, &y, &invalid]);

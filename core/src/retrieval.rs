@@ -9,6 +9,7 @@ use crate::internal::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::node::event_admissibility::read_operations;
 use crate::storage::StorageTransaction;
 use crate::util::Iterable;
 use ankurah_proto::{Attested, EntityId, Event, EventId};
@@ -145,17 +146,27 @@ where
 }
 
 /// The event in a peer's `GetEvents` response that actually answers a request
-/// for `event_id`: one that recomputes to the id asked for and is structurally
-/// well formed.
+/// for `event_id`: one that recomputes to the id asked for, is structurally
+/// well formed, and carries only operations this build can read. An answer of
+/// which every such event holds an unreadable operation is refused as unreadable.
 ///
-/// Both are the peer's word rather than ours. An event that derives some other
+/// All three are the peer's word rather than ours. An event that derives some other
 /// id does not answer this request, and caching it under the requested id would
 /// make every later reader of that id read the wrong event. A malformed one --
 /// a genesis whose content derives a different id, a genesis carrying a parent
 /// clock, an update carrying none -- would reach the DAG layers, where its
-/// backend diffs and its membership are applied to the requesting entity.
-fn answering_event(peer_events: Vec<Attested<Event>>, event_id: &EventId) -> Option<Attested<Event>> {
-    peer_events.into_iter().find(|event| event.payload.id() == *event_id && event.payload.validate_structure().is_ok())
+/// backend diffs and its membership are applied to the requesting entity. One
+/// holding an operation this build cannot read could never apply, and storing it
+/// would leave the entity silently stale.
+fn answering_event(peer_events: Vec<Attested<Event>>, event_id: &EventId) -> Result<Attested<Event>, RetrievalError> {
+    let mut unreadable = None;
+    for event in peer_events.into_iter().filter(|event| event.payload.id() == *event_id && event.payload.validate_structure().is_ok()) {
+        match read_operations(&event.payload) {
+            Ok(_) => return Ok(event),
+            Err(cause) => unreadable = unreadable.or(Some(cause)),
+        }
+    }
+    Err(unreadable.map_or_else(|| RetrievalError::EventNotFound(event_id.clone()), RetrievalError::UnreadableOperation))
 }
 
 #[async_trait]
@@ -193,7 +204,7 @@ where
                 // together with the ignored coverage in
                 // tests/tests/adversarial_wire.rs, and membership
                 // admissibility at BFS time is identity-02's.
-                let event = answering_event(peer_events, event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))?;
+                let event = answering_event(peer_events, event_id)?;
                 let mut transaction = self.node.storage.transaction();
                 transaction.add_events(std::slice::from_ref(&event)).await?;
                 self.node.lifecycle.begin_storage_write()?.commit(transaction).await?.committed()?;
@@ -245,7 +256,7 @@ impl<SE: StorageEngine> GetState for LocalStateGetter<SE> {
 mod tests {
     use super::*;
     use crate::test_utils::TestStorage;
-    use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, Event, EventId, OperationSet};
+    use ankurah_proto::{AttestationSet, Attested, CarriedOperations, Clock, EntityId, Event, EventId, OperationSet};
     use std::sync::Arc;
 
     /// Create a test genesis with a deterministic content-hashed ID.
@@ -259,10 +270,10 @@ mod tests {
         let mut nonce = [0u8; 32];
         nonce[0] = seed;
 
-        let author = ankurah_proto::AuthorId::Unknown;
-        let operations = OperationSet::default();
-        let entity_id = EntityId::from(EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
-        let body = ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations };
+        let minter = ankurah_proto::Identity::Ed25519([seed; 32]);
+        let operations = CarriedOperations::encode(&OperationSet::default());
+        let entity_id = EntityId::from(EventId::from_genesis_parts(&minter, &nonce, 0, &operations));
+        let body = ankurah_proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations };
         Event { entity_id, body, parent: Clock::default() }
     }
 
@@ -349,5 +360,45 @@ mod tests {
 
         let ephemeral_getter = LocalEventGetter::new(collection, false);
         assert!(!ephemeral_getter.storage_is_definitive(), "Ephemeral getter should report storage as non-definitive");
+    }
+
+    /// A peer's answer holding an operation this build cannot read is refused with the typed error,
+    /// though its id matches, so the getter neither returns nor stores it.
+    #[test]
+    fn a_peer_event_holding_an_operation_this_build_cannot_read_is_refused() {
+        let event = make_test_event(4);
+        assert!(answering_event(vec![event.clone().into()], &event.id()).is_ok());
+
+        let mut unreadable = event.clone();
+        let ankurah_proto::EventBody::Genesis { operations, .. } = &mut unreadable.body else { unreachable!("a test genesis") };
+        // Variant index 2, which no build of `Operation` defines yet.
+        operations.0.push(ankurah_proto::CarriedOperation::Bytes(vec![2, 0, 0, 0]));
+        let unreadable = Event { entity_id: EntityId::from(unreadable.id()), ..unreadable };
+        unreadable.validate_structure().expect("the unreadable genesis still derives the id it names");
+        assert!(matches!(
+            answering_event(vec![unreadable.clone().into()], &unreadable.id()),
+            Err(RetrievalError::UnreadableOperation(ankurah_proto::UnreadableOperation::UnknownKind { indices })) if indices == [2]
+        ));
+        assert!(matches!(answering_event(vec![], &unreadable.id()), Err(RetrievalError::EventNotFound(_))));
+    }
+
+    /// An event whose operation's bytes were erased has the id of the event that still carries them,
+    /// so a peer may answer with both; the readable one answers.
+    #[test]
+    fn a_readable_answer_is_preferred_to_one_with_the_same_id_holding_an_erased_operation() {
+        let membership = ankurah_proto::Operation::Membership(ankurah_proto::Membership::Add(ankurah_proto::ModelId::EntityId(
+            EntityId::from_bytes([6; 32]),
+        )));
+        let readable = Event::genesis(ankurah_proto::Identity::Ed25519([6; 32]), OperationSet(vec![membership]));
+        let mut erased = readable.clone();
+        let ankurah_proto::EventBody::Genesis { operations, .. } = &mut erased.body else { unreachable!("a genesis") };
+        operations.0[0] = ankurah_proto::CarriedOperation::Erased(operations.0[0].digest());
+        assert_eq!(erased.id(), readable.id());
+        let answer = answering_event(vec![erased.clone().into(), readable.clone().into()], &readable.id()).unwrap();
+        assert_eq!(answer.payload, readable);
+        assert!(matches!(
+            answering_event(vec![erased.into()], &readable.id()),
+            Err(RetrievalError::UnreadableOperation(ankurah_proto::UnreadableOperation::Erased))
+        ));
     }
 }

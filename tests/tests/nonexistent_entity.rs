@@ -41,7 +41,6 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     let fake_update = proto::Event::update(
         EntityId::random(),
         proto::Clock::genesis(proto::EventId::from_bytes([1u8; 32])),
-        proto::AuthorId::Unknown,
         proto::OperationSet::default(),
     );
 
@@ -86,8 +85,7 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
     // content no longer derives the id it names.
     let album_model = server.catalog.model_id_for("album")?.expect("Album registered by the create above");
     let mut fake_create = proto::Event::genesis(
-        None,
-        proto::AuthorId::Unknown,
+        server.identity(),
         proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(album_model))]),
     );
     fake_create.entity_id = existing_id;

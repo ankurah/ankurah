@@ -5,7 +5,7 @@ use ankurah::core::{
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::Value,
 };
-use ankurah::proto::{Attested, AuthorId, Clock, EntityId, EntityState, Event, EventId, ModelId, State, StateBuffers};
+use ankurah::proto::{Attested, Clock, EntityId, EntityState, Event, EventId, ModelId, State, StateBuffers};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -250,7 +250,7 @@ async fn a_stored_update_event_reads_back_unchanged() -> anyhow::Result<()> {
     let engine = IndexedDBStorageEngine::open(&db_name).await?;
     // Storage preserves the event as given; admission is the caller's responsibility.
     let parent = Clock::genesis(EventId::from_bytes([0x92; 32]));
-    let event = Attested::opt(Event::update(entity_id(0x91), parent, AuthorId::Unknown, Default::default()), None);
+    let event = Attested::opt(Event::update(entity_id(0x91), parent, Default::default()), None);
     let mut transaction = engine.transaction();
     transaction.add_events(std::slice::from_ref(&event)).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));

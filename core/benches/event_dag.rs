@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use ankurah_core::bench_support::{compare, prepare_layers, topo_sort_events, AbstractCausalRelation, DEFAULT_BUDGET};
 use ankurah_core::error::RetrievalError;
 use ankurah_core::retrieval::GetEvents;
-use ankurah_proto::{Attested, AuthorId, Clock, EntityId, Event, EventBody, EventId, OperationSet};
+use ankurah_proto::{Attested, CarriedOperations, Clock, EntityId, Event, EventBody, EventId, Identity, OperationSet};
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
@@ -74,11 +74,11 @@ fn event(seed: u32, parent: Clock) -> Event {
     entity_id_bytes[0..4].copy_from_slice(&seed.to_be_bytes());
     let mut nonce = [0u8; 32];
     nonce[0..4].copy_from_slice(&seed.to_be_bytes());
-    let operations = OperationSet::from_backends(BTreeMap::new());
+    let operations = CarriedOperations::encode(&OperationSet::from_backends(BTreeMap::new()));
     let body = if parent.is_empty() {
-        EventBody::Genesis { system: None, nonce, timestamp: 0, author: AuthorId::Unknown, operations }
+        EventBody::Genesis { minter: Identity::Ed25519([0; 32]), nonce, timestamp: 0, operations }
     } else {
-        EventBody::Update { nonce, timestamp: 0, author: AuthorId::Unknown, operations }
+        EventBody::Update { nonce, timestamp: 0, operations }
     };
     Event { entity_id: EntityId::from_bytes(entity_id_bytes), parent, body }
 }

@@ -66,6 +66,9 @@ pub enum RetrievalError {
     MissingComponent { entity_id: EntityId, model_id: ModelId },
     #[error("Event not found: {0:?}")]
     EventNotFound(EventId),
+    /// The event carries an operation this build cannot read, so it is refused rather than stored unapplied.
+    #[error("unreadable event: {0}")]
+    UnreadableOperation(ankurah_proto::UnreadableOperation),
     #[error(transparent)]
     EventStructure(#[from] ankurah_proto::EventStructureError),
     #[error("Storage error: {0}")]
@@ -115,6 +118,10 @@ impl From<NodeReadinessError> for RetrievalError {
             NodeReadinessError::Halted(reason) => Self::NodeHalted(reason),
         }
     }
+}
+
+impl From<ankurah_proto::UnreadableOperation> for RetrievalError {
+    fn from(err: ankurah_proto::UnreadableOperation) -> Self { RetrievalError::UnreadableOperation(err) }
 }
 
 impl From<RequestError> for RetrievalError {
@@ -250,6 +257,9 @@ pub enum MutationError {
     InvalidEvent,
     #[error("malformed event: {0}")]
     EventStructure(ankurah_proto::EventStructureError),
+    /// The event carries an operation this build cannot read, so it is refused rather than stored unapplied.
+    #[error("unreadable event: {0}")]
+    UnreadableOperation(ankurah_proto::UnreadableOperation),
     #[error("inadmissible event: {0}")]
     InadmissibleEvent(InadmissibleEvent),
     /// A commit-path invariant about an event's provenance, as opposed to
@@ -295,6 +305,10 @@ impl From<NodeReadinessError> for MutationError {
 
 impl From<ankurah_proto::EventStructureError> for MutationError {
     fn from(err: ankurah_proto::EventStructureError) -> Self { MutationError::EventStructure(err) }
+}
+
+impl From<ankurah_proto::UnreadableOperation> for MutationError {
+    fn from(err: ankurah_proto::UnreadableOperation) -> Self { MutationError::UnreadableOperation(err) }
 }
 
 impl From<InadmissibleEvent> for MutationError {
@@ -372,6 +386,7 @@ impl From<RetrievalError> for MutationError {
             RetrievalError::NodeHalted(error) => MutationError::NodeHalted(error),
             RetrievalError::AccessDenied(a) => MutationError::AccessDenied(a),
             RetrievalError::EventStructure(error) => MutationError::EventStructure(error),
+            RetrievalError::UnreadableOperation(error) => MutationError::UnreadableOperation(error),
             _ => MutationError::RetrievalError(err),
         }
     }

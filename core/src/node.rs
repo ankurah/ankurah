@@ -287,6 +287,9 @@ where
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
 
+    /// The identity this node mints under.
+    pub fn identity(&self) -> proto::Identity { self.id.identity() }
+
     /// Build our handshake identity; a halted node has none.
     pub async fn presence(&self) -> Result<proto::Presence, NodeHaltReason> {
         self.lifecycle.check_not_halted()?;

@@ -239,9 +239,23 @@ impl<'de> Deserialize<'de> for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
     use ed25519_dalek::Signer;
 
     fn identity_of(key: &ed25519_dalek::SigningKey) -> Identity { Identity::Ed25519(key.verifying_key().to_bytes()) }
+
+    /// Every genesis hashes its minter's binary encoding, so the variant index
+    /// and the byte layout are pinned here: a change fails this test rather
+    /// than silently re-deriving every entity id.
+    #[test]
+    fn identity_encodings_are_pinned() {
+        let identity = Identity::Ed25519([7; 32]);
+        assert_eq!(encode(&identity), [0u32.to_le_bytes().as_slice(), &[7; 32]].concat());
+        assert_eq!(decode_exact::<Identity>(&encode(&identity)).unwrap(), identity);
+
+        let node = NodeId::from(identity);
+        assert_eq!(encode(&node), [0u32.to_le_bytes().as_slice(), &[7; 32]].concat(), "a node id encodes as its identity");
+    }
 
     /// The text form names the scheme, so a key of a later scheme can never be read as an ed25519 key.
     #[test]
@@ -268,6 +282,24 @@ mod tests {
         );
         assert!(matches!("ed25519:AQIDBAUGBwgJCgsMDQ4PEA".parse::<Identity>(), Err(DecodeError::InvalidLength)));
         assert!(serde_json::from_str::<Identity>("\"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc\"").is_err());
+    }
+
+    #[test]
+    fn signature_encodings_are_pinned() {
+        let mut bytes = [0u8; 64];
+        bytes.iter_mut().enumerate().for_each(|(index, byte)| *byte = index as u8);
+        let signature = Signature::Ed25519(bytes);
+        let encoded = encode(&signature);
+        assert_eq!(encoded, [0u32.to_le_bytes().as_slice(), &bytes].concat());
+        assert_eq!(decode_exact::<Signature>(&encoded).unwrap(), signature);
+
+        let text = "ed25519:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw";
+        assert_eq!(signature.to_string(), text);
+        assert_eq!(text.parse::<Signature>().unwrap(), signature);
+        assert_eq!(serde_json::to_string(&signature).unwrap(), format!("\"{text}\""));
+        assert_eq!(serde_json::from_str::<Signature>(&format!("\"{text}\"")).unwrap(), signature);
+        assert!(matches!(text["ed25519:".len()..].parse::<Signature>(), Err(DecodeError::MissingScheme)));
+        assert!(matches!(text.replacen("ed25519", "rsa", 1).parse::<Signature>(), Err(DecodeError::UnknownScheme(_))));
     }
 
     #[test]

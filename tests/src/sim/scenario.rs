@@ -63,7 +63,7 @@ impl<'a> Workload<'a> {
     /// it to all other nodes through the scheduler, and return its id. The id
     /// is deterministic (seed-derived counter).
     pub async fn create_at(&mut self, origin: usize, field: Field, value: &str) -> proto::EntityId {
-        let event = model::genesis_event(self.next_entity, field, value);
+        let event = model::genesis_event(self.nodes[origin].node.identity(), self.next_entity, field, value);
         let id = event.entity_id;
         self.next_entity += 1;
 

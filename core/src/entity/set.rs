@@ -132,7 +132,7 @@ mod tests {
         property::backend::LWWBackend,
         value::Value,
     };
-    use ankurah_proto::{AuthorId, Clock, EventId, PropertyId};
+    use ankurah_proto::{Clock, EventId, PropertyId};
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
         let fresh = Entity::from_resident(replacement.get_or_insert_state(id, &state)?.1);
         assert_ne!(resident, fresh);
         assert_ne!(resident.catalog_epoch(), fresh.catalog_epoch());
-        let fork = LocalTrxEntity::edit(&resident, AuthorId::Unknown, Arc::new(AtomicBool::new(true)))?;
+        let fork = LocalTrxEntity::edit(&resident, Arc::new(AtomicBool::new(true)))?;
         drop(resident);
         assert!(original.get(&id).is_some());
         drop(fork);

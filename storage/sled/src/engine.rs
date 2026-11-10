@@ -139,7 +139,7 @@ impl StorageEngine for SledStorageEngine {
             let mut events = Vec::new();
             for event_id in event_ids {
                 if let Some(bytes) = database.events_tree.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
-                    events.push(bincode::deserialize(bytes.as_ref())?);
+                    events.push(Attested::<Event>::decode(bytes.as_ref()).map_err(RetrievalError::storage)?);
                 }
             }
             Ok::<_, RetrievalError>(events)
@@ -153,7 +153,7 @@ impl StorageEngine for SledStorageEngine {
             let mut events = Vec::new();
             for item in database.events_tree.iter() {
                 let (_, bytes) = item.map_err(SledRetrievalError::StorageError)?;
-                let event: Attested<Event> = bincode::deserialize(bytes.as_ref())?;
+                let event = Attested::<Event>::decode(bytes.as_ref()).map_err(RetrievalError::storage)?;
                 if event.payload.entity_id == entity_id {
                     events.push(event);
                 }

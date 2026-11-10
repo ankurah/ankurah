@@ -531,7 +531,7 @@ fn decode_event_row((entity_id, body, parent, attestations): RawEventRow) -> Res
     Ok(Attested {
         payload: Event {
             entity_id,
-            body: bincode::deserialize::<EventBody>(&body).map_err(RetrievalError::storage)?,
+            body: EventBody::decode(&body).map_err(RetrievalError::storage)?,
             parent: serde_json::from_str(&parent).map_err(RetrievalError::storage)?,
         },
         attestations: bincode::deserialize(&attestations).map_err(RetrievalError::storage)?,
@@ -968,8 +968,7 @@ mod tests {
         let mut events = Vec::new();
         let mut writes = Vec::new();
         for old in &initial {
-            let event =
-                Event::update(old.payload.entity_id, old.payload.state.head.clone(), ankurah_proto::AuthorId::Unknown, Default::default());
+            let event = Event::update(old.payload.entity_id, old.payload.state.head.clone(), Default::default());
             let mut state = state_with_strings(old.payload.entity_id, 3, &[(property, "after")]);
             state.payload.state.head = Clock::singleton(&event);
             events.push(Attested::opt(event, None));

@@ -39,7 +39,13 @@ pub fn apply_backend_event(backend: &dyn crate::property::backend::PropertyBacke
         async fn event_stored(&self, _: &proto::EventId) -> Result<bool, RetrievalError> { Ok(false) }
     }
     async {
-        let layers = crate::event_dag::EventLayers::prepare(&Incoming(event), &[event], &event.parent).await?;
+        let layers = crate::event_dag::EventLayers::prepare(
+            &Incoming(event),
+            &[event],
+            &event.parent,
+            &crate::node::event_admissibility::AdmittedOperations::new(),
+        )
+        .await?;
         for layer in layers.layers() {
             backend.apply_layer(layer)?;
         }
@@ -52,17 +58,17 @@ pub fn apply_backend_event(backend: &dyn crate::property::backend::PropertyBacke
 /// Commit a backend's staged fixture values under a deterministic genesis event.
 /// Storage tests can use the returned event's clock when constructing a snapshot.
 pub fn commit_backend<B: crate::property::backend::PropertyBackend>(backend: &B, seed: u8) -> Result<proto::Event, MutationError> {
-    let operations = proto::OperationSet::from_backends(std::collections::BTreeMap::from([(
+    let operations = proto::CarriedOperations::encode(&proto::OperationSet::from_backends(std::collections::BTreeMap::from([(
         B::property_backend_name().to_owned(),
         backend.to_operations()?.unwrap_or_default(),
-    )]));
+    )])));
+    let minter = proto::Identity::Ed25519([seed; 32]);
     let nonce = [seed; 32];
-    let author = proto::AuthorId::Unknown;
-    let entity_id = proto::EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations).into();
+    let entity_id = proto::EventId::from_genesis_parts(&minter, &nonce, 0, &operations).into();
     let event = proto::Event {
         entity_id,
         parent: proto::Clock::default(),
-        body: proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations },
+        body: proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations },
     };
     apply_backend_event(backend, &event)?;
     Ok(event)

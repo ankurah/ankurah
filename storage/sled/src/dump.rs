@@ -85,7 +85,7 @@ fn event_page(mut entries: sled::Iter) -> Result<(sled::Iter, Vec<StorageDumpIte
     let mut page = Vec::new();
     for entry in entries.by_ref().take(PAGE_SIZE) {
         let (key, bytes) = entry.map_err(sled_error)?;
-        let event = bincode::deserialize::<Attested<Event>>(&bytes)?;
+        let event = Attested::<Event>::decode(&bytes).map_err(RetrievalError::storage)?;
         let payload_id = event.payload.id();
         if key.as_ref() != payload_id.as_bytes() {
             return Err(key_mismatch("event", key.as_ref(), payload_id.as_bytes()));
@@ -118,7 +118,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use ankurah_core::storage::StorageDump;
-    use ankurah_proto::{AttestationSet, AuthorId, OperationSet, State};
+    use ankurah_proto::{AttestationSet, Identity, OperationSet, State};
     use futures::{pin_mut, StreamExt};
 
     use super::*;
@@ -126,12 +126,14 @@ mod tests {
     #[tokio::test]
     async fn dump_identifies_both_sides_of_an_event_key_mismatch() -> anyhow::Result<()> {
         let storage = SledStorageEngine::new_test()?;
-        let event =
-            Attested { payload: Event::genesis(None, AuthorId::Unknown, OperationSet::default()), attestations: AttestationSet::default() };
+        let event = Attested {
+            payload: Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default()),
+            attestations: AttestationSet::default(),
+        };
         let stored_key = vec![0xab; event.payload.id().as_bytes().len()];
         {
             let database = storage.database.lock().unwrap();
-            database.events_tree.insert(&stored_key, bincode::serialize(&event)?)?;
+            database.events_tree.insert(&stored_key, event.encode())?;
         }
 
         let items = storage.dump().await?;
@@ -156,13 +158,13 @@ mod tests {
             let database = storage.database.lock().unwrap();
             for _ in 0..RECORDS {
                 let event = Attested {
-                    payload: Event::genesis(None, AuthorId::Unknown, OperationSet::default()),
+                    payload: Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default()),
                     attestations: AttestationSet::default(),
                 };
                 let entity_id = event.payload.entity_id;
                 let state =
                     Attested { payload: EntityState { entity_id, state: State::default() }, attestations: AttestationSet::default() };
-                database.events_tree.insert(event.payload.id().as_bytes(), bincode::serialize(&event)?)?;
+                database.events_tree.insert(event.payload.id().as_bytes(), event.encode())?;
                 let (_, fragment) = state.to_parts();
                 database.entities_tree.insert(entity_id.to_bytes(), bincode::serialize(&fragment)?)?;
                 expected_events.insert(event.payload.id());

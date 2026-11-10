@@ -21,8 +21,7 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
         // A well-formed genesis, so the refusal comes from the protected
         // collection rule rather than from structural validation.
         let event = proto::Event::genesis(
-            Some(EntityId::random()),
-            proto::AuthorId::Unknown,
+            proto::Identity::Ed25519([1; 32]),
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
         );
         let resp = client
@@ -48,18 +47,14 @@ async fn direct_remote_commit_refuses_a_protected_batch_before_writing_any_event
     let server = durable_sled_setup().await?;
     let context = server.context(DEFAULT_CONTEXT)?;
     let model = context.resolve_model_id::<Album>().await?;
-    let ordinary = proto::Event::genesis(
-        None,
-        proto::AuthorId::Unknown,
-        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
-    );
+    let ordinary =
+        proto::Event::genesis(server.identity(), proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]));
     let storage = &server.storage;
 
     for protected in PROTECTED {
         let protected_model = ankurah::core::schema::system_model_id(protected).unwrap();
         let protected_event = proto::Event::genesis(
-            None,
-            proto::AuthorId::Unknown,
+            server.identity(),
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(protected_model))]),
         );
         let protected_id = protected_event.entity_id;

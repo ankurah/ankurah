@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
-    event_dag::{CausalRelation, EventLayer},
+    event_dag::{CausalRelation, EventLayer, LayerEvent},
     property::{backend::PropertyBackend, Value},
 };
 
@@ -239,9 +239,11 @@ impl PropertyBackend for LWWBackend {
 
         {
             let values = self.values.read().unwrap();
-            for (event, from_to_apply) in layer.already_applied.iter().map(|e| (e, false)).chain(layer.to_apply.iter().map(|e| (e, true))) {
+            for (LayerEvent { event, operations }, from_to_apply) in
+                layer.already_applied.iter().map(|e| (e, false)).chain(layer.to_apply.iter().map(|e| (e, true)))
+            {
                 let rank = WriteRank { generation: event.generation(), event_id: event.id() };
-                for operation in event.operations().backend_operations(Self::property_backend_name()) {
+                for operation in operations.backend_operations(Self::property_backend_name()) {
                     for (prop, value) in decode_changes(operation)? {
                         let current =
                             winners.get(&prop).map(|candidate| &candidate.rank).or_else(|| values.get(&prop).and_then(ValueEntry::rank));
@@ -323,23 +325,21 @@ mod tests {
 
     #[test]
     fn layers_keep_the_greater_rank_in_either_order() {
-        use ankurah_proto::{AuthorId, Clock, Event, OperationSet};
+        use ankurah_proto::{CarriedOperations, Clock, Event, OperationSet};
         let scratch = LWWBackend::new();
         scratch.set(title(), Some(Value::String("shallower".into())));
         let shallower = crate::test_helpers::commit_backend(&scratch, 9).unwrap();
         scratch.set(title(), Some(Value::String("deeper".into())));
-        let operations = OperationSet::from_backends(BTreeMap::from([("lww".into(), scratch.to_operations().unwrap().unwrap())]));
+        let operations = CarriedOperations::encode(&OperationSet::from_backends(BTreeMap::from([(
+            "lww".into(),
+            scratch.to_operations().unwrap().unwrap(),
+        )])));
         let deeper = (0..200)
             .find_map(|seed| {
                 let event = Event {
                     entity_id: shallower.entity_id,
                     parent: Clock::singleton(&shallower),
-                    body: ankurah_proto::EventBody::Update {
-                        nonce: [seed; 32],
-                        timestamp: 0,
-                        author: AuthorId::Unknown,
-                        operations: operations.clone(),
-                    },
+                    body: ankurah_proto::EventBody::Update { nonce: [seed; 32], timestamp: 0, operations: operations.clone() },
                 };
                 (event.id() < shallower.id()).then_some(event)
             })

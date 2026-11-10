@@ -2,8 +2,9 @@
 uniffi::setup_scaffolding!();
 
 pub mod auth;
-pub mod author;
 pub mod clock;
+pub mod domain_tag;
+mod encoding;
 pub mod error;
 pub mod event;
 pub mod event_id;
@@ -30,8 +31,9 @@ pub mod wasm;
 pub use ankurah_core_types::{ModelId, PropertyId, SystemModel, SystemProperty};
 
 pub use auth::*;
-pub use author::*;
 pub use clock::*;
+pub use domain_tag::*;
+pub use encoding::UndecodableBytes;
 pub use error::*;
 pub use event::*;
 pub use event_id::*;

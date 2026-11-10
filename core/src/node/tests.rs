@@ -246,11 +246,10 @@ async fn remote_creations_are_not_registered_or_published_before_storage_succeed
     let a = ModelId::EntityId(proto::EntityId::random());
     let b = ModelId::EntityId(proto::EntityId::random());
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
-    let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(a));
-    let update = proto::Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(b));
-    let other_genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(b));
-    let other_update =
-        proto::Event::update(other_genesis.entity_id, proto::Clock::singleton(&other_genesis), proto::AuthorId::Unknown, membership(a));
+    let genesis = proto::Event::genesis(node.identity(), membership(a));
+    let update = proto::Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), membership(b));
+    let other_genesis = proto::Event::genesis(node.identity(), membership(b));
+    let other_update = proto::Event::update(other_genesis.entity_id, proto::Clock::singleton(&other_genesis), membership(a));
 
     let events = vec![genesis.clone().into(), other_genesis.clone().into(), update.clone().into(), other_update.clone().into()];
     let subscription = node.reactor.subscribe();
@@ -296,13 +295,13 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
     node.wait_ready().await?;
     let [a, b, c] = [1, 2, 3].map(|byte| ModelId::EntityId(proto::EntityId::from_bytes([byte; 32])));
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
-    let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(a));
+    let genesis = proto::Event::genesis(node.identity(), membership(a));
     let id = genesis.entity_id;
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(genesis.clone(), None)]).await?;
     let getter = LocalEventGetter::new(storage.clone(), true);
     let entity = node.entities.get_or_retrieve(&LocalStateGetter::new(storage.clone()), &getter, &id).await?.unwrap();
-    let ours = proto::Event::update(id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(c));
-    let other = proto::Event::update(id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(b));
+    let ours = proto::Event::update(id, proto::Clock::singleton(&genesis), membership(c));
+    let other = proto::Event::update(id, proto::Clock::singleton(&genesis), membership(b));
     let expected_events = [other.id(), ours.id()];
     let subscription = node.reactor.subscribe();
     subscription.add_entity_subscriptions([id]);

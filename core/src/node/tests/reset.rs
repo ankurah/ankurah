@@ -86,8 +86,8 @@ async fn a_commit_reaching_storage_after_a_reset_is_refused() {
         let (release, release_rx) = oneshot::channel();
         *storage.hold_set_state.lock().unwrap() = Some((entered, release_rx));
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]));
-        let operations = proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
-        let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, operations);
+        let genesis =
+            proto::Event::genesis(node.identity(), proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]));
         let commit = tokio::spawn({
             let node = node.clone();
             async move {

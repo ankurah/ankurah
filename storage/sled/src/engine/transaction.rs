@@ -50,8 +50,8 @@ fn sled_abort(error: impl std::fmt::Display) -> ConflictableTransactionError<Sle
     ConflictableTransactionError::Abort(SledCommitAbort::Invalid(error.to_string()))
 }
 
-pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<(IVec, IVec)>, MutationError> {
-    events.iter().map(|event| Ok((IVec::from(event.payload.id().as_bytes()), IVec::from(bincode::serialize(event)?)))).collect()
+pub(super) fn encode_events(events: &[Attested<Event>]) -> Vec<(IVec, IVec)> {
+    events.iter().map(|event| (IVec::from(event.payload.id().as_bytes()), IVec::from(event.encode()))).collect()
 }
 
 impl<'a> SledTransaction<'a> {
@@ -61,7 +61,7 @@ impl<'a> SledTransaction<'a> {
 #[async_trait]
 impl StorageTransaction for SledTransaction<'_> {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError> {
-        self.events.extend(encode_events(events)?);
+        self.events.extend(encode_events(events));
         Ok(())
     }
 

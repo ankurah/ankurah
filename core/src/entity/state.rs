@@ -1,6 +1,7 @@
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
-    event_dag::{AbstractCausalRelation, EventLayer, EventLayers, DEFAULT_BUDGET},
+    event_dag::{AbstractCausalRelation, EventLayer, EventLayers, LayerEvent, DEFAULT_BUDGET},
+    node::event_admissibility::AdmittedOperations,
     property::backend::{backend_from_string, PropertyBackend},
     retrieval::GetEvents,
     value::Value,
@@ -29,10 +30,10 @@ impl EntityInnerState {
 
     /// Apply backend and membership operations in causal order, then advance the head.
     /// New backends receive preceding layers as well, so they have the same merge context.
-    fn apply_layers(&mut self, layers: &[crate::event_dag::EventLayer]) -> Result<(), MutationError> {
+    fn apply_layers(&mut self, layers: &[EventLayer]) -> Result<(), MutationError> {
         for (i, layer) in layers.iter().enumerate() {
-            for event in &layer.to_apply {
-                for (name, _) in event.operations().backends() {
+            for LayerEvent { operations, .. } in &layer.to_apply {
+                for (name, _) in operations.backends() {
                     if !self.backends.contains_key(name) {
                         let backend = backend_from_string(name, None)?;
                         for earlier in &layers[..i] {
@@ -41,7 +42,7 @@ impl EntityInnerState {
                         self.backends.insert(name.to_owned(), backend);
                     }
                 }
-                for membership in event.operations().memberships() {
+                for membership in operations.memberships() {
                     let ankurah_proto::Membership::Add(model) = membership;
                     self.memberships.insert(*model);
                 }
@@ -52,7 +53,7 @@ impl EntityInnerState {
         }
         // Advance the head only after every layer has applied successfully.
         for layer in layers {
-            for event in &layer.to_apply {
+            for LayerEvent { event, .. } in &layer.to_apply {
                 for parent in event.parent.ids() {
                     self.head.remove(parent);
                 }
@@ -196,7 +197,7 @@ impl EntityState {
         let mut head = self.head();
         const MAX_RETRIES: usize = 5;
         for _ in 0..MAX_RETRIES {
-            let prepared = EventLayers::prepare(getter, events, &head).await?;
+            let prepared = EventLayers::prepare(getter, events, &head, &AdmittedOperations::new()).await?;
             let applied: Vec<_> = prepared.per_event().map(|layers| !layers.is_empty()).collect();
             if !applied.iter().any(|applied| *applied) {
                 return Ok(applied);
