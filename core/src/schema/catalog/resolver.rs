@@ -155,10 +155,20 @@ pub(crate) fn resolve_component_selection(
     Ok(components.iter().rev().fold(selection, |selection, component| selection.and_member_of(component.model)))
 }
 
-/// Check declared names without requiring their durable identities.
+/// Check declared names without requiring their durable identities. A qualifier naming a component outside
+/// `schemas` is left to resolution, which finds that component through the catalog.
 pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selection: &Selection<Parsed>) -> Result<(), RetrievalError> {
     let declares = |schema: &&ModelStructDescriptor, name: &str| name == "id" || schema.field_by_name(name).is_some();
     let check = |path: &PathExpr| {
+        if let Some(qualifier) = &path.component {
+            let name = path.steps.first().map(String::as_str).unwrap_or("");
+            return match schemas.iter().find(|schema| schema.name == qualifier || schema.label == qualifier) {
+                Some(schema) if !declares(schema, name) => {
+                    Err(ComponentScopeError::Undeclared { name: name.to_owned(), components: vec![qualifier.clone()] }.into())
+                }
+                _ => Ok(()),
+            };
+        }
         let head = usize::from(path.steps.len() > 1 && schemas.iter().any(|schema| path.steps[0] == schema.label));
         let name = path.steps.get(head).map(String::as_str).unwrap_or("");
         if schemas.iter().any(|schema| declares(schema, name)) {
@@ -305,7 +315,7 @@ fn resolve_expr<R: ModelResolver + ?Sized>(
                 if value_type != ValueType::Json {
                     return Err(ModelResolutionError::UnsupportedSubpath {
                         model: found.model,
-                        path: path.steps.join("."),
+                        path: path.to_string(),
                         reason: "only JSON properties support subpaths".to_owned(),
                     });
                 }
@@ -358,7 +368,7 @@ fn check_order_by_path(model: &ModelId, path: &PathExpr, rest: &[String]) -> Res
     }
     Err(ModelResolutionError::UnsupportedSubpath {
         model: *model,
-        path: path.steps.join("."),
+        path: path.to_string(),
         reason: "ORDER BY keys name whole properties; JSON subpaths are not sortable".to_owned(),
     })
 }
@@ -366,7 +376,7 @@ fn check_order_by_path(model: &ModelId, path: &PathExpr, rest: &[String]) -> Res
 fn id_subpath_error(model: &ModelId, path: &PathExpr) -> ModelResolutionError {
     ModelResolutionError::UnsupportedSubpath {
         model: *model,
-        path: path.steps.join("."),
+        path: path.to_string(),
         reason: "the id pseudo-property is the entity id and has no subfields".to_owned(),
     }
 }
@@ -473,7 +483,10 @@ mod tests {
         let resolved = resolve_selection(
             &model(),
             &WarmResolver,
-            comparison(PathExpr { steps: vec!["document".to_owned(), "nested".to_owned()] }, Value::String("hello".to_owned())),
+            comparison(
+                PathExpr { component: None, steps: vec!["document".to_owned(), "nested".to_owned()] },
+                Value::String("hello".to_owned()),
+            ),
         )
         .unwrap();
         let Predicate::Comparison { right, .. } = resolved.predicate else { panic!("expected comparison") };
@@ -482,7 +495,7 @@ mod tests {
 
     #[test]
     fn scalar_subpaths_are_rejected() {
-        let path = PathExpr { steps: vec!["value".to_owned(), "nested".to_owned()] };
+        let path = PathExpr { component: None, steps: vec!["value".to_owned(), "nested".to_owned()] };
         let error = resolve_selection(&model(), &WarmResolver, comparison(path, Value::I64(1))).unwrap_err();
         assert!(matches!(error, ModelResolutionError::UnsupportedSubpath { .. }));
     }

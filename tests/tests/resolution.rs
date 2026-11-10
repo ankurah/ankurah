@@ -196,7 +196,7 @@ async fn order_by_resolves_fail_closed() -> anyhow::Result<()> {
     let qualified = Selection::<Parsed> {
         predicate: ankql::ast::Predicate::True,
         order_by: Some(vec![ankql::ast::OrderByItem {
-            path: PathExpr { steps: vec!["album".into(), "name".into()] },
+            path: PathExpr { component: None, steps: vec!["album".into(), "name".into()] },
             direction: ankql::ast::OrderDirection::Asc,
         }]),
         limit: None,
@@ -221,7 +221,7 @@ async fn subpath_order_keys_and_id_subpaths_are_refused() -> anyhow::Result<()> 
     let order = |steps: &[&str]| Selection::<Parsed> {
         predicate: ankql::ast::Predicate::True,
         order_by: Some(vec![OrderByItem {
-            path: PathExpr { steps: steps.iter().map(|s| s.to_string()).collect() },
+            path: PathExpr { component: None, steps: steps.iter().map(|s| s.to_string()).collect() },
             direction: ankql::ast::OrderDirection::Asc,
         }]),
         limit: None,
@@ -281,7 +281,7 @@ async fn systemize_strips_the_collection_qualifier() -> anyhow::Result<()> {
     let order = |steps: &[&str]| Selection::<Parsed> {
         predicate: ankql::ast::Predicate::True,
         order_by: Some(vec![OrderByItem {
-            path: PathExpr { steps: steps.iter().map(|s| s.to_string()).collect() },
+            path: PathExpr { component: None, steps: steps.iter().map(|s| s.to_string()).collect() },
             direction: ankql::ast::OrderDirection::Asc,
         }]),
         limit: None,

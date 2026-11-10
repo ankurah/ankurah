@@ -1,6 +1,7 @@
 //! Views of one entity's several components: a typed query over a tuple of views,
 //! `ctx.fetch::<(TaskView, AssignmentView)>(..)`, and a cast between views, `task.cast::<AssignmentView>()`.
-//! A query's matches belong to every component in its tuple, and bare names resolve across those components.
+//! A query's matches belong to every component in its tuple; bare names resolve across those components,
+//! and `Component::name` names a property of one component, in the tuple or outside it.
 //! Each scenario runs on sled and on in-memory SQLite.
 
 use ankurah::core::schema::resolver::ComponentScopeError;
@@ -257,7 +258,10 @@ async fn shared_and_colliding_names(f: Fixture) -> anyhow::Result<()> {
 
     // `note` is two properties: Task's and Assignment's.
     let ambiguous = ComponentScopeError::Ambiguous { name: "note".into(), first: "Task".into(), second: "Assignment".into() };
-    assert_eq!(ambiguous.to_string(), "'note' names different properties in components 'Task' and 'Assignment'");
+    assert_eq!(
+        ambiguous.to_string(),
+        "'note' names different properties in components 'Task' and 'Assignment'; qualify it as Task::note or Assignment::note"
+    );
     for selection in ["note = 'task note ship'", "status = 'open' ORDER BY note"] {
         assert_eq!(f.refusal(selection).await, ambiguous, "{engine}: {selection}");
     }
@@ -308,4 +312,78 @@ async fn live_tuple_query(f: Fixture) -> anyhow::Result<()> {
 async fn a_live_tuple_query_follows_both_components() -> anyhow::Result<()> {
     live_tuple_query(on_sled().await?).await?;
     live_tuple_query(on_sqlite().await?).await
+}
+
+async fn qualified_names(f: Fixture) -> anyhow::Result<()> {
+    let engine = f.engine;
+    // A qualifier picks one of the two properties named `note`: a component of the tuple by display name, or by label.
+    assert_eq!(f.fetch_pairs("Task::note = 'task note ship'").await?, ["ada"], "{engine}");
+    assert_eq!(f.fetch_pairs("Assignment::note = 'assignment note bob'").await?, ["bob"], "{engine}");
+    assert_eq!(f.fetch_pairs("assignment::note = 'assignment note bob'").await?, ["bob"], "{engine}");
+    assert!(f.fetch_pairs("Assignment::note = 'task note ship'").await?.is_empty(), "{engine}");
+    let live = f.ctx.query_wait::<(TaskView, AssignmentView)>("Assignment::note = 'assignment note bob'").await?;
+    assert_eq!(f.names(live.ids()), ["bob"], "{engine}");
+
+    // The shared property is the same property whichever component names it.
+    for selection in ["Task::project = 'atlas'", "Assignment::project = 'atlas'"] {
+        assert_eq!(f.fetch_pairs(selection).await?, ["ada", "bob", "done"], "{engine}: {selection}");
+    }
+
+    // ORDER BY takes a qualifier too.
+    assert_eq!(f.fetch_pairs_in_order("status = 'open' ORDER BY Assignment::assignee DESC").await?, ["bob", "ada"], "{engine}");
+    assert_eq!(f.fetch_pairs_in_order("assignee = 'ada' ORDER BY Task::note").await?, ["done", "ada"], "{engine}");
+
+    // A qualifier must name a known component, and its component must declare the property.
+    assert_eq!(f.refusal("Nobody::closed_at = 5").await, ComponentScopeError::UnknownComponent("Nobody".into()), "{engine}");
+    assert_eq!(f.refusal("Closure::closed_at = 5").await, ComponentScopeError::UnknownComponent("Closure".into()), "{engine}");
+    let undeclared = ComponentScopeError::Undeclared { name: "closed_at".into(), components: vec!["Task".into()] };
+    assert_eq!(f.refusal("Task::closed_at = 5").await, undeclared, "{engine}");
+
+    // The path after a qualifier keeps its existing rules: a subpath needs a JSON property.
+    let subpath = f.ctx.fetch::<(TaskView, AssignmentView)>("Assignment::assignee.display_name = 'Ada'").await.map(|_| ());
+    assert!(
+        matches!(&subpath, Err(RetrievalError::Other(message)) if message.contains("only JSON properties support subpaths")),
+        "{engine}: {subpath:?}"
+    );
+    Ok(())
+}
+
+/// `Component::name` names the component a property belongs to, in a predicate and in ORDER BY: a component
+/// of the tuple by display name or label. A qualifier naming no such component and no label, or a property
+/// its component does not declare, is refused.
+#[tokio::test]
+async fn a_qualifier_names_the_component_a_property_belongs_to() -> anyhow::Result<()> {
+    qualified_names(on_sled().await?).await?;
+    qualified_names(on_sqlite().await?).await
+}
+
+/// The matches of a pair query three ways: a fetch, a live query's initial answer, and that live query after
+/// each candidate changed, which the reactor re-evaluates in memory.
+async fn three_answers(f: &Fixture, selection: &str) -> anyhow::Result<[Vec<&'static str>; 3]> {
+    let fetched = f.fetch_pairs(selection).await?;
+    let live = f.ctx.query_wait::<(TaskView, AssignmentView)>(selection).await?;
+    let initial = f.names(live.ids());
+    for name in ["ada", "bob", "done"] {
+        f.edit::<Task>(name, |task| Ok(task.title()?.insert(0, "re-")?)).await?;
+    }
+    Ok([fetched, initial, f.names(live.ids())])
+}
+
+async fn qualified_outside_component(f: Fixture) -> anyhow::Result<()> {
+    let engine = f.engine;
+    // Closure is outside the tuple: its label is found through the catalog, double-quoted for its dot.
+    assert_eq!(three_answers(&f, "\"records.closure\"::closed_at = 5").await?, [["done"], ["done"], ["done"]], "{engine}");
+    // ada and bob lack Closure, so its property is absent from them: a comparison with it is never true,
+    // even beneath NOT. Fetch and live query agree on both engines.
+    assert_eq!(three_answers(&f, "NOT \"records.closure\"::closed_at = 5").await?, [[""; 0], [""; 0], [""; 0]], "{engine}");
+    assert_eq!(three_answers(&f, "NOT \"records.closure\"::closed_at = 6").await?, [["done"], ["done"], ["done"]], "{engine}");
+    Ok(())
+}
+
+/// `"records.closure"::closed_at` reads a property of a component outside the tuple; on an entity that lacks
+/// that component the property is absent, with the same answer from a fetch and a live query.
+#[tokio::test]
+async fn a_qualified_property_of_a_component_outside_the_tuple_reads_absent_where_it_is_missing() -> anyhow::Result<()> {
+    qualified_outside_component(on_sled().await?).await?;
+    qualified_outside_component(on_sqlite().await?).await
 }

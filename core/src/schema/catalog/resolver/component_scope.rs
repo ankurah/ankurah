@@ -11,7 +11,8 @@ use crate::value::ValueType;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct QueryComponent<'a> {
     pub model: ModelId,
-    /// Its display name, such as `Assignment`; a component known only by its model id has none.
+    /// The display name a `Component::` qualifier may use for it, such as `Assignment`. A component known
+    /// only by its model id has none; a qualifier names it by label.
     pub name: Option<&'a str>,
 }
 
@@ -24,8 +25,13 @@ impl QueryComponent<'_> {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ComponentScopeError {
     /// A bare name two of the query's components declare as different properties.
-    #[error("'{name}' names different properties in components '{first}' and '{second}'")]
+    #[error(
+        "'{name}' names different properties in components '{first}' and '{second}'; qualify it as {first}::{name} or {second}::{name}"
+    )]
     Ambiguous { name: String, first: String, second: String },
+    /// A qualifier naming neither a component of the query by display name nor any component by label.
+    #[error("unknown component '{0}': a qualifier names one of the query's components by name, or any component by its label")]
+    UnknownComponent(String),
     /// A name that none of these components declares.
     #[error("no property '{name}' in {}", describe_components(.components))]
     Undeclared { name: String, components: Vec<String> },
@@ -47,9 +53,10 @@ pub(super) struct LocatedProperty<'p> {
     pub subpath: &'p [String],
 }
 
-/// Find the property a path names. A leading dotted label of one of `components` (`album.name`) qualifies the
-/// path. A bare name belongs to whichever of `components` declares it, and is refused when two of them declare
-/// it as different properties.
+/// Find the property a path names. `Component::name` reads it from the component the qualifier names: one of
+/// `components` by display name, or any component by label, including one a match may lack. A leading dotted
+/// label of one of `components` (`album.name`) also qualifies the path. A bare name belongs to whichever of
+/// `components` declares it, and is refused when two of them declare it as different properties.
 pub(super) fn locate_property<'p, R: ModelResolver + ?Sized>(
     components: &[QueryComponent<'_>],
     resolver: &R,
@@ -58,6 +65,15 @@ pub(super) fn locate_property<'p, R: ModelResolver + ?Sized>(
     let Some((first, rest)) = path.steps.split_first() else {
         return Err(undeclared(components, ""));
     };
+    if let Some(qualifier) = &path.component {
+        let model = match components.iter().find(|component| component.name == Some(qualifier.as_str())) {
+            Some(component) => component.model,
+            None => resolver.resolve_model(qualifier)?.ok_or_else(|| ComponentScopeError::UnknownComponent(qualifier.clone()))?,
+        };
+        let property = lookup_property(&model, resolver, first)?
+            .ok_or_else(|| ComponentScopeError::Undeclared { name: first.clone(), components: vec![qualifier.clone()] })?;
+        return Ok(LocatedProperty { model, name: first, property, subpath: rest });
+    }
     if let [name, subpath @ ..] = rest {
         if let Some(model) = resolver.resolve_model(first)?.filter(|model| components.iter().any(|component| component.model == *model)) {
             let property = lookup_property(&model, resolver, name)?.ok_or_else(|| unknown_property(&model, name.as_str()))?;

@@ -22,14 +22,16 @@ pub enum Expr<S: Stage> {
     Placeholder,
 }
 
-/// A parsed, model-scoped property name and optional subpath.
+/// A parsed property name and optional subpath, optionally qualified by the component declaring the property.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathExpr {
+    /// The component written before `::`: a model label, or the display name of a component the query returns.
+    pub component: Option<String>,
     pub steps: Vec<String>,
 }
 
 impl PathExpr {
-    pub fn simple(name: impl Into<String>) -> Self { Self { steps: vec![name.into()] } }
+    pub fn simple(name: impl Into<String>) -> Self { Self { component: None, steps: vec![name.into()] } }
 
     pub fn is_simple(&self) -> bool { self.steps.len() == 1 }
 
@@ -39,10 +41,17 @@ impl PathExpr {
 }
 
 impl std::fmt::Display for PathExpr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.steps.join(".")) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(component) = &self.component {
+            write!(f, "{component}::")?;
+        }
+        write!(f, "{}", self.steps.join("."))
+    }
 }
 
 impl ankurah_core_types::Path for PathExpr {
+    fn display_component(&self) -> Option<&str> { self.component.as_deref() }
+
     fn display_steps(&self) -> impl Iterator<Item = &str> { self.steps.iter().map(String::as_str) }
 }
 
@@ -667,7 +676,10 @@ mod tests {
     fn identifier_display_matches_path() {
         let ident = PropertyPath::registered(EntityId::from_bytes([1u8; 32]), "licensing", vec!["territory".to_string()]);
         assert_eq!(ident.to_string(), "licensing.territory");
-        assert_eq!(ident.to_string(), PathExpr { steps: vec!["licensing".to_string(), "territory".to_string()] }.to_string());
+        assert_eq!(
+            ident.to_string(),
+            PathExpr { component: None, steps: vec!["licensing".to_string(), "territory".to_string()] }.to_string()
+        );
 
         let simple = PropertyPath::registered(EntityId::from_bytes([1u8; 32]), "status", vec![]);
         assert_eq!(simple.to_string(), "status");
