@@ -132,6 +132,17 @@ async fn wait_until_held(engine: &SledStorageEngine, id: EntityId) {
     .expect("the node comes to hold the entity");
 }
 
+/// Wait until `engine` no longer holds the entity `id`.
+async fn wait_until_wiped(engine: &SledStorageEngine, id: EntityId) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while engine.get_state(id).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the store comes to hold no such entity");
+}
+
 /// Wait until neither `client` nor `server` holds a registration of the other. A dialer's plugin
 /// decides after the accepting side has registered it, and the accepting side removes that
 /// registration when the refused connection ends.
@@ -209,10 +220,11 @@ async fn a_client_meeting_a_server_seeded_again_resets_and_refuses_and_a_fresh_n
         assert_eq!(returning.state().value(), NodeState::Halted(NodeHaltReason::Reset));
         wait_until_unregistered(&returning, &reseeded.node).await;
 
-        // The host waits for the wipe the plugin began, then builds a fresh node on the store.
+        // The plugin's own reset wipes the store; the host's call only waits for that wipe, then
+        // the host builds a fresh node on the store.
+        wait_until_wiped(&engine, first_system).await;
         returning.reset().await?;
         close(returning, None).await;
-        assert!(engine.get_state(first_system).await.is_err(), "the reset wiped the old seeding");
         let fresh = client(&engine, OnReseed::Reset)?;
         let _connection = connect(transport, &fresh, &reseeded).await?;
         wait_until_held(&engine, second_system).await;
