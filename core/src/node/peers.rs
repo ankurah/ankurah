@@ -1,9 +1,10 @@
 //! The peers registered with one node.
 
 use super::PeerState;
+use crate::connector::PeerSender;
 use crate::error::RequestError;
 use crate::livequery::WeakEntityLiveQuery;
-use crate::peer_subscription::SubscriptionRelay;
+use crate::peer_subscription::{SubscriptionHandler, SubscriptionRelay};
 use crate::policy::PeerTrust;
 use crate::session::ContextData;
 use crate::util::safemap::SafeMap;
@@ -11,6 +12,7 @@ use crate::util::safeset::SafeSet;
 use ankurah_proto as proto;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What a request needs from the trust its recipient holds when it is sent.
@@ -22,9 +24,28 @@ pub(super) enum RequiredTrust {
     Durable,
 }
 
+/// One connection's registration with a node: the peer it registered, and which of that peer's
+/// registrations it is. The connector holds it while the connection is open and gives it back to
+/// deregister, which removes this registration only, never a newer one of the same peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionRegistration {
+    peer: proto::NodeId,
+    serial: u64,
+}
+
+impl ConnectionRegistration {
+    /// The peer this registration registered.
+    pub fn peer(&self) -> proto::NodeId { self.peer }
+
+    /// A registration of `peer` that no node issued, for a test double of a node's connector interface.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test(peer: proto::NodeId) -> Self { Self { peer, serial: u64::MAX } }
+}
+
 /// The peers registered with one node: each one's connection, the ones trusted as durable, and
 /// the choice of a durable peer to ask.
 pub(crate) struct PeerRegistry<CD: ContextData> {
+    /// The current registration's connection for each registered peer.
     connections: SafeMap<proto::NodeId, Arc<PeerState<CD>>>,
     durable: SafeSet<proto::NodeId>,
     /// Held while a registration or deregistration updates `durable`, the subscription relay and
@@ -34,22 +55,34 @@ pub(crate) struct PeerRegistry<CD: ContextData> {
     /// explicit seed can be injected at construction so the simulation harness and tests can
     /// reproduce an identical selection sequence. The lock is only ever held for a single draw.
     rng: Mutex<SmallRng>,
+    /// The serial the next registration takes.
+    next_serial: AtomicU64,
 }
 
 impl<CD: ContextData> PeerRegistry<CD> {
     pub(super) fn new(rng: SmallRng) -> Self {
-        Self { connections: SafeMap::new(), durable: SafeSet::new(), registration: Mutex::new(()), rng: Mutex::new(rng) }
+        Self {
+            connections: SafeMap::new(),
+            durable: SafeSet::new(),
+            registration: Mutex::new(()),
+            rng: Mutex::new(rng),
+            next_serial: AtomicU64::new(0),
+        }
     }
 
-    /// Register `connection` for `peer`, replacing any earlier registration of it: the latest
-    /// registration decides trust.
+    /// Register a connection to `peer` that sends through `sender`, replacing any earlier
+    /// registration of `peer`: the latest registration decides trust.
     pub(super) fn register(
         &self,
         peer: proto::NodeId,
-        connection: PeerState<CD>,
+        sender: Box<dyn PeerSender>,
+        trust: PeerTrust,
+        subscription_handler: SubscriptionHandler<CD>,
         relay: Option<&SubscriptionRelay<CD, WeakEntityLiveQuery>>,
-    ) {
-        let durable = connection.trust.durable;
+    ) -> ConnectionRegistration {
+        let registration = ConnectionRegistration { peer, serial: self.next_serial.fetch_add(1, Ordering::Relaxed) };
+        let connection = PeerState::new(registration, sender, trust, subscription_handler);
+        let durable = trust.durable;
         let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // An id registering again without durable trust leaves durable routing before its new
         // sender is reachable.
@@ -65,18 +98,21 @@ impl<CD: ContextData> PeerRegistry<CD> {
                 relay.notify_peer_connected(peer);
             }
         }
+        registration
     }
 
-    /// Remove `peer`'s registration, returning its connection if it had one.
+    /// Remove `registration`, returning its connection; nothing, if a newer registration of the
+    /// same peer has replaced it.
     pub(super) fn deregister(
         &self,
-        peer: proto::NodeId,
+        registration: ConnectionRegistration,
         relay: Option<&SubscriptionRelay<CD, WeakEntityLiveQuery>>,
     ) -> Option<Arc<PeerState<CD>>> {
+        let peer = registration.peer;
         let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.connections.get(&peer).filter(|connection| connection.registration == registration)?;
         self.durable.remove(&peer);
         let connection = self.connections.remove(&peer);
-        // Unconditional: the relay handles filtering.
         if let Some(relay) = relay {
             relay.notify_peer_disconnected(peer);
         }

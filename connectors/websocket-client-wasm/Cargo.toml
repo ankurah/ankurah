@@ -71,6 +71,7 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 ###### 
 
 [dev-dependencies]
+ankurah-core      = { path = "../../core", version = "=0.10.0", features = ["test-helpers"] }
 wasm-bindgen-test = "0.3"
 
     [package.metadata.wasm-pack.profile.dev.wasm-bindgen]

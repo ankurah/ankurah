@@ -224,6 +224,32 @@ async fn a_durable_peer_registering_again_inbound_leaves_durable_routing() {
     assert_eq!(commit_relays(&relayer_messages), 0);
 }
 
+/// A connection that closes after its peer registered again on a new one removes only its own
+/// registration: the newer connection keeps its routing, durable standing and subscriptions.
+#[tokio::test]
+async fn a_closing_connection_leaves_a_newer_registration_of_its_peer_in_place() {
+    let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let client = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let relay = client.subscription_relay.as_ref().unwrap();
+    let register = || async {
+        let (handshake, presence) = answered_handshake(&client, &server).await;
+        let (sent, _) = mpsc::channel();
+        client.register_peer(presence, handshake, PeerProvenance::Configured, Box::new(RecordingSender(server.id, sent))).await.unwrap()
+    };
+    let (first, second) = (register().await, register().await);
+    assert_ne!(first, second);
+
+    client.deregister_peer(first);
+    assert_eq!(client.granted_trust(&server.id), Some(PeerTrust { durable: true }));
+    assert_eq!(client.get_durable_peers(), vec![server.id]);
+    assert!(relay.is_connected(&server.id));
+
+    client.deregister_peer(second);
+    assert_eq!(client.granted_trust(&server.id), None);
+    assert!(client.get_durable_peers().is_empty());
+    assert!(!relay.is_connected(&server.id));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_registrations_of_one_id_leave_durable_routing_matching_the_connection_that_won() {
     let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());

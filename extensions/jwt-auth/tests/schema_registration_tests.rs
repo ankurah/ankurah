@@ -110,7 +110,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     let peer = key.node_id();
     let (tx, mut replies) = mpsc::unbounded_channel();
     let (handshake, presence) = keyed_handshake(&node, &key);
-    node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
+    let registration = node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
     let model = proto::RegisterModel::from(RegistrationRecord::descriptor());
     let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), model.clone()).await?;
     assert!(
@@ -146,7 +146,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
         "{response:?}"
     );
     assert_eq!(catalog_states(&node).await?, after, "an existing model must not permit anonymous schema extension");
-    node.deregister_peer(peer);
+    node.deregister_peer(registration);
     Ok(())
 }
 
@@ -158,7 +158,7 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
         let peer = key.node_id();
         let (tx, mut replies) = mpsc::unbounded_channel();
         let (handshake, presence) = keyed_handshake(&node, &key);
-        node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
+        let registration = node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
         let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
         let auth = proto::AuthData(common::sign_token(&common::test_keys(), &claims).into_bytes());
         let model = proto::RegisterModel::from(Role::descriptor());
@@ -193,7 +193,7 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
             "{response:?}"
         );
         assert!(!node.catalog.membership_by_id(&membership_id)?.expect("unchanged role membership").optional);
-        node.deregister_peer(peer);
+        node.deregister_peer(registration);
         Ok::<(), anyhow::Error>(())
     })
     .await?
@@ -249,7 +249,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         client_side.receive_opening(server_side.opening())?;
         server_side.receive_opening(client_side.opening())?;
         let (client_presence, server_presence) = (client.presence(&client_side).await?, server.presence(&server_side).await?);
-        client
+        let server_registration = client
             .register_peer(
                 server_presence,
                 client_side,
@@ -257,7 +257,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                 Box::new(ReplySender { peer: server.id, tx: server_tx }),
             )
             .await?;
-        server
+        let client_registration = server
             .register_peer(client_presence, server_side, PeerProvenance::Inbound, Box::new(ReplySender { peer: client.id, tx: client_tx }))
             .await?;
 
@@ -345,8 +345,8 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         assert!(query.get().iter().any(|row| row.id() == id));
         assert_eq!(context.fetch::<ScopeProbeView>("body = 'hello'").await?.len(), 1);
 
-        server.deregister_peer(client.id);
-        client.deregister_peer(server.id);
+        server.deregister_peer(client_registration);
+        client.deregister_peer(server_registration);
         server_task.abort();
         client_task.abort();
         Ok::<(), anyhow::Error>(())

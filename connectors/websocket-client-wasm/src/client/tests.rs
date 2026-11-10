@@ -3,7 +3,7 @@ use ankurah::signals::Signal;
 use ankurah_core::{
     connector::{Handshake, PeerProvenance, PeerSender},
     error::NodeHaltReason,
-    node::NodeKey,
+    node::{ConnectionRegistration, NodeKey},
 };
 use ankurah_proto as proto;
 use async_trait::async_trait;
@@ -83,19 +83,19 @@ impl NodeComms for HeldAdmission {
     }
     async fn register_peer(
         &self,
-        _: proto::Presence,
+        presence: proto::Presence,
         _: Handshake,
         _: PeerProvenance,
         _: Box<dyn PeerSender>,
-    ) -> Result<(), PeerConnectionError> {
+    ) -> Result<ConnectionRegistration, PeerConnectionError> {
         let release = self.0.release.lock().unwrap().take().unwrap();
         self.0.started.set(true);
         release.await.map_err(|_| PeerConnectionError::ChallengeMismatch(self.id()))?;
         self.0.published.set(true);
-        Ok(())
+        Ok(ConnectionRegistration::for_test(presence.claims.node_id))
     }
     fn state(&self) -> Read<NodeState> { self.0.node_state.read() }
-    fn deregister_peer(&self, _: proto::NodeId) { self.0.published.set(false); }
+    fn deregister_peer(&self, _: ConnectionRegistration) { self.0.published.set(false); }
     async fn handle_message(&self, _: proto::NodeMessage) -> anyhow::Result<()> {
         self.0.handled.set(self.0.handled.value() + 1);
         Ok(())

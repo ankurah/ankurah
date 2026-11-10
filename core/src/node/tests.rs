@@ -40,7 +40,7 @@ async fn register_keyed_peer_claiming<SE, PA>(
     claims: impl FnOnce(&mut proto::PresenceClaims),
     provenance: PeerProvenance,
     sender: Box<dyn PeerSender>,
-) -> Result<(), PeerConnectionError>
+) -> Result<ConnectionRegistration, PeerConnectionError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -58,7 +58,7 @@ async fn register_keyed_peer<SE, PA>(
     durable: bool,
     provenance: PeerProvenance,
     sender: Box<dyn PeerSender>,
-) -> Result<(), PeerConnectionError>
+) -> Result<ConnectionRegistration, PeerConnectionError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -213,12 +213,13 @@ async fn disconnect_releases_pending_requests() {
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (sent, _messages) = std::sync::mpsc::channel();
-    register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent))).await.unwrap();
+    let registration =
+        register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent))).await.unwrap();
     let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
     tokio::pin!(request);
     assert!(futures::poll!(&mut request).is_pending());
 
-    node.deregister_peer(peer);
+    node.deregister_peer(registration);
     assert!(matches!(futures::poll!(&mut request), std::task::Poll::Ready(Err(RequestError::InternalChannelClosed))));
 }
 

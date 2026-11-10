@@ -1,7 +1,7 @@
 use ankurah_proto as proto;
 use async_trait::async_trait;
 
-use crate::{policy::PolicyAgent, storage::StorageEngine, Node, NodeState};
+use crate::{node::ConnectionRegistration, policy::PolicyAgent, storage::StorageEngine, Node, NodeState};
 
 mod handshake;
 pub use handshake::Handshake;
@@ -46,10 +46,7 @@ pub enum PeerProvenance {
     Inbound,
 }
 
-// TODO redesign this such that:
-// - the sender and receiver are disconnected at the same time
-// - a connection id or dyn Ord/Eq/Hash is used to identify the connection for deregistration
-//   so that we can have multiple connections to the same node without things getting mixed up
+// TODO redesign this such that the sender and receiver are disconnected at the same time
 
 #[async_trait]
 pub trait PeerSender: Send + Sync {
@@ -88,9 +85,9 @@ pub trait NodeComms: Send + Sync {
         handshake: Handshake,
         provenance: PeerProvenance,
         sender: Box<dyn PeerSender>,
-    ) -> Result<(), PeerConnectionError>;
+    ) -> Result<ConnectionRegistration, PeerConnectionError>;
     fn state(&self) -> ankurah_signals::Read<NodeState>;
-    fn deregister_peer(&self, node_id: proto::NodeId);
+    fn deregister_peer(&self, registration: ConnectionRegistration);
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
@@ -106,14 +103,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         handshake: Handshake,
         provenance: PeerProvenance,
         sender: Box<dyn PeerSender>,
-    ) -> Result<(), PeerConnectionError> {
+    ) -> Result<ConnectionRegistration, PeerConnectionError> {
         self.register_peer(presence, handshake, provenance, sender).await
     }
     fn state(&self) -> ankurah_signals::Read<NodeState> { self.state() }
-    fn deregister_peer(&self, node_id: proto::NodeId) {
-        //
-        self.deregister_peer(node_id);
-    }
+    fn deregister_peer(&self, registration: ConnectionRegistration) { self.deregister_peer(registration); }
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         //
         self.handle_message(message).await

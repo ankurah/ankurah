@@ -1,6 +1,7 @@
 use crate::sender::WebsocketPeerSender;
 use ankurah_core::{
-    connector::{Handshake, PeerConnectionError, PeerProvenance, PeerSender},
+    connector::{Handshake, PeerConnectionError, PeerProvenance},
+    node::ConnectionRegistration,
     policy::PolicyAgent,
     storage::StorageEngine,
     Node, NodeState,
@@ -273,7 +274,8 @@ where
             inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
         }
 
-        let mut peer_sender: Option<WebsocketPeerSender> = None;
+        // Taken when the server registers; given back to deregister it once the connection ends.
+        let mut registration: Option<ConnectionRegistration> = None;
         let mut outgoing_rx: Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>> = None;
         let handshake = inner.node.begin_handshake();
         let opening = proto::Message::Open(handshake.opening());
@@ -301,7 +303,7 @@ where
                         }
                     }
                     msg = stream.next() => {
-                        match Self::handle_incoming_message(inner, msg, &mut handshake, &mut peer_sender, &mut outgoing_rx, &mut sink).await? {
+                        match Self::handle_incoming_message(inner, msg, &mut handshake, &mut registration, &mut outgoing_rx, &mut sink).await? {
                             MessageResult::Continue => continue,
                             MessageResult::Break => break,
                         }
@@ -318,9 +320,9 @@ where
 
         // Cleanup
         inner.connected.store(false, Ordering::Release);
-        if let Some(sender) = peer_sender {
-            inner.node.deregister_peer(sender.recipient_node_id());
-            debug!("Deregistered peer {}", sender.recipient_node_id());
+        if let Some(registration) = registration {
+            inner.node.deregister_peer(registration);
+            debug!("Deregistered peer {}", registration.peer());
         }
         result
     }
@@ -342,7 +344,7 @@ where
         inner: &Arc<Inner<SE, PA>>,
         msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
         handshake: &mut Option<Handshake>,
-        peer_sender: &mut Option<WebsocketPeerSender>,
+        registration: &mut Option<ConnectionRegistration>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
         sink: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -366,7 +368,7 @@ where
                         }
                     };
                 }
-                Self::handle_server_message(inner, &data, handshake, peer_sender, outgoing_rx, sink).await
+                Self::handle_server_message(inner, &data, handshake, registration, outgoing_rx, sink).await
             }
             Some(Ok(Message::Close(_))) => {
                 info!("WebSocket connection closed by server");
@@ -408,7 +410,7 @@ where
         inner: &Arc<Inner<SE, PA>>,
         data: &[u8],
         handshake: &mut Option<Handshake>,
-        peer_sender: &mut Option<WebsocketPeerSender>,
+        registration: &mut Option<ConnectionRegistration>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
         sink: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -424,7 +426,7 @@ where
                 Err(PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs }.into())
             }
             Ok(proto::Message::Presence(server_presence)) => {
-                match Self::handle_server_presence(inner, server_presence, handshake, peer_sender, outgoing_rx, sink).await {
+                match Self::handle_server_presence(inner, server_presence, handshake, registration, outgoing_rx, sink).await {
                     Ok(()) => Ok(MessageResult::Continue),
                     Err(rejection) => {
                         error!("Refusing server {}: {}", inner.server_url, rejection);
@@ -433,7 +435,7 @@ where
                 }
             }
             Ok(proto::Message::PeerMessage(node_msg)) => {
-                if peer_sender.is_none() {
+                if registration.is_none() {
                     // Application traffic before a compatible Presence:
                     // negotiation has not admitted this server, so nothing
                     // it says may reach the node.
@@ -443,7 +445,7 @@ where
                 Ok(MessageResult::Continue)
             }
             Err(e) => {
-                if peer_sender.is_none() {
+                if registration.is_none() {
                     // A handshake we cannot read will never establish; close
                     // instead of idling on a dead connection.
                     return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
@@ -458,7 +460,7 @@ where
         inner: &Arc<Inner<SE, PA>>,
         server_presence: proto::Presence,
         handshake: &mut Option<Handshake>,
-        peer_sender: &mut Option<WebsocketPeerSender>,
+        registration: &mut Option<ConnectionRegistration>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
         sink: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -476,10 +478,9 @@ where
         let presence = proto::Message::Presence(inner.node.presence(&handshake).await?);
 
         let (sender, rx) = WebsocketPeerSender::new(server_presence.claims.node_id);
-        inner.node.register_peer(server_presence.clone(), handshake, PeerProvenance::Configured, Box::new(sender.clone())).await?;
-
+        *registration =
+            Some(inner.node.register_peer(server_presence.clone(), handshake, PeerProvenance::Configured, Box::new(sender)).await?);
         *outgoing_rx = Some(rx);
-        *peer_sender = Some(sender);
 
         sink.send(Message::Binary(presence.encode().into())).await?;
 

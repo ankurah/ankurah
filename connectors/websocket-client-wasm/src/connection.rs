@@ -7,6 +7,7 @@ use ankurah_core::connector::NodeComms;
 use ankurah_core::connector::PeerConnectionError;
 use ankurah_core::connector::PeerProvenance;
 use ankurah_core::connector::PeerSender;
+use ankurah_core::node::ConnectionRegistration;
 use ankurah_proto::{self as proto};
 
 use async_trait::async_trait;
@@ -35,7 +36,8 @@ pub struct ConnectionInner {
     client: Weak<ClientInner>,
     /// This node's side of the handshake; taken when the server's presence arrives.
     handshake: RefCell<Option<Handshake>>,
-    registered_peer: Cell<Option<proto::NodeId>>,
+    /// This node's registration of the server, given back to deregister it on disconnect.
+    registration: Cell<Option<ConnectionRegistration>>,
     receive_task: Cell<Option<RemoteHandle<()>>>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
@@ -66,7 +68,7 @@ impl Connection {
             node,
             client,
             handshake,
-            registered_peer: Cell::new(None),
+            registration: Cell::new(None),
             receive_task: Cell::new(None),
             _callbacks: Mutex::new(None),
         })));
@@ -217,22 +219,22 @@ impl Connection {
                             let sender = Box::new(WebSocketPeerSender { recipient_node_id: server, ws: SendWrapper::new(self.ws.clone()) });
                             return Some(async move {
                                 // Signed before registration spends the handshake.
-                                let presence = match node.presence(&handshake).await {
+                                let registered = match node.presence(&handshake).await {
                                     Ok(presence) => node
                                         .register_peer(server_presence.clone(), handshake, PeerProvenance::Configured, sender)
                                         .await
-                                        .map(|()| presence),
+                                        .map(|registration| (registration, presence)),
                                     Err(error) => Err(error),
                                 };
                                 let Some(connection) = weak.upgrade().map(Connection) else {
-                                    if presence.is_ok() {
-                                        node.deregister_peer(server);
+                                    if let Ok((registration, _)) = registered {
+                                        node.deregister_peer(registration);
                                     }
                                     return;
                                 };
-                                let presence = match presence {
-                                    Ok(presence) => {
-                                        connection.registered_peer.set(Some(server));
+                                let presence = match registered {
+                                    Ok((registration, presence)) => {
+                                        connection.registration.set(Some(registration));
                                         presence
                                     }
                                     Err(rejection) => {
@@ -272,7 +274,7 @@ impl Connection {
                     }
                 }
                 proto::Message::PeerMessage(msg) => {
-                    if self.registered_peer.get().is_none() {
+                    if self.registration.get().is_none() {
                         // As the native client: nothing an unregistered server says may reach the node.
                         let message = format!("Server {} sent application traffic before its presence registered; closing", self.url);
                         error!("{}", message);
@@ -354,8 +356,8 @@ impl ConnectionInner {
         // Close the WebSocket connection with a normal closure (code 1000)
         let _ = self.ws.close();
         self._callbacks.lock().unwrap().take();
-        if let Some(peer) = self.registered_peer.take() {
-            self.node.deregister_peer(peer);
+        if let Some(registration) = self.registration.take() {
+            self.node.deregister_peer(registration);
         }
     }
 }

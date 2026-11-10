@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use ankurah_core::connector::{PeerProvenance, PeerSender, SendError};
-use ankurah_core::node::{Node, WeakNode};
+use ankurah_core::node::{ConnectionRegistration, Node, WeakNode};
 
 #[derive(Clone)]
 /// Sender for local process connection
@@ -40,8 +40,10 @@ where
     receiver2_task: tokio::task::JoinHandle<()>,
     node1: WeakNode<SE1, PA1>,
     node2: WeakNode<SE2, PA2>,
-    node1_id: proto::NodeId,
-    node2_id: proto::NodeId,
+    /// `node1`'s registration of `node2`.
+    registration1: ConnectionRegistration,
+    /// `node2`'s registration of `node1`.
+    registration2: ConnectionRegistration,
 }
 
 impl<SE1, PA1, SE2, PA2> LocalProcessConnection<SE1, PA1, SE2, PA2>
@@ -75,29 +77,35 @@ where
         let register_node2 =
             node2.register_peer(presence1, handshake2, provenance2, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }));
         // The dialing side registers its peer first, as a websocket client registers the server before sending its presence.
-        if node2_dials {
-            register_node2.await?;
-            if let Err(error) = register_node1.await {
-                node2.deregister_peer(node1.id);
-                return Err(error.into());
+        let (registration1, registration2) = if node2_dials {
+            let registration2 = register_node2.await?;
+            match register_node1.await {
+                Ok(registration1) => (registration1, registration2),
+                Err(error) => {
+                    node2.deregister_peer(registration2);
+                    return Err(error.into());
+                }
             }
         } else {
-            register_node1.await?;
-            if let Err(error) = register_node2.await {
-                node1.deregister_peer(node2.id);
-                return Err(error.into());
+            let registration1 = register_node1.await?;
+            match register_node2.await {
+                Ok(registration2) => (registration1, registration2),
+                Err(error) => {
+                    node1.deregister_peer(registration1);
+                    return Err(error.into());
+                }
             }
-        }
+        };
 
-        let receiver1_task = Self::setup_receiver(node1.clone(), node2.id, node2.state(), node1_rx);
-        let receiver2_task = Self::setup_receiver(node2.clone(), node1.id, node1.state(), node2_rx);
+        let receiver1_task = Self::setup_receiver(node1.clone(), registration1, node2.state(), node1_rx);
+        let receiver2_task = Self::setup_receiver(node2.clone(), registration2, node1.state(), node2_rx);
 
-        Ok(Self { node1: node1.weak(), node2: node2.weak(), node1_id: node1.id, node2_id: node2.id, receiver1_task, receiver2_task })
+        Ok(Self { node1: node1.weak(), node2: node2.weak(), registration1, registration2, receiver1_task, receiver2_task })
     }
 
     fn setup_receiver<SE, PA>(
         node: Node<SE, PA>,
-        peer_id: proto::NodeId,
+        registration: ConnectionRegistration,
         peer_state: Read<NodeState>,
         mut rx: mpsc::Receiver<proto::NodeMessage>,
     ) -> tokio::task::JoinHandle<()>
@@ -119,7 +127,7 @@ where
                     let _ = node.handle_message(message).await;
                 });
             }
-            node.deregister_peer(peer_id);
+            node.deregister_peer(registration);
         })
     }
 }
@@ -135,10 +143,10 @@ where
         self.receiver1_task.abort();
         self.receiver2_task.abort();
         if let Some(node1) = self.node1.upgrade() {
-            node1.deregister_peer(self.node2_id);
+            node1.deregister_peer(self.registration1);
         }
         if let Some(node2) = self.node2.upgrade() {
-            node2.deregister_peer(self.node1_id);
+            node2.deregister_peer(self.registration2);
         }
     }
 }

@@ -173,9 +173,8 @@ where
     }
 
     // Clean up peer registration if we had registered one
-    if let Connection::Established(peer_sender) = conn {
-        use ankurah_core::connector::PeerSender;
-        node.deregister_peer(peer_sender.recipient_node_id());
+    if let Connection::Established { registration, .. } = conn {
+        node.deregister_peer(registration);
     }
 
     debug!("Websocket context {client_ip} destroyed");
@@ -261,7 +260,7 @@ where
 
                                     // Outside the deadline: cancelling registration partway could leave the peer registered.
                                     match node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(sender.clone())).await {
-                                        Ok(()) => *state = Connection::Established(sender),
+                                        Ok(registration) => *state = Connection::Established { sender, registration },
                                         Err(rejection) => {
                                             warn!("Refusing peer at {client_ip}: {rejection}");
                                             return ControlFlow::Break(());
@@ -273,7 +272,7 @@ where
                         }
                     }
                     proto::Message::PeerMessage(msg) => {
-                        if let Connection::Established(_) = state {
+                        if let Connection::Established { .. } = state {
                             tokio::spawn(async move {
                                 if let Err(e) = node.handle_message(msg).await {
                                     error!("Error handling message from {}: {:?}", client_ip, e);

@@ -55,6 +55,7 @@ pub use key::NodeKey;
 use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
+pub use peers::ConnectionRegistration;
 use peers::{PeerRegistry, RequiredTrust};
 use plugin::NodePlugins;
 pub use plugin::{AnnouncementFailure, DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};
@@ -328,7 +329,8 @@ where
     /// Register a peer connection whose presence completes `handshake`, this node's side of it.
     /// `provenance` says how the connection was made; the policy agent's [`PolicyAgent::peer_trust`]
     /// decides from it whether the peer is durable. Then each plugin is asked, in the order
-    /// plugged, and the first refusal leaves the peer unregistered.
+    /// plugged, and the first refusal leaves the peer unregistered. The connector holds the
+    /// registration returned while the connection is open.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.claims.node_id.to_base64_short(), durable = %presence.claims.durable)))]
     pub async fn register_peer(
         &self,
@@ -336,7 +338,7 @@ where
         handshake: Handshake,
         provenance: PeerProvenance,
         sender: Box<dyn PeerSender>,
-    ) -> Result<(), PeerConnectionError> {
+    ) -> Result<ConnectionRegistration, PeerConnectionError> {
         action_info!(self, "register_peer", "{}", &presence);
 
         if let Err(refusal) = handshake.authenticate(self.id, &presence) {
@@ -358,15 +360,18 @@ where
         // A plugin may have halted this node.
         self.lifecycle.check_not_halted()?;
         let subscription_handler = SubscriptionHandler::new(peer, self);
-        self.peers.register(peer, PeerState::new(sender, trust, subscription_handler), self.subscription_relay.as_ref());
+        let registration = self.peers.register(peer, sender, trust, subscription_handler, self.subscription_relay.as_ref());
         // TODO send hello message to the peer, including present head state for all relevant collections
-        Ok(())
+        Ok(registration)
     }
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %node_id.to_base64_short())))]
-    pub fn deregister_peer(&self, node_id: proto::NodeId) {
+    /// Remove `registration`, which [`Node::register_peer`] returned; a newer registration of the
+    /// same peer stays.
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %registration.peer().to_base64_short())))]
+    pub fn deregister_peer(&self, registration: ConnectionRegistration) {
+        let node_id = registration.peer();
         notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
 
-        if let Some(peer_state) = self.peers.deregister(node_id, self.subscription_relay.as_ref()) {
+        if let Some(peer_state) = self.peers.deregister(registration, self.subscription_relay.as_ref()) {
             action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
             // ReactorSubscription is automatically unsubscribed on drop
         }
