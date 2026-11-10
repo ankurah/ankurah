@@ -214,9 +214,8 @@ impl NodeApplier {
         // Reject undecodable snapshots before persisting them or attaching a resident.
         crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
         Self::check_snapshot_events(node, state, &proto::Clock::default(), events, event_getter).await?;
-        let attestation = node.policy_agent.attest_state(node, state);
         let mut storage_trx = node.storage.transaction();
-        storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
+        storage_trx.set_state(&proto::Clock::default(), state).await?;
         storage_trx.add_events(events).await?;
         let _publication = node.commit_publication_lock.lock().await;
         match node.lifecycle.begin_storage_write()?.commit(storage_trx).await? {
@@ -257,18 +256,14 @@ impl NodeApplier {
                 candidate.apply_events(event_getter, &mut events, admitted, |_| Ok(None)).await?;
             }
             let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
-            let attestation = node.policy_agent.attest_state(node, &state);
-            let state = Attested::opt(state, attestation);
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
             node.lifecycle.begin_storage_write()?.commit(storage_trx).await?.committed()?;
             if adopted {
-                let (_, entity) = node
-                    .entities
-                    .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
-                    .await?;
+                let (_, entity) =
+                    node.entities.with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.state).await?;
                 Ok(Some(EntityChange::new(entity, events)))
             } else {
                 let change = candidate.commit(&node.entities, event_getter, false).await?;
@@ -299,9 +294,8 @@ impl NodeApplier {
             let mut events = events.to_vec();
             candidate.apply_events(event_getter, &mut events, admitted, |_| Ok(None)).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
-            let attestation = node.policy_agent.attest_state(node, &state);
             let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+            storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
             node.lifecycle.begin_storage_write()?.commit(storage_trx).await?.committed()?;

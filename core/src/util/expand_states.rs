@@ -7,11 +7,11 @@ use ankurah_proto as proto;
 /// When a client has knowledge of entities that don't appear in the current predicate results,
 /// we need to fetch their current state individually to generate proper deltas (including removals).
 pub async fn expand_states<SE: crate::storage::StorageEngine>(
-    mut states: Vec<proto::Attested<proto::EntityState>>,
+    mut states: Vec<proto::EntityState>,
     additional_entity_ids: impl IntoIterator<Item = proto::EntityId>,
     storage: &SE,
-) -> Result<Vec<proto::Attested<proto::EntityState>>, RetrievalError> {
-    let mut entity_map: std::collections::HashSet<_> = states.iter().map(|s| s.payload.entity_id).collect();
+) -> Result<Vec<proto::EntityState>, RetrievalError> {
+    let mut entity_map: std::collections::HashSet<_> = states.iter().map(|s| s.entity_id).collect();
 
     for entity_id in additional_entity_ids {
         if !entity_map.contains(&entity_id) {

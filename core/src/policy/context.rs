@@ -4,11 +4,12 @@ use crate::entity::{Entity, TemporaryEntity};
 use crate::error::{InadmissibleEvent, MutationError};
 use crate::node::Node;
 use crate::selection::filter::evaluate_predicate;
-use crate::storage::StorageEngine;
+use crate::storage::{GetStateResult, StorageEngine};
 use crate::util::Iterable;
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{Attestation, Attested, EntityId, EntityState, Event, GetResult, ModelId, State};
+use ankurah_proto::{Attestation, Attested, EntityId, Event, ModelId, State};
 use ankurah_signals::{ListenerGuard, Mut, Peek, Signal};
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -146,29 +147,21 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
         Ok(())
     }
 
-    /// Apply additional checks to a batch that has already passed the storage predicate.
-    pub(crate) fn check_reads(&self, results: &mut [GetResult]) {
+    /// The ids of the states found in `results`, a batch that has already passed the storage
+    /// predicate, that the agent's additional checks deny.
+    pub(crate) fn check_reads(&self, results: &[GetStateResult]) -> HashSet<EntityId> {
         if matches!(&self.auth, ContextAuth::Privileged) {
-            return;
+            return HashSet::new();
         }
         let states: Vec<_> = results
             .iter()
             .filter_map(|result| {
-                let GetResult::Found(state) = result else { return None };
-                (!state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy))
-                    .then_some((&state.payload.entity_id, &state.payload.state))
+                let GetStateResult::Found(state) = result else { return None };
+                (!state.state.memberships.iter().any(crate::schema::reads_bypass_policy)).then_some((&state.entity_id, &state.state))
             })
             .collect();
         let denied = self.agent.check_reads(&self.credentials(), &states);
-        for result in results {
-            if let GetResult::Found(state) = result {
-                if denied.contains_key(&state.payload.entity_id)
-                    && !state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy)
-                {
-                    *result = GetResult::AccessDenied(state.payload.entity_id);
-                }
-            }
-        }
+        states.into_iter().map(|(id, _)| *id).filter(|id| denied.contains_key(id)).collect()
     }
 
     /// Require entity visibility and any additional event-specific permission.
@@ -226,13 +219,6 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
         match &self.auth {
             ContextAuth::Sessions(_) => Ok(self.agent.check_write_event(node, &self.write_credential()?, before, after, event)?),
             ContextAuth::Privileged => Ok(None),
-        }
-    }
-
-    pub(crate) fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, PA>, state: &EntityState) -> Option<Attestation> {
-        match &self.auth {
-            ContextAuth::Sessions(_) => self.agent.attest_state(node, state),
-            ContextAuth::Privileged => None,
         }
     }
 }

@@ -76,12 +76,3 @@ impl std::fmt::Display for EntityState {
 impl From<EntityState> for Attested<EntityState> {
     fn from(val: EntityState) -> Self { Attested { payload: val, attestations: AttestationSet::default() } }
 }
-
-impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, StateFragment) {
-        (self.payload.entity_id, StateFragment { state: self.payload.state, attestations: self.attestations })
-    }
-    pub fn from_parts(entity_id: EntityId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, state: fragment.state }, attestations: fragment.attestations }
-    }
-}

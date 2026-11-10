@@ -60,7 +60,7 @@ async fn commits_stamp_from_the_head_including_after_multitip_rehydration() -> R
     // Forked from the genesis before the chain, so it extends generation 1 however late it commits.
     let stale = stale.commit_and_return_events().await?.remove(0);
     assert_eq!(stale.generation(), 2);
-    let stored = node.storage.get_state(id).await?.payload.state;
+    let stored = node.storage.get_state(id).await?.state;
     assert_eq!(stored.head, proto::Clock::new(vec![(3, chain[2].id()), (2, stale.id())])?, "each tip retains its own generation");
     drop(record);
     assert!(node.get_resident_entity(id).is_none(), "the entity must actually be evicted");
@@ -74,7 +74,7 @@ async fn commits_stamp_from_the_head_including_after_multitip_rehydration() -> R
     let merged = merge.commit_and_return_events().await?;
     assert_eq!(merged[0].parent.len(), 2, "the merge extends both tips");
     assert_eq!(merged[0].generation(), 4, "one more than the greater tip, generation 3");
-    let stored = node.storage.get_state(id).await?.payload.state;
+    let stored = node.storage.get_state(id).await?.state;
     assert_eq!(stored.head, proto::Clock::singleton(&merged[0]));
     Ok(())
 }
@@ -113,7 +113,7 @@ async fn an_ephemeral_node_stamps_an_edit_of_a_snapshot_without_fetching_its_hea
     let genesis = proto::EventId::from(id.to_bytes());
     let record = client_ctx.get::<RecordView>(id).await?;
     assert!(client.storage.get_events(vec![genesis.clone()]).await?.is_empty(), "a snapshot brings no events");
-    let snapshot = client.storage.get_state(id).await?.payload.state;
+    let snapshot = client.storage.get_state(id).await?.state;
     assert_eq!(snapshot.head, proto::Clock::genesis(genesis.clone()));
 
     let trx = client_ctx.begin();
@@ -174,14 +174,14 @@ impl StorageEngine for CountEventReads {
 
     fn transaction(&self) -> Self::Transaction<'_> { self.inner.transaction() }
 
-    async fn get_state(&self, id: proto::EntityId) -> Result<proto::Attested<proto::EntityState>, ankurah::error::RetrievalError> {
+    async fn get_state(&self, id: proto::EntityId) -> Result<proto::EntityState, ankurah::error::RetrievalError> {
         self.inner.get_state(id).await
     }
 
     async fn fetch_states(
         &self,
         selection: &ankql::ast::Selection<ankql::ast::Resolved>,
-    ) -> Result<Vec<proto::Attested<proto::EntityState>>, ankurah::error::RetrievalError> {
+    ) -> Result<Vec<proto::EntityState>, ankurah::error::RetrievalError> {
         self.inner.fetch_states(selection).await
     }
 

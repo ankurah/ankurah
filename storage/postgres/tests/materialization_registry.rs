@@ -27,40 +27,37 @@ impl CatalogResolver for TestResolver {
 
 fn entity_id(byte: u8) -> EntityId { EntityId::from_bytes([byte; EntityId::BYTE_LEN]) }
 
-fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId, &str)]) -> Attested<EntityState> {
+fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId, &str)]) -> EntityState {
     let backend = LWWBackend::new();
     for (property, value) in values {
         backend.set(*property, Some(Value::String((*value).to_owned())));
     }
     let event = ankurah::core::test_helpers::commit_backend(&backend, event_byte).unwrap();
-    Attested::opt(
-        EntityState {
-            entity_id,
-            state: State {
-                state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
-                memberships: BTreeSet::new(),
-                // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
-                head: Clock::singleton(&event),
-            },
+    EntityState {
+        entity_id,
+        state: State {
+            state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
+            memberships: BTreeSet::new(),
+            // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
+            head: Clock::singleton(&event),
         },
-        None,
-    )
+    }
 }
 
-fn state_for_model(mut state: Attested<EntityState>, model: ModelId) -> Attested<EntityState> {
-    state.payload.state.memberships = [model].into();
+fn state_for_model(mut state: EntityState, model: ModelId) -> EntityState {
+    state.state.memberships = [model].into();
     state
 }
 
-fn state_for_models(mut state: Attested<EntityState>, models: impl IntoIterator<Item = ModelId>) -> Attested<EntityState> {
-    state.payload.state.memberships = models.into_iter().collect();
+fn state_for_models(mut state: EntityState, models: impl IntoIterator<Item = ModelId>) -> EntityState {
+    state.state.memberships = models.into_iter().collect();
     state
 }
 
 async fn commit_canonical_state(
     engine: &ankurah_storage_postgres::Postgres,
     expected_head: Clock,
-    state: Attested<EntityState>,
+    state: EntityState,
 ) -> anyhow::Result<()> {
     let mut transaction = engine.transaction();
     transaction.set_state(&expected_head, &state).await?;
@@ -73,7 +70,7 @@ async fn commit_state(
     engine: &ankurah_storage_postgres::Postgres,
     expected_head: Clock,
     model: ModelId,
-    state: Attested<EntityState>,
+    state: EntityState,
 ) -> anyhow::Result<()> {
     commit_canonical_state(engine, expected_head, state_for_model(state, model)).await
 }
@@ -162,8 +159,8 @@ async fn long_labels_remain_distinct_within_postgres_identifier_limit() -> anyho
     let all = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
     let model_a_states = engine.fetch_states(&all.clone().and_member_of(model_a)).await?;
     let model_b_states = engine.fetch_states(&all.clone().and_member_of(model_b)).await?;
-    assert_eq!(model_a_states.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity_a]);
-    assert_eq!(model_b_states.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity_b]);
+    assert_eq!(model_a_states.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity_a]);
+    assert_eq!(model_b_states.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity_b]);
 
     let client = pool.get().await?;
     let rows = client
@@ -218,7 +215,7 @@ async fn write_refreshes_every_canonical_membership_materialization() -> anyhow:
     let initial = state_for_models(state_with_strings(entity, 1, &[(property_a, "a1"), (property_b, "b1")]), [model_a, model_b]);
     commit_canonical_state(&engine, Clock::default(), initial.clone()).await?;
     let updated = state_for_models(state_with_strings(entity, 2, &[(property_a, "a2"), (property_b, "b2")]), [model_a, model_b]);
-    commit_canonical_state(&engine, initial.payload.state.head, updated.clone()).await?;
+    commit_canonical_state(&engine, initial.state.head, updated.clone()).await?;
 
     let selection: ankql::ast::Selection<ankql::ast::Resolved> = ankql::ast::Predicate::Comparison {
         left: Box::new(ankql::ast::Expr::Path(property_b.into())),
@@ -228,9 +225,9 @@ async fn write_refreshes_every_canonical_membership_materialization() -> anyhow:
     .into();
     let found = engine.fetch_states(&selection.clone().and_member_of(model_b)).await?;
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].payload.entity_id, entity);
+    assert_eq!(found[0].entity_id, entity);
     let removed = state_for_models(state_with_strings(entity, 3, &[(property_a, "a3")]), [model_a, model_b]);
-    commit_canonical_state(&engine, updated.payload.state.head, removed).await?;
+    commit_canonical_state(&engine, updated.state.head, removed).await?;
     assert!(
         engine.fetch_states(&selection.clone().and_member_of(model_b)).await?.is_empty(),
         "removed properties must not retain old values"
@@ -259,7 +256,7 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
 
     let mut transaction = engine.transaction();
     transaction
-        .set_state(&first.payload.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
+        .set_state(&first.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
         .await?;
     transaction
         .set_state(&Clock::default(), &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b))
@@ -268,10 +265,10 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
     let StorageCommitOutcome::Conflict { observed } = outcome else {
         anyhow::bail!("one stale expected head must reject the complete batch");
     };
-    assert_eq!(observed[&first_id].as_ref().unwrap().payload.state.head, first.payload.state.head);
-    assert_eq!(observed[&second_id].as_ref().unwrap().payload.state.head, second.payload.state.head);
-    assert_eq!(engine.get_state(first_id).await?.payload.state.head, first.payload.state.head);
-    assert_eq!(engine.get_state(second_id).await?.payload.state.head, second.payload.state.head);
+    assert_eq!(observed[&first_id].as_ref().unwrap().state.head, first.state.head);
+    assert_eq!(observed[&second_id].as_ref().unwrap().state.head, second.state.head);
+    assert_eq!(engine.get_state(first_id).await?.state.head, first.state.head);
+    assert_eq!(engine.get_state(second_id).await?.state.head, second.state.head);
 
     let all = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
     assert!(
@@ -310,7 +307,7 @@ async fn independent_engines_cannot_commit_the_same_expected_head() -> anyhow::R
         assert_eq!(second.get_state(id).await?, winner);
         let projected = second.fetch_states(&ankql::ast::Predicate::MemberOf(model).into()).await?;
         assert_eq!(projected, vec![winner.clone()]);
-        expected = winner.payload.state.head;
+        expected = winner.state.head;
     }
     Ok(())
 }
@@ -327,14 +324,14 @@ async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Resul
     let mut events = Vec::new();
     let mut writes = Vec::new();
     for old in &initial {
-        let event = ankurah::proto::Event::update(old.payload.entity_id, old.payload.state.head.clone(), Default::default());
-        let mut state = state_with_strings(old.payload.entity_id, 3, &[(property, "after")]);
-        state.payload.state.head = Clock::singleton(&event);
+        let event = ankurah::proto::Event::update(old.entity_id, old.state.head.clone(), Default::default());
+        let mut state = state_with_strings(old.entity_id, 3, &[(property, "after")]);
+        state.state.head = Clock::singleton(&event);
         events.push(Attested::opt(event, None));
-        writes.push((old.payload.state.head.clone(), state));
+        writes.push((old.state.head.clone(), state));
     }
     let connection = pool.get().await?;
-    let rejected = initial[1].payload.entity_id.to_base64();
+    let rejected = initial[1].entity_id.to_base64();
     connection
         .batch_execute(&format!(
             r#"
@@ -359,7 +356,7 @@ async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Resul
     assert!(format!("{error:?}").contains("test write failure"), "{error:?}");
     assert!(engine.get_events(events.iter().map(|event| event.payload.id()).collect()).await?.is_empty());
     for state in &initial {
-        assert_eq!(engine.get_state(state.payload.entity_id).await?.payload.state, state.payload.state);
+        assert_eq!(engine.get_state(state.entity_id).await?.state, state.state);
     }
 
     connection.batch_execute(r#"DROP TRIGGER reject_second ON "_ankurah_entity"; DROP FUNCTION reject_second();"#).await?;
@@ -374,7 +371,7 @@ async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Resul
     events.sort_by_key(|event| event.payload.id());
     assert_eq!(stored, events, "the stored events read back unchanged, generation included");
     for (_, state) in writes {
-        assert_eq!(engine.get_state(state.payload.entity_id).await?.payload.state, state.payload.state);
+        assert_eq!(engine.get_state(state.entity_id).await?.state, state.state);
     }
     Ok(())
 }
@@ -432,7 +429,7 @@ async fn the_loser_of_a_race_to_assign_a_system_property_column_adopts_the_winne
     }
     .into();
     let mut found = engine.fetch_states(&named.and_member_of(model)).await?;
-    found.sort_by_key(|state| state.payload.entity_id);
+    found.sort_by_key(|state| state.entity_id);
     assert_eq!(found, vec![first, second]);
     Ok(())
 }

@@ -2,7 +2,7 @@ use crate::internal::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ankurah_proto::{Attested, EntityId, EntityState, Event};
+use ankurah_proto::{EntityId, EntityState, Event};
 
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
@@ -219,8 +219,7 @@ impl Transaction {
                     .await?;
                 storage_trx.add_events(&events).await?;
                 let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
-                let attestation = policy.attest_state(node, &state);
-                storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+                storage_trx.set_state(&expected_head, &state).await?;
                 attested_events.extend(events);
                 forks.push((entity, entity_after));
             }

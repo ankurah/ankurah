@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ankql::ast::{Resolved, Selection};
 use ankurah_core::error::RetrievalError;
-use ankurah_proto::{Attested, EntityId, EntityState};
+use ankurah_proto::{EntityId, EntityState};
 use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::select_states};
 use futures::StreamExt;
 use send_wrapper::SendWrapper;
@@ -13,7 +13,7 @@ use crate::database::Database;
 use crate::util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, require::WBGRequire};
 
 /// Read membership keys and their matching states in one IndexedDB snapshot.
-pub(crate) async fn fetch(database: &Database, selection: &Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+pub(crate) async fn fetch(database: &Database, selection: &Selection<Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
     let plan = MaterializationPlan::new(selection);
     let mut names = Vec::new();
     for model in &plan.models {

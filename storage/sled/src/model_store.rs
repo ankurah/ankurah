@@ -7,8 +7,8 @@ use std::sync::atomic::AtomicBool;
 use ankql::ast::Predicate;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{error::RetrievalError, ModelId};
+use ankurah_proto::EntityState;
 use ankurah_proto::PropertyId;
-use ankurah_proto::{Attested, EntityState};
 use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection};
 use futures::Stream;
 use std::sync::Arc;
@@ -59,10 +59,7 @@ impl SledModelStore {
 
 impl SledModelStore {
     /// Query this model's projection and hydrate matching canonical states.
-    pub(crate) async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    pub(crate) async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         let inner = self.0.clone();
         let selection = selection.clone();
         Ok(task::spawn_blocking(move || inner.fetch_states_blocking(selection)).await??)
@@ -70,7 +67,7 @@ impl SledModelStore {
 }
 
 impl SledModelStoreInner {
-    fn fetch_states_blocking(&self, selection: ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    fn fetch_states_blocking(&self, selection: ankql::ast::Selection<Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         let resolved_selection = selection.clone();
         let manager = &self.database.property_manager;
 
@@ -131,7 +128,7 @@ impl SledModelStoreInner {
         remaining_predicate: Predicate<EngineColumns>,
         order_by_spill: OrderByComponents,
         selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    ) -> Result<Vec<EntityState>, RetrievalError> {
         use ankurah_core::{
             indexing::IndexKeyPart,
             value::{Value, ValueType},
@@ -184,7 +181,7 @@ impl SledModelStoreInner {
         ids: impl EntityIdStream,
         selection: &ankql::ast::Selection<Resolved>,
         ordered: bool,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    ) -> Result<Vec<EntityState>, RetrievalError> {
         use ankurah_core::{entity::TemporaryEntity, selection::filter::evaluate_predicate};
         use ankurah_storage_common::materialization_plan::MaterializationPlan;
         use futures::{StreamExt, TryStreamExt};
@@ -208,7 +205,7 @@ impl SledModelStoreInner {
             let mut matches = Vec::new();
             while let Some(state) = states.next().await {
                 let state = state?;
-                let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
+                let entity = TemporaryEntity::new(state.entity_id, &state.state)?;
                 if !evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) {
                     continue;
                 }
@@ -227,7 +224,7 @@ impl SledModelStoreInner {
         remaining_predicate: Predicate<EngineColumns>,
         order_by_spill: OrderByComponents,
         selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    ) -> Result<Vec<EntityState>, RetrievalError> {
         if !selection.predicate.referenced_models().is_empty() {
             let ids = SledMaterializationKeyScanner::new(&self.tree, &bounds, scan_direction)?;
             return self.filter_candidate_states(ids, selection, order_by_spill.is_satisfied());
@@ -251,7 +248,7 @@ impl SledModelStoreInner {
         remaining_predicate: Predicate<EngineColumns>,
         order_by_spill: OrderByComponents,
         limit: Option<u64>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError>
+    ) -> Result<Vec<EntityState>, RetrievalError>
     where
         S: Stream<Item = ProjectedEntity> + Unpin,
     {
@@ -287,49 +284,46 @@ mod tests {
         storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
         value::Value,
     };
-    use ankurah_proto::{Attested, Clock, EntityId, EventId, PropertyId, State, StateBuffers};
+    use ankurah_proto::{Clock, EntityId, EventId, PropertyId, State, StateBuffers};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn entity_id(byte: u8) -> EntityId { EntityId::from_bytes([byte; EntityId::BYTE_LEN]) }
 
-    fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId, &str)]) -> Attested<EntityState> {
+    fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId, &str)]) -> EntityState {
         let backend = LWWBackend::new();
         for (property, value) in values {
             backend.set(*property, Some(Value::String((*value).to_owned())));
         }
         let event = ankurah_core::test_helpers::commit_backend(&backend, event_byte).unwrap();
-        Attested::opt(
-            EntityState {
-                entity_id,
-                state: State {
-                    state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
-                    memberships: BTreeSet::new(),
-                    // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
-                    head: Clock::singleton(&event),
-                },
+        EntityState {
+            entity_id,
+            state: State {
+                state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
+                memberships: BTreeSet::new(),
+                // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
+                head: Clock::singleton(&event),
             },
-            None,
-        )
+        }
     }
 
-    fn state_for_model(mut state: Attested<EntityState>, model: ModelId) -> Attested<EntityState> {
-        state.payload.state.memberships = [model].into();
+    fn state_for_model(mut state: EntityState, model: ModelId) -> EntityState {
+        state.state.memberships = [model].into();
         state
     }
 
-    fn state_for_models(mut state: Attested<EntityState>, models: impl IntoIterator<Item = ModelId>) -> Attested<EntityState> {
-        state.payload.state.memberships = models.into_iter().collect();
+    fn state_for_models(mut state: EntityState, models: impl IntoIterator<Item = ModelId>) -> EntityState {
+        state.state.memberships = models.into_iter().collect();
         state
     }
 
-    async fn commit_canonical_state(engine: &crate::SledStorageEngine, expected_head: Clock, state: Attested<EntityState>) {
+    async fn commit_canonical_state(engine: &crate::SledStorageEngine, expected_head: Clock, state: EntityState) {
         let mut transaction = engine.transaction();
         transaction.set_state(&expected_head, &state).await.unwrap();
         let outcome = transaction.commit().await.unwrap();
         assert!(matches!(outcome, StorageCommitOutcome::Committed(_)));
     }
 
-    async fn commit_state(engine: &crate::SledStorageEngine, expected_head: Clock, model: ModelId, state: Attested<EntityState>) {
+    async fn commit_state(engine: &crate::SledStorageEngine, expected_head: Clock, model: ModelId, state: EntityState) {
         commit_canonical_state(engine, expected_head, state_for_model(state, model)).await;
     }
 
@@ -345,7 +339,7 @@ mod tests {
         let initial = state_for_models(state_with_strings(entity, 1, &[(property_a, "a1"), (property_b, "b1")]), [model_a, model_b]);
         commit_canonical_state(&engine, Clock::default(), initial.clone()).await;
         let updated = state_for_models(state_with_strings(entity, 2, &[(property_a, "a2"), (property_b, "b2")]), [model_a, model_b]);
-        commit_canonical_state(&engine, initial.payload.state.head, updated).await;
+        commit_canonical_state(&engine, initial.state.head, updated).await;
 
         let selection = ankql::ast::Selection {
             predicate: Predicate::Comparison {
@@ -358,7 +352,7 @@ mod tests {
         };
         let found = engine.fetch_states(&selection.clone().and_member_of(model_b)).await.unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].payload.entity_id, entity);
+        assert_eq!(found[0].entity_id, entity);
     }
 
     #[tokio::test]
@@ -386,7 +380,7 @@ mod tests {
         })
         .and_member_of(b);
         let found = engine.fetch_states(&selection).await.unwrap();
-        assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity_id(6)]);
+        assert_eq!(found.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity_id(6)]);
     }
 
     #[tokio::test]
@@ -425,7 +419,7 @@ mod tests {
                 selection.order_by = None;
             }
             let states = engine.fetch_states(&selection).await.unwrap();
-            assert_eq!(states.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity_id(6)]);
+            assert_eq!(states.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity_id(6)]);
         }
         let union = Selection::from(Predicate::Or(Box::new(Predicate::MemberOf(b)), Box::new(comparison))).and_member_of(a);
         assert!(engine.fetch_states(&union).await.is_err(), "OR permits the unreadable entity, so it must still be read");
@@ -446,7 +440,7 @@ mod tests {
 
         let mut transaction = engine.transaction();
         transaction
-            .set_state(&first.payload.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
+            .set_state(&first.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
             .await
             .unwrap();
         transaction
@@ -457,10 +451,10 @@ mod tests {
         let StorageCommitOutcome::Conflict { observed } = outcome else {
             panic!("one stale expected head must reject the complete batch");
         };
-        assert_eq!(observed[&first_id].as_ref().unwrap().payload.state.head, first.payload.state.head);
-        assert_eq!(observed[&second_id].as_ref().unwrap().payload.state.head, second.payload.state.head);
-        assert_eq!(engine.get_state(first_id).await.unwrap().payload.state.head, first.payload.state.head);
-        assert_eq!(engine.get_state(second_id).await.unwrap().payload.state.head, second.payload.state.head);
+        assert_eq!(observed[&first_id].as_ref().unwrap().state.head, first.state.head);
+        assert_eq!(observed[&second_id].as_ref().unwrap().state.head, second.state.head);
+        assert_eq!(engine.get_state(first_id).await.unwrap().state.head, first.state.head);
+        assert_eq!(engine.get_state(second_id).await.unwrap().state.head, second.state.head);
 
         let all = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         assert!(
@@ -475,9 +469,9 @@ mod tests {
         let entity = entity_id(0x51);
         let mut state = state_with_strings(entity, 1, &[(PropertyId::EntityId(entity_id(0x52)), "value")]);
         // Synthetic tips with distinct generations: the engine must retain each association.
-        state.payload.state.head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
+        state.state.head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
         commit_canonical_state(&engine, Clock::default(), state.clone()).await;
-        let stored = engine.get_state(entity).await.unwrap().payload.state;
-        assert_eq!(stored.head, state.payload.state.head);
+        let stored = engine.get_state(entity).await.unwrap().state;
+        assert_eq!(stored.head, state.state.head);
     }
 }

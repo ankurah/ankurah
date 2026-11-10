@@ -13,7 +13,7 @@ use ankurah_core::{
     value::{Value, ValueType},
     ModelId,
 };
-use ankurah_proto::{self as proto, Attested, EntityState};
+use ankurah_proto::{self as proto, EntityState};
 use send_wrapper::SendWrapper;
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -151,25 +151,22 @@ impl std::fmt::Display for IndexedDBBucket {
 impl IndexedDBBucket {
     /// Assign any missing durable fields and build a projection ready for the
     /// engine's atomic state transaction.
-    pub(crate) async fn prepare_state(&self, state: &Attested<EntityState>) -> Result<PreparedIndexedDbMaterialization, MutationError> {
+    pub(crate) async fn prepare_state(&self, state: &EntityState) -> Result<PreparedIndexedDbMaterialization, MutationError> {
         self.ensure_property_columns_loaded().await?;
 
         let materialized = Object::new(js_sys::Object::new().into());
-        materialized.set(&*ID_KEY, state.payload.entity_id.to_base64())?;
+        materialized.set(&*ID_KEY, state.entity_id.to_base64())?;
         materialized.set(&*MATERIALIZATION_KEY, self.materialization_name.as_str())?;
-        self.extract_fields(&materialized, &state.payload).await?;
+        self.extract_fields(&materialized, state).await?;
 
         Ok(PreparedIndexedDbMaterialization {
-            key: materialization_entity_key(&self.materialization_name, state.payload.entity_id),
+            key: materialization_entity_key(&self.materialization_name, state.entity_id),
             object: materialized,
         })
     }
 
     /// Query this model's projection and hydrate matching canonical states.
-    pub(crate) async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    pub(crate) async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         let _lock = self.mutex.lock().await;
 
         // Resolve, through this engine's own durable map, the field for every
@@ -556,7 +553,7 @@ impl IndexedDBBucket {
         eq_prefix_values: Vec<ankurah_core::value::Value>,
         order_by_spill: &OrderByComponents,
         field_types: &BTreeMap<String, ValueType>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    ) -> Result<Vec<EntityState>, RetrievalError> {
         if limit == Some(0) {
             return Ok(Vec::new());
         }

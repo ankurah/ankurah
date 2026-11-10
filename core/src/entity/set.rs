@@ -62,7 +62,7 @@ impl WeakEntitySet {
             Some(entity) => Ok(Some(entity)),
             None => match state_getter.get_state(*id).await? {
                 None => Ok(None),
-                Some(state) => Ok(Some(self.with_state(state_getter, event_getter, *id, state.payload.state).await?.1)),
+                Some(state) => Ok(Some(self.with_state(state_getter, event_getter, *id, state.state).await?.1)),
             },
         }
     }
@@ -110,7 +110,7 @@ impl WeakEntitySet {
             Some(entity) => entity.resident()?,
             None => {
                 if let Some(stored) = state_getter.get_state(id).await? {
-                    self.get_or_insert_state(id, &stored.payload.state)?.1
+                    self.get_or_insert_state(id, &stored.state)?.1
                 } else {
                     match self.get_or_insert_state(id, &state)? {
                         (true, entity) => entity,

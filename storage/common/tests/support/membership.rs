@@ -8,7 +8,7 @@ use ankurah_core::{
     storage::{GetStateResult, StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::Value,
 };
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, EventId, ModelId, PropertyId, State, StateBuffers};
+use ankurah_proto::{Clock, EntityId, EntityState, EventId, ModelId, PropertyId, State, StateBuffers};
 
 struct Labels;
 
@@ -53,7 +53,7 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
         (equals(p, "a"), vec![4]),
     ] {
         let states = engine.fetch_states(&predicate.clone().into()).await?;
-        let mut actual: Vec<_> = states.iter().map(|state| state.payload.entity_id).collect();
+        let mut actual: Vec<_> = states.iter().map(|state| state.entity_id).collect();
         actual.sort();
         let expected: Vec<_> = expected.into_iter().map(id).collect();
         assert_eq!(actual, expected, "{predicate:?}");
@@ -66,9 +66,9 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
         order_by: Some(vec![OrderByItem { path: p.into(), direction: OrderDirection::Asc }]),
         limit: Some(2),
     };
-    assert_eq!(engine.fetch_states(&ordered).await?.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![id(2), id(3)]);
+    assert_eq!(engine.fetch_states(&ordered).await?.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![id(2), id(3)]);
     let limited = Selection { predicate: and(member(a), member(b)), order_by: None, limit: Some(1) };
-    assert_eq!(engine.fetch_states(&limited).await?.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![id(3)]);
+    assert_eq!(engine.fetch_states(&limited).await?.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![id(3)]);
     let missing = PropertyId::EntityId(id(203));
     let denied = and(member(a), Predicate::Not(Box::new(equals(missing, "blocked"))));
     assert!(
@@ -87,8 +87,7 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
         (and(member(a), Predicate::Not(Box::new(unknown.clone()))), vec![1, 3]),
         (Predicate::Not(Box::new(unknown)), vec![1, 2, 3, 4, 5]),
     ] {
-        let mut actual: Vec<_> =
-            engine.fetch_states(&predicate.clone().into()).await?.iter().map(|state| state.payload.entity_id).collect();
+        let mut actual: Vec<_> = engine.fetch_states(&predicate.clone().into()).await?.iter().map(|state| state.entity_id).collect();
         actual.sort();
         assert_eq!(actual, expected.into_iter().map(id).collect::<Vec<_>>(), "{predicate:?}");
     }
@@ -101,31 +100,31 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
     // Successive states for one entity belong to one transaction, not separate core write batches.
     let original = engine.get_state(id(5)).await?;
     let mut first = original.clone();
-    first.payload.state.head = Clock::new(vec![(2, EventId::from_bytes([40; 32]))]).unwrap();
-    first.payload.state.memberships.insert(a);
+    first.state.head = Clock::new(vec![(2, EventId::from_bytes([40; 32]))]).unwrap();
+    first.state.memberships.insert(a);
     let mut last = first.clone();
-    last.payload.state.head = Clock::new(vec![(3, EventId::from_bytes([41; 32]))]).unwrap();
-    last.payload.state.memberships.insert(b);
+    last.state.head = Clock::new(vec![(3, EventId::from_bytes([41; 32]))]).unwrap();
+    last.state.memberships.insert(b);
     let mut transaction = engine.transaction();
-    transaction.set_state(&original.payload.state.head, &first).await?;
+    transaction.set_state(&original.state.head, &first).await?;
     // Same event IDs with different generation annotations are not the state this write extends.
     let incorrect_head = Clock::new(vec![(99, EventId::from_bytes([40; 32]))])?;
     assert!(matches!(transaction.set_state(&incorrect_head, &last).await, Err(MutationError::InvalidUpdate(_))));
-    transaction.set_state(&first.payload.state.head, &last).await?;
+    transaction.set_state(&first.state.head, &last).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
-    assert_eq!(engine.get_state(id(5)).await?.payload.state, last.payload.state);
+    assert_eq!(engine.get_state(id(5)).await?.state, last.state);
     let incorrect_head = Clock::new(vec![(99, EventId::from_bytes([41; 32]))])?;
     let mut stale = engine.transaction();
     stale.set_state(&incorrect_head, &original).await?;
     match stale.commit().await? {
         StorageCommitOutcome::Conflict { observed } => {
-            assert_eq!(observed[&id(5)].as_ref().unwrap().payload.state, last.payload.state);
+            assert_eq!(observed[&id(5)].as_ref().unwrap().state, last.state);
         }
         StorageCommitOutcome::Committed(_) => panic!("a mismatched generation must conflict"),
     }
-    assert_eq!(engine.get_state(id(5)).await?.payload.state, last.payload.state);
+    assert_eq!(engine.get_state(id(5)).await?.state, last.state);
     let both = engine.fetch_states(&and(member(a), member(b)).into()).await?;
-    assert!(both.iter().any(|state| state.payload.entity_id == id(5)), "the last state's memberships are materialized");
+    assert!(both.iter().any(|state| state.entity_id == id(5)), "the last state's memberships are materialized");
     Ok(())
 }
 
@@ -140,7 +139,7 @@ pub async fn check_id_order(engine: &impl StorageEngine) -> anyhow::Result<()> {
             order_by: Some(vec![OrderByItem { path: PropertyId::Id.into(), direction }]),
             limit: Some(1),
         };
-        assert_eq!(engine.fetch_states(&selection).await?[0].payload.entity_id, id(expected));
+        assert_eq!(engine.fetch_states(&selection).await?[0].entity_id, id(expected));
     }
     Ok(())
 }
@@ -182,7 +181,7 @@ pub async fn check_indexed(engine: &impl StorageEngine) -> anyhow::Result<()> {
                 limit: Some(1),
             };
             let states = engine.fetch_states(&selection).await?;
-            assert_eq!(states.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![id(expected)]);
+            assert_eq!(states.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![id(expected)]);
         }
         if expected == 3 {
             write(engine, 2, &[a, b], &[(p, "bb")]).await?;
@@ -197,19 +196,16 @@ async fn write(engine: &impl StorageEngine, byte: u8, models: &[ModelId], values
         backend.set(*property, Some(Value::String((*value).into())));
     }
     let event = ankurah_core::test_helpers::commit_backend(&backend, byte.wrapping_add(values.len() as u8))?;
-    let state = Attested::opt(
-        EntityState {
-            entity_id: id(byte),
-            state: State {
-                state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
-                memberships: models.iter().copied().collect(),
-                head: Clock::singleton(&event),
-            },
+    let state = EntityState {
+        entity_id: id(byte),
+        state: State {
+            state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
+            memberships: models.iter().copied().collect(),
+            head: Clock::singleton(&event),
         },
-        None,
-    );
+    };
     let expected = match engine.get_state(id(byte)).await {
-        Ok(state) => state.payload.state.head,
+        Ok(state) => state.state.head,
         Err(ankurah_core::error::RetrievalError::EntityNotFound(_)) => Clock::default(),
         Err(error) => return Err(error.into()),
     };
