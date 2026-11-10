@@ -37,6 +37,7 @@ pub use auth::*;
 pub use carried_body::*;
 pub use clock::*;
 pub use domain_tag::*;
+pub use encoding::UndecodableBytes;
 pub use error::*;
 pub use event::*;
 pub use event_id::*;

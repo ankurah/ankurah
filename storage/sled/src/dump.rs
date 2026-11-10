@@ -85,7 +85,7 @@ fn event_page(mut entries: sled::Iter) -> Result<(sled::Iter, Vec<StorageDumpIte
     let mut page = Vec::new();
     for entry in entries.by_ref().take(PAGE_SIZE) {
         let (key, bytes) = entry.map_err(sled_error)?;
-        let event = Attested::<Event>::decode(&bytes)?;
+        let event = Attested::<Event>::decode(&bytes).map_err(RetrievalError::storage)?;
         let payload_id = event.payload.id();
         if key.as_ref() != payload_id.as_bytes() {
             return Err(key_mismatch("event", key.as_ref(), payload_id.as_bytes()));

@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     clock::Clock,
     domain_tag::DomainTag,
-    encoding,
+    encoding::{self, UndecodableBytes},
     event::{Event, EventFragment},
     event_id::EventId,
     id::EntityId,
@@ -142,7 +142,7 @@ impl AttestationSet {
     pub fn encode(&self) -> Vec<u8> { encoding::encode(self) }
 
     /// The set `bytes` hold; bytes left over after it make them undecodable.
-    pub fn decode(bytes: &[u8]) -> bincode::Result<Self> { encoding::decode_exact(bytes) }
+    pub fn decode(bytes: &[u8]) -> Result<Self, UndecodableBytes> { encoding::decode_exact(bytes).map_err(UndecodableBytes::of) }
 }
 
 impl<T> AsRef<T> for Attested<T> {
@@ -172,7 +172,7 @@ impl Attested<Event> {
     pub fn encode(&self) -> Vec<u8> { encoding::encode(self) }
 
     /// The event and attestations `bytes` hold; bytes left over after them make them undecodable.
-    pub fn decode(bytes: &[u8]) -> bincode::Result<Self> { encoding::decode_exact(bytes) }
+    pub fn decode(bytes: &[u8]) -> Result<Self, UndecodableBytes> { encoding::decode_exact(bytes).map_err(UndecodableBytes::of) }
 }
 
 #[cfg(test)]

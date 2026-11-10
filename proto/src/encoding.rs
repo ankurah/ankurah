@@ -25,6 +25,16 @@ pub(crate) fn encode_into<T: Serialize + ?Sized>(bytes: &mut Vec<u8>, value: &T)
 /// The value `bytes` hold; bytes left over after it make them undecodable.
 pub(crate) fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> { options().deserialize(bytes) }
 
+/// Bytes that do not hold the value one of proto's decoders read them as, or that hold bytes after it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("bytes that do not decode: {0}")]
+pub struct UndecodableBytes(String);
+
+impl UndecodableBytes {
+    /// The bytes the serializer refused with `error`.
+    pub(crate) fn of(error: bincode::Error) -> Self { Self(error.to_string()) }
+}
+
 /// Why bytes do not hold a value of an enum whose variants a later build may append.
 pub(crate) enum UndecodableVariant {
     /// The bytes open with a variant index the enum does not have in this build.

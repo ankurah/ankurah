@@ -116,9 +116,11 @@ async fn event_page(client: &tokio_postgres::Client, after: Option<&EventId>) ->
         .map(|row| {
             let declared_id: EventId = row.try_get("id").map_err(RetrievalError::storage)?;
             let entity_id: EntityId = row.try_get("entity_id").map_err(RetrievalError::storage)?;
-            let body = EventBody::decode(&row.try_get::<_, Vec<u8>>("body").map_err(RetrievalError::storage)?)?;
+            let body =
+                EventBody::decode(&row.try_get::<_, Vec<u8>>("body").map_err(RetrievalError::storage)?).map_err(RetrievalError::storage)?;
             let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
-            let attestations = AttestationSet::decode(&row.try_get::<_, Vec<u8>>("attestations").map_err(RetrievalError::storage)?)?;
+            let attestations = AttestationSet::decode(&row.try_get::<_, Vec<u8>>("attestations").map_err(RetrievalError::storage)?)
+                .map_err(RetrievalError::storage)?;
             let event = Attested { payload: Event { entity_id, body, parent }, attestations };
             if event.payload.id() != declared_id {
                 return Err(RetrievalError::Other(format!("stored event id does not match payload for {declared_id}")));

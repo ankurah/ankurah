@@ -100,9 +100,9 @@ fn event_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
         let stored_id: String = row.get(0)?;
         let declared_id = EventId::from_base64(&stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let entity_id = EntityId::from_base64(row.get::<_, String>(1)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
-        let body = EventBody::decode(&row.get::<_, Vec<u8>>(2)?)?;
+        let body = EventBody::decode(&row.get::<_, Vec<u8>>(2)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let parent = serde_json::from_str::<Clock>(&row.get::<_, String>(3)?)?;
-        let attestations = AttestationSet::decode(&row.get::<_, Vec<u8>>(4)?)?;
+        let attestations = AttestationSet::decode(&row.get::<_, Vec<u8>>(4)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let event = Attested { payload: Event { entity_id, body, parent }, attestations };
         if event.payload.id() != declared_id {
             return Err(SqliteError::Dump(format!("stored event id does not match payload for {declared_id}")));
