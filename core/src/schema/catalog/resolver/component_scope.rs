@@ -255,3 +255,102 @@ fn check_expr_names(expr: &Expr<Parsed>, check: &impl Fn(&PathExpr) -> Result<()
         Expr::Literal(_) | Expr::Placeholder => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ankurah_proto::EntityId;
+
+    use super::*;
+
+    fn model(id: u8) -> ModelId { ModelId::EntityId(EntityId::from_bytes([id; 32])) }
+    fn property(id: u8) -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([id; 32])) }
+
+    /// Task and Assignment share `project` and each declare their own `note`; Closure stays outside the tuples below.
+    struct Catalog;
+
+    impl ModelResolver for Catalog {
+        fn resolve_model(&self, label: &str) -> Result<Option<ModelId>, ModelResolutionError> {
+            Ok(match label {
+                "task" => Some(model(1)),
+                "assignment" => Some(model(2)),
+                "records.closure" => Some(model(3)),
+                _ => None,
+            })
+        }
+
+        fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+            let ModelId::EntityId(model) = model else { return Ok(None) };
+            let id = match (model.to_bytes()[0], name) {
+                (1, "status") => 10,
+                (1, "note") => 11,
+                (1 | 2, "project") => 12,
+                (2, "assignee") => 20,
+                (2, "note") => 21,
+                (3, "closed_at") => 30,
+                _ => return Ok(None),
+            };
+            Ok(Some(ResolvedProperty { id: property(id), value_type: ValueType::String }))
+        }
+    }
+
+    fn component(id: u8, name: &'static str, label: &'static str) -> QueryComponent<'static> {
+        QueryComponent { model: model(id), names: Some(ComponentNames { name, label }) }
+    }
+
+    fn task() -> QueryComponent<'static> { component(1, "Task", "task") }
+    fn assignment() -> QueryComponent<'static> { component(2, "Assignment", "assignment") }
+
+    fn path(component: Option<&str>, steps: &[&str]) -> PathExpr {
+        PathExpr { component: component.map(str::to_owned), steps: steps.iter().map(|step| step.to_string()).collect() }
+    }
+
+    /// The model and property a path resolves to across `components`.
+    fn locate(components: &[QueryComponent<'_>], path: &PathExpr) -> Result<(ModelId, PropertyId), ModelResolutionError> {
+        locate_property(components, &Catalog, path).map(|found| (found.model, found.property.id))
+    }
+
+    #[test]
+    fn a_qualifier_matches_a_display_name_before_a_label() {
+        // The second component's display name is the first one's label.
+        let components = [component(1, "Task", "assignment"), component(2, "assignment", "task")];
+        assert_eq!(locate(&components, &path(Some("assignment"), &["note"])).unwrap(), (model(2), property(21)));
+        assert_eq!(locate(&components, &path(Some("Task"), &["note"])).unwrap(), (model(1), property(11)));
+    }
+
+    #[test]
+    fn a_bare_name_two_components_declare_as_one_property_resolves() {
+        assert_eq!(locate(&[task(), assignment()], &path(None, &["project"])).unwrap(), (model(1), property(12)));
+        assert_eq!(locate(&[task(), assignment()], &path(None, &["assignee"])).unwrap(), (model(2), property(20)));
+    }
+
+    #[test]
+    fn a_bare_name_two_components_declare_as_different_properties_is_ambiguous() {
+        let error = locate(&[task(), assignment()], &path(None, &["note"])).unwrap_err();
+        let expected = ComponentScopeError::Ambiguous { name: "note".into(), first: "Task".into(), second: "Assignment".into() };
+        assert!(matches!(error, ModelResolutionError::ComponentScope(found) if found == expected));
+    }
+
+    #[test]
+    fn id_is_the_entity_id_in_every_component() {
+        assert_eq!(locate(&[task(), assignment()], &path(None, &["id"])).unwrap(), (model(1), PropertyId::Id));
+        assert_eq!(locate(&[task(), assignment()], &path(Some("Assignment"), &["id"])).unwrap(), (model(2), PropertyId::Id));
+    }
+
+    #[test]
+    fn a_qualifier_reads_a_component_outside_the_tuple_by_label_but_never_sorts_by_it() {
+        let outside = path(Some("records.closure"), &["closed_at"]);
+        assert_eq!(locate(&[task(), assignment()], &outside).unwrap(), (model(3), property(30)));
+        let error = locate_sort_key(&[task(), assignment()], &Catalog, &outside).map(|_| ()).unwrap_err();
+        assert!(matches!(error, ModelResolutionError::ComponentScope(ComponentScopeError::SortKeyOutsideQuery { .. })));
+        let unknown = locate(&[task(), assignment()], &path(Some("Closure"), &["closed_at"])).unwrap_err();
+        assert!(
+            matches!(unknown, ModelResolutionError::ComponentScope(ComponentScopeError::UnknownComponent(found)) if found == "Closure")
+        );
+    }
+
+    #[test]
+    fn a_component_named_twice_is_one_component() {
+        assert_eq!(locate(&[task(), task()], &path(None, &["note"])).unwrap(), (model(1), property(11)));
+        assert_eq!(locate(&[task(), task()], &path(Some("Task"), &["note"])).unwrap(), (model(1), property(11)));
+    }
+}
