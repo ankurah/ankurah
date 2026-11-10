@@ -818,7 +818,7 @@ mod tests {
             ])
         );
         assert_eq!(parse_selection(&selection.to_string())?, selection);
-        assert!(parse_selection("true ORDER BY Assignment::assignee.name").is_err(), "ORDER BY still names whole properties");
+        assert!(parse_selection("true ORDER BY Assignment::assignee.name").is_err(), "ORDER BY names whole properties");
         Ok(())
     }
 

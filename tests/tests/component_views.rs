@@ -156,7 +156,8 @@ impl Fixture {
     async fn refusal(&self, selection: &str) -> ComponentScopeError {
         match self.ctx.fetch::<(TaskView, AssignmentView)>(selection).await {
             Err(RetrievalError::ComponentScope(error)) => error,
-            other => panic!("{}: `{selection}` gave {other:?}", self.engine),
+            Err(other) => panic!("{}: `{selection}` failed with {other:?}", self.engine),
+            Ok(pairs) => panic!("{}: `{selection}` returned {} pairs", self.engine, pairs.len()),
         }
     }
 
@@ -278,7 +279,7 @@ async fn shared_and_colliding_names(f: Fixture) -> anyhow::Result<()> {
     let live = f.ctx.query_wait::<(TaskView, AssignmentView)>("note = 'task note ship'").await.map(|_| ());
     assert!(matches!(&live, Err(RetrievalError::ComponentScope(error)) if *error == ambiguous), "{engine}: {live:?}");
 
-    // One component's names are never ambiguous: a one-view query answers as it always has.
+    // A one-view query reads its own component's `note`, which no other component in it shares.
     let tasks = f.ctx.fetch::<TaskView>("note = 'task note triage'").await?;
     assert_eq!(f.names(tasks.iter().map(View::id)), ["unassigned"], "{engine}");
     Ok(())
@@ -359,7 +360,7 @@ async fn qualified_names(f: Fixture) -> anyhow::Result<()> {
     let undeclared = ComponentScopeError::Undeclared { name: "closed_at".into(), components: vec!["Task".into()] };
     assert_eq!(f.refusal("Task::closed_at = 5").await, undeclared, "{engine}");
 
-    // The path after a qualifier keeps its existing rules: a subpath needs a JSON property.
+    // After a qualifier, as after a bare name, a subpath needs a JSON property.
     let subpath = f.ctx.fetch::<(TaskView, AssignmentView)>("Assignment::assignee.display_name = 'Ada'").await.map(|_| ());
     assert!(
         matches!(&subpath, Err(RetrievalError::Other(message)) if message.contains("only JSON properties support subpaths")),
@@ -400,7 +401,11 @@ async fn qualified_outside_component(f: Fixture) -> anyhow::Result<()> {
         [["ada", "bob"], ["ada", "bob"], ["ada", "bob"]],
         "{engine}"
     );
-    assert_eq!(three_answers(&f, "NOT \"records.closure\"::closed_at = 5").await?, [[""; 0], [""; 0], [""; 0]], "{engine}");
+    assert_eq!(
+        three_answers(&f, "NOT \"records.closure\"::closed_at = 5").await?,
+        [Vec::<&str>::new(), Vec::new(), Vec::new()],
+        "{engine}"
+    );
     assert_eq!(three_answers(&f, "NOT \"records.closure\"::closed_at = 6").await?, [["done"], ["done"], ["done"]], "{engine}");
     Ok(())
 }
@@ -439,7 +444,7 @@ async fn dotted_paths(f: Fixture) -> anyhow::Result<()> {
 
 /// In a query over a tuple a dot only ever starts a subpath, so `pin.owner` reads Card's JSON property `pin`
 /// beside a Pin component exactly as it does in a one-view query, and `Pin::owner` reads the component.
-/// A one-view query still reads a leading label of its own component as a qualifier.
+/// A one-view query reads a leading label of its own component as a qualifier.
 #[tokio::test]
 async fn a_dot_in_a_tuple_query_starts_a_subpath_and_never_names_a_component() -> anyhow::Result<()> {
     dotted_paths(on_sled().await?).await?;

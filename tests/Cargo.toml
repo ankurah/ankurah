@@ -59,7 +59,7 @@ tokio-postgres           = { version = "0.7", optional = true }
 [dev-dependencies]
 # The simulator must wake catalog queries in subscription order on system readiness.
 ankurah-signals = { path = "../signals", version = "=0.10.0", features = ["deterministic"] }
-# Typed queries over several components run on sled and on SQLite (component_tuples.rs).
+# Typed queries over several components run on sled and on SQLite (component_views.rs).
 ankurah-storage-sqlite = { path = "../storage/sqlite", version = "=0.10.0" }
 # Per-lane end-to-end benchmarks (E-shapes perf tier). criterion drives real
 # multi-threaded tokio + LocalProcessConnection multi-node setups; harness =

@@ -193,7 +193,7 @@ fn lookup_property<R: ModelResolver + ?Sized>(
     })
 }
 
-/// A bare name no component declares. A one-component query keeps its one-model error.
+/// A bare name no component declares: `UnknownProperty` for a one-component selection, `Undeclared` across several.
 fn undeclared(components: &[QueryComponent<'_>], name: &str) -> ModelResolutionError {
     match components {
         [only] => unknown_property(&only.model, name),
