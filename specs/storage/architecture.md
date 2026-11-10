@@ -101,8 +101,8 @@ pub trait StorageEngine: Send + Sync {
 
     async fn get_state(&self, id: EntityId)
         -> Result<EntityState, RetrievalError>;
-    async fn get_states(&self, ids: Vec<EntityId>)
-        -> Result<Vec<EntityState>, RetrievalError>;
+    async fn get_states(&self, ids: Vec<EntityId>, predicate: &Predicate<Resolved>)
+        -> Result<Vec<GetStateResult>, RetrievalError>;
 
     async fn fetch_states(
         &self,

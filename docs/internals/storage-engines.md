@@ -232,9 +232,11 @@ An implementation must:
 6. keep physical names private and stable by durable identity;
 7. resolve logical `PropertyId`s only at the engine boundary;
 8. preserve unrelated embedding-application data during initialization and
-   `delete_all`; and
-9. exercise the same query, collision, reopen, atomicity, and concurrent-writer
-   scenarios as the existing engine suites.
+   `delete_all`;
+9. meet what `StorageTransaction::commit` requires of a commit that keeps
+   running after its caller drops its future; and
+10. exercise the same query, collision, reopen, atomicity, and concurrent-writer
+    scenarios as the existing engine suites.
 
 The normative storage contract and required cross-engine scenarios are in
 `specs/storage/architecture.md`.
