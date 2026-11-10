@@ -566,7 +566,7 @@ where
         version: u32,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
-        node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
+        node.system.catalog_epoch().ok_or(RequestError::SystemNotReady)?;
 
         // 1. Pre-fetch known_matches from local storage
         let known_matches: Vec<ankurah_proto::KnownEntity> = node
@@ -594,7 +594,7 @@ where
         // 3. Apply deltas to local node using NodeApplier
         let event_getter = crate::retrieval::CachedEventGetter::new(&node, &context_data);
         let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-        crate::node::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
+        crate::node::inbound::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
 
         Ok(())
     }

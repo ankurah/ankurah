@@ -1,8 +1,6 @@
-use crate::{internal::prelude::*, schema::registration::RegistrationError};
+use crate::internal::prelude::*;
 use ankql::ast::Resolved;
-use ankurah_proto::Attested;
 use ankurah_signals::{Calculated, Get, Mut, Wait};
-use anyhow::anyhow;
 use futures::TryFutureExt;
 
 use rand::prelude::*;
@@ -10,7 +8,7 @@ use rand::rngs::SmallRng;
 use std::{
     fmt,
     ops::Deref,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
 };
 use tokio::sync::oneshot;
 
@@ -19,39 +17,33 @@ use crate::context::{Context, ContextAuth, ContextInner};
 use crate::entity::WeakEntitySet;
 use crate::error::{NodeHaltReason, NodeReadinessError, RequestError};
 use crate::peer_subscription::{SubscriptionHandler, SubscriptionRelay};
-use crate::policy::ContextPolicy;
 use crate::reactor::Reactor;
-use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter};
-use crate::schema::catalog::register::RegistrationAuth;
+use crate::retrieval::{LocalEventGetter, LocalStateGetter};
 use crate::system::SystemManager;
-use crate::util::safemap::SafeMap;
-use crate::util::safeset::SafeSet;
 use crate::util::Iterable;
 use crate::{action_info, notice_info};
-use itertools::Itertools;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 
 use tracing::{debug, warn};
 
-pub mod applier;
 mod erased;
 pub(crate) mod event_admissibility;
-pub(crate) mod handler;
 pub mod handles;
+pub(crate) mod inbound;
+mod lifecycle;
 mod match_args;
-mod peer_state;
-mod schema_registration;
-mod state;
+mod peers;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
+pub use lifecycle::state::NodeState;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
-pub use peer_state::PeerState;
-use schema_registration::WireRegistrant;
-pub use state::NodeState;
+pub(crate) use peers::durable_peer;
+pub use peers::peer_state::PeerState;
+use peers::PeerRegistry;
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
@@ -103,14 +95,7 @@ where PA: PolicyAgent
     /// or update one already registered there. Otherwise a competing writer could retry
     /// from stale in-memory state after storage advances. Reactor notification follows later.
     pub(crate) commit_publication_lock: tokio::sync::Mutex<()>,
-    peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
-    durable_peers: SafeSet<proto::EntityId>,
-
-    /// Per-node source of randomness for peer selection. Seeded from entropy in production;
-    /// an explicit seed can be injected at construction so the simulation harness and tests
-    /// can reproduce an identical selection sequence. Held behind a Mutex because draws mutate
-    /// RNG state and Node is shared across tasks; the lock is only ever held for a single draw.
-    rng: Mutex<SmallRng>,
+    peers: PeerRegistry<PA::ContextData>,
 
     /// The continuous superset of every session backing a context on
     /// this node: each context attaches its credential source here at
@@ -195,7 +180,7 @@ where
     }
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
-        let entityset = WeakEntitySet::new(SystemEpoch::allocate());
+        let entityset = WeakEntitySet::new(CatalogEpoch::allocate());
         let id = proto::EntityId::random();
         let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
         let alive = Mut::new(true);
@@ -218,9 +203,7 @@ where
             storage: engine,
             entities: entityset,
             commit_publication_lock: tokio::sync::Mutex::new(()),
-            peer_connections: SafeMap::new(),
-            durable_peers: SafeSet::new(),
-            rng: Mutex::new(rng),
+            peers: PeerRegistry::new(rng),
             reactor,
             durable,
             policy_agent,
@@ -299,9 +282,9 @@ where
             }
         }
         let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
-        self.peer_connections.insert(presence.node_id, Arc::new(PeerState::new(sender, presence.durable, subscription_handler)));
+        self.peers.connections.insert(presence.node_id, Arc::new(PeerState::new(sender, presence.durable, subscription_handler)));
         if presence.durable {
-            self.durable_peers.insert(presence.node_id);
+            self.peers.durable.insert(presence.node_id);
             if let Some(ref relay) = self.subscription_relay {
                 relay.notify_peer_connected(presence.node_id);
             }
@@ -313,9 +296,9 @@ where
     pub fn deregister_peer(&self, node_id: proto::EntityId) {
         notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
 
-        self.durable_peers.remove(&node_id);
+        self.peers.durable.remove(&node_id);
         // Get and cleanup subscriptions before removing the peer
-        if let Some(peer_state) = self.peer_connections.remove(&node_id) {
+        if let Some(peer_state) = self.peers.connections.remove(&node_id) {
             action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
             // ReactorSubscription is automatically unsubscribed on drop
         }
@@ -351,7 +334,7 @@ where
         };
 
         {
-            let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
+            let connection = self.peers.connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
             connection.pending_requests.insert(request_id, response_tx);
             connection.send_message(proto::NodeMessage::Request { auth, request })?;
         }
@@ -370,7 +353,7 @@ where
         let id = proto::UpdateId::new();
 
         // Get the peer connection
-        let Some(connection) = self.peer_connections.get(&node_id) else {
+        let Some(connection) = self.peers.connections.get(&node_id) else {
             warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
             return;
         };
@@ -394,339 +377,7 @@ where
     // (does this actually make it more secure? or just move the place they could lie to us to the handshake?)
     // Not if its signed by a node key.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
-    pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
-        self.system.check_not_halted()?;
-        match message {
-            proto::NodeMessage::Update(update) => {
-                debug!("Node({}) received update {}", self.id, update);
-
-                if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
-                    let _from = update.from;
-                    let _id = update.id.clone();
-                    if update.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
-                        return Ok(());
-                    }
-
-                    // take down the return address
-                    let id = update.id.clone();
-                    let to = update.from;
-                    let from = self.id;
-
-                    // TODO - validate the from node id is the one we're connected to
-                    let body = match self.handle_update(update).await {
-                        Ok(_) => proto::NodeUpdateAckBody::Success,
-                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
-                    };
-
-                    sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
-                }
-            }
-            proto::NodeMessage::UpdateAck(ack) => {
-                debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
-                // let connection = self.peer_connections.get(&ack.from).ok_or(RequestError::PeerNotConnected)?;
-                // if let Some(tx) = connection.pending_updates.remove(&ack.id) {
-                //     tx.send(Ok(proto::NodeResponseBody::Success)).unwrap();
-                // }
-            }
-            proto::NodeMessage::Request { auth, request } => {
-                debug!("Node({}) received request {}", self.id, request);
-                // TODO: Should we spawn a task here and make handle_message synchronous?
-                // I think this depends on how we want to handle timeouts.
-                // I think we want timeouts to be handled by the node, not the connector,
-                // which would lend itself to spawning a task here and making this function synchronous.
-
-                // double check to make sure we have a connection to the peer based on the node id
-                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
-                    let from = request.from;
-                    let request_id = request.id.clone();
-                    if request.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
-                        return Ok(());
-                    }
-
-                    // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
-                    // follow-on uses #426's node session union for catalog queries.
-                    let cdata = if crate::schema::request_bypasses_policy(&request.body) {
-                        Ok(Vec::new())
-                    } else {
-                        self.policy_agent.check_request(self, &auth, &request).await
-                    };
-                    let body = match cdata {
-                        Ok(cdata) => match self.handle_request(&cdata, request).await {
-                            Ok(result) => result,
-                            Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                        },
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                    };
-                    let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
-                        request_id,
-                        from: self.id,
-                        to: from,
-                        body,
-                    }));
-                }
-            }
-            proto::NodeMessage::Response(response) => {
-                debug!("Node {} received response {}", self.id, response);
-                let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
-                if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
-                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
-                }
-            }
-            proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
-                // Remove predicate from the peer's subscription
-                if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(query_id).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
-    async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
-    where C: Iterable<PA::ContextData> {
-        match request.body {
-            proto::NodeRequestBody::CommitTransaction { id, events } => handler::commit_transaction(self, cdata, id, events).await,
-            proto::NodeRequestBody::RegisterSchema { model } => {
-                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
-                if !self.durable {
-                    return Ok(proto::NodeResponseBody::Error(RegistrationError::NotDurable.to_string()));
-                }
-                let mut registrant = WireRegistrant::new(model);
-                match self.catalog.resolve_or_register(self, &mut registrant, RegistrationAuth::Credential(cdata.clone())).await {
-                    Ok(()) => Ok(proto::NodeResponseBody::SchemaRegistered {
-                        model: registrant.into_response().expect("successful registration must bind its response"),
-                    }),
-                    Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
-                }
-            }
-            proto::NodeRequestBody::Fetch { mut selection, known_matches } => {
-                let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
-                selection.predicate = policy.filter_predicate(selection.predicate)?;
-
-                let expanded_states = crate::util::expand_states::expand_states(
-                    self.storage.fetch_states(&selection).await?,
-                    known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-                    self.storage.as_ref(),
-                )
-                .await?;
-
-                let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
-
-                let mut deltas = Vec::new();
-                for state in expanded_states {
-                    if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
-                        continue;
-                    }
-
-                    if let Some(delta) = self.generate_entity_delta(&known_map, state, cdata).await? {
-                        deltas.push(delta);
-                    }
-                }
-                Ok(proto::NodeResponseBody::Fetch(deltas))
-            }
-            proto::NodeRequestBody::Get { ids } => {
-                let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
-                let mut results: Vec<_> =
-                    self.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().map(Into::into).collect();
-                policy.check_reads(&mut results);
-                Ok(proto::NodeResponseBody::Get(results))
-            }
-            proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
-            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
-                let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
-                // Catalog subscriptions carry no credential; others carry exactly one.
-                let cdata = match cdata.iterable().at_most_one() {
-                    Ok(cdata) => cdata,
-                    Err(_) => {
-                        return Err(anyhow!(
-                            "SubscribeQuery currently requires at most one cdata (this server does not yet accept several per subscribe)"
-                        ));
-                    }
-                };
-                peer_state.subscription_handler.subscribe_query(self, query_id, selection, cdata, version, known_matches).await
-            }
-        }
-    }
-
-    async fn handle_update(&self, notification: proto::NodeUpdate) -> anyhow::Result<()> {
-        let Some(_connection) = self.peer_connections.get(&notification.from) else {
-            return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
-        };
-
-        match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { items } => {
-                tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                self.system.require_system_ready()?;
-                crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
-                Ok(())
-            }
-        }
-    }
-
-    pub(crate) async fn relay_to_required_peers(
-        &self,
-        cdata: &PA::ContextData,
-        id: proto::TransactionId,
-        events: &[Attested<proto::Event>],
-    ) -> Result<(), MutationError> {
-        // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
-        // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
-        for peer_id in self.get_durable_peers() {
-            match self.request(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() }).await
-            {
-                Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
-                Err(error) => return Err(RetrievalError::from(error).into()),
-                Ok(proto::NodeResponseBody::Error(e)) => {
-                    return Err(MutationError::General(Box::new(std::io::Error::other(format!("Peer {} rejected: {}", peer_id, e)))));
-                }
-                _ => {
-                    return Err(MutationError::General(Box::new(std::io::Error::other(format!(
-                        "Peer {} returned unexpected response",
-                        peer_id
-                    )))));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Generate EntityDelta for an entity state, using known_matches to decide between StateSnapshot and EventBridge
-    /// Returns None if the entity is in known_matches with equal heads (client already has current state)
-    pub(crate) async fn generate_entity_delta<C>(
-        &self,
-        known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
-        entity_state: proto::Attested<proto::EntityState>,
-        cdata: &C,
-    ) -> anyhow::Result<Option<proto::EntityDelta>>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-        C: crate::util::Iterable<PA::ContextData>,
-    {
-        // Destructure to take ownership and avoid clones
-        let proto::Attested { payload: proto::EntityState { entity_id, state }, attestations } = entity_state;
-        let current_head = &state.head;
-
-        // Entity is in known_matches - try to optimize the response
-        if let Some(known_head) = known_map.get(&entity_id) {
-            // Case 1: Heads equal → return None (omit entity, client already has current state) ✓
-            if known_head == current_head {
-                return Ok(None);
-            }
-
-            // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
-            let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
-            match self.collect_event_bridge(known_head, current_head, &state, &policy).await {
-                Ok(attested_events) if !attested_events.is_empty() => {
-                    // Convert Attested<Event> to EventFragments (strips entity_id)
-                    let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
-
-                    return Ok(Some(proto::EntityDelta {
-                        entity_id,
-                        content: proto::DeltaContent::EventBridge { events: event_fragments },
-                    }));
-                }
-                _ => {
-                    // Fall through to StateSnapshot if bridge building failed or returned empty
-                }
-            }
-        }
-
-        // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
-        let state_fragment = proto::StateFragment { state, attestations };
-        Ok(Some(proto::EntityDelta { entity_id, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
-    }
-
-    /// Collect events between known_head and current_head using event_dag comparison.
-    /// Returns events needed to advance from known_head to current_head.
-    pub(crate) async fn collect_event_bridge<C>(
-        &self,
-        known_head: &proto::Clock,
-        current_head: &proto::Clock,
-        state: &proto::State,
-        policy: &ContextPolicy<'_, PA, C>,
-    ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-        C: ankurah_signals::Signal + ankurah_signals::Peek<Vec<PA::ContextData>>,
-    {
-        use crate::event_dag::{compare, AbstractCausalRelation};
-        use crate::retrieval::LocalEventGetter;
-        use std::collections::HashSet;
-
-        let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);
-
-        // First check the causal relationship
-        let comparison_result = compare(&event_getter, current_head, known_head, 100000).await?;
-
-        match comparison_result.relation {
-            AbstractCausalRelation::Equal => {
-                // Heads are equal - no events needed
-                Ok(vec![])
-            }
-            AbstractCausalRelation::StrictDescends { chain: _ } => {
-                // Current descends from known - collect events by walking backward
-                // TODO: Optimize with forward chain from relation (GitHub #200)
-                let known_set: HashSet<_> = known_head.ids().collect();
-                let mut events = Vec::new();
-                let mut frontier: Vec<proto::EventId> = current_head.ids().cloned().collect();
-                let mut visited: HashSet<proto::EventId> = HashSet::new();
-
-                while !frontier.is_empty() {
-                    let batch = std::mem::take(&mut frontier);
-                    let fetched = self.storage.get_events(batch).await?;
-
-                    for event in fetched {
-                        let id = event.payload.id();
-                        if visited.insert(id.clone()) && !known_set.contains(&id) {
-                            // Add parents to frontier (walking backward)
-                            for parent in event.payload.parent.ids() {
-                                if !visited.contains(parent) && !known_set.contains(parent) {
-                                    frontier.push(parent.clone());
-                                }
-                            }
-                            events.push(event);
-                        }
-                    }
-                }
-
-                // Receivers must not learn events the read policy hides.
-                // One unreadable event makes the whole bridge unusable (a
-                // chain with a hole loses operations downstream), so give up
-                // entirely and let the caller fall back to a state snapshot,
-                // which passes its own read check.
-                for event in &events {
-                    // FIXME: should we really pass state here? Ideally we'd pass the Entity
-                    // but we don't necessarily have it here. It's possible the PolicyAgent
-                    // could fetch the Entity itself for a given clock (though this might require)
-                    // checkpointing. I think we're not even using this anyway
-                    // in favor of PolicyAgent-generated predicates anyway. If that's the case
-                    // maybe we omit state here and handwave about future specific-clock (snapshot) retrievals
-                    // as a way to discharge this theoretical requirement in the future?
-                    match policy.check_read_event(event, state) {
-                        Ok(()) => {}
-                        Err(AccessDenied::ByPolicy(_)) => return Ok(vec![]),
-                        Err(e) => return Err(anyhow!("check_read_event failed while building event bridge: {}", e)),
-                    }
-                }
-
-                // Backward BFS discovery order is not a causal order (uneven
-                // branch lengths interleave); sort parents-first so the wire
-                // carries a sane order. Receivers sort again and must not
-                // trust this.
-                let events = crate::event_dag::ordering::topo_sort_events(events)?;
-                Ok(events)
-            }
-            _ => {
-                // Other relationships (NotDescends, Incomparable, etc.) - can't build simple bridge
-                Ok(vec![])
-            }
-        }
-    }
+    pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> { inbound::handle_message(self, message).await }
 
     /// Return the resident entity if a live handle keeps it in memory.
     pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
@@ -751,90 +402,17 @@ where
         Context(Arc::new(ContextInner { node: NodeHandle::Strong(Node::clone(self)), auth: ContextAuth::Privileged }))
     }
 
-    /// Retrieve peer states and persist them in this node.
-    pub(crate) async fn get_from_peer(&self, ids: Vec<proto::EntityId>, cdata: &Vec<PA::ContextData>) -> Result<(), RetrievalError> {
-        self.system.require_system_ready().map_err(MutationError::from)?;
-        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
-
-        match self.request(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
-            proto::NodeResponseBody::Get(results) => {
-                if results.len() != ids.len() || results.iter().zip(&ids).any(|(result, id)| result.entity_id() != *id) {
-                    return Err(RetrievalError::Other("Peer Get did not answer the requested identities".into()));
-                }
-                let deltas = results.into_iter().map(proto::EntityDelta::try_from).collect::<Result<Vec<_>, _>>()?;
-                let event_getter = CachedEventGetter::new(self, cdata);
-                applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, self.storage.as_ref()).await?;
-                Ok(())
-            }
-            proto::NodeResponseBody::Error(e) => {
-                debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
-            }
-            _ => {
-                debug!("Unexpected response type from peer get");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
-            }
-        }
-    }
-
-    /// Fetch matching entities from a durable peer using local heads as known matches.
-    /// Apply its deltas locally before returning.
-    pub(crate) async fn fetch_from_peer(
-        &self,
-        selection: ankql::ast::Selection<Resolved>,
-        cdata: &Vec<PA::ContextData>,
-    ) -> Result<Vec<Entity>, RetrievalError> {
-        self.system.require_system_ready().map_err(MutationError::from)?;
-        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
-
-        let known_matched_entities = self.fetch_entities_from_local(&selection).await?;
-
-        let known_matches = known_matched_entities
-            .iter()
-            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
-            .collect();
-
-        let selection_clone = selection.clone();
-        match self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches }).await? {
-            proto::NodeResponseBody::Fetch(deltas) => {
-                let event_getter = CachedEventGetter::new(self, cdata);
-                let state_getter = LocalStateGetter::new(self.storage.clone());
-
-                applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, &state_getter).await?;
-                // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
-
-                self.fetch_entities_from_local(&selection_clone).await
-            }
-            proto::NodeResponseBody::Error(e) => {
-                debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
-            }
-            _ => {
-                debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
-            }
-        }
-    }
-
     /// Get a random durable peer node ID.
     ///
     /// Draws from the node's seeded RNG (not `thread_rng`) so the simulation harness can reproduce
     /// selections. The candidate slice is sorted first: `choose` indexes by position, so a stable
     /// candidate order is required for a given seed to yield a given peer.
-    pub fn get_durable_peer_random(&self) -> Option<proto::EntityId> {
-        let peers = self.get_durable_peers();
-        let mut rng = self.rng.lock().expect("node rng mutex poisoned");
-        peers.choose(&mut *rng).copied()
-    }
+    pub fn get_durable_peer_random(&self) -> Option<proto::EntityId> { self.peers.random_durable() }
 
     /// Get all durable peer node IDs, sorted by id for a stable fan-out order.
     /// The underlying set is unordered; callers that emit per peer (relay, random selection)
     /// depend on this stable order for the C1 determinism audit.
-    pub fn get_durable_peers(&self) -> Vec<proto::EntityId> {
-        let mut peers = self.durable_peers.to_vec();
-        peers.sort();
-        peers
-    }
+    pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.peers.durable_peers() }
 
     /// TEST ONLY: Create a phantom entity with a specific ID.
     ///
@@ -857,7 +435,7 @@ where
     ///
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
-    pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.durable_peers.insert(peer_id); }
+    pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.peers.insert_durable_for_test(peer_id); }
 
     /// TEST ONLY: Observe the session registry — the current credential
     /// of every session backing a context on this node, in the
@@ -879,7 +457,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
-        for (peer_id, item) in self.peer_connections.get_list(peers) {
+        for (peer_id, item) in self.peers.connections.get_list(peers) {
             if let Some(connection) = item {
                 connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: self.id, query_id })?;
             } else {

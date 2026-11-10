@@ -153,7 +153,7 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
 
 /// Seed and bind the deterministic `SimRecord` catalog on one node. The
 /// node's system must be READY (the seeded binding resolves under its
-/// system epoch).
+/// catalog epoch).
 pub fn seed_sim_schema(node: &SimNode) -> anyhow::Result<()> {
     ankurah::core::test_helpers::seed_registered_schema(&node.node, SimRecord::descriptor(), &sim_model_definition())?;
     Ok(())

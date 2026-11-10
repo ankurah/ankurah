@@ -40,8 +40,8 @@ pub enum PropertyError {
     #[error("entity is still in an uncommitted transaction")]
     Uncommitted,
 
-    /// The field has no usable binding in the system epoch this entity belongs to.
-    #[error("field '{field}' of model '{model}' is not resolved under this entity's system epoch")]
+    /// The field has no usable binding in the catalog epoch this entity belongs to.
+    #[error("field '{field}' of model '{model}' is not resolved under this entity's catalog epoch")]
     Unresolved { model: &'static str, field: &'static str },
 
     #[error("cast error: {0}")]

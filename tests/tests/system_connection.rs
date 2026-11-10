@@ -52,7 +52,7 @@ async fn different_system_halts_native_reconnects_without_replacement_enabled() 
         advertise(&mut socket, &original).await?;
         client.wait_connected().await?;
         assert_eq!(client_presence(&mut socket).await?.system_root, Some(root.clone()));
-        let epoch = node.system.system_epoch();
+        let epoch = node.system.catalog_epoch();
         assert!(epoch.is_some());
         socket.close(None).await?;
         drop(socket);
@@ -68,7 +68,7 @@ async fn different_system_halts_native_reconnects_without_replacement_enabled() 
         assert_eq!(node.state().peek(), NodeState::Halted(reason));
         assert!(!node.system.is_system_ready());
         assert_eq!(node.system.root(), Some(root.clone()));
-        assert_eq!(node.system.system_epoch(), epoch);
+        assert_eq!(node.system.catalog_epoch(), epoch);
         drop(socket);
 
         assert!(tokio::time::timeout(Duration::from_secs(3), listener.accept()).await.is_err());
@@ -119,7 +119,7 @@ async fn enabled_system_replacement_stops_native_reconnects_permanently() -> any
             }
         })
         .await?;
-        assert!(node.system.system_epoch().is_none());
+        assert!(node.system.catalog_epoch().is_none());
         drop(socket);
 
         node.set_allow_system_replacement(false);
@@ -132,7 +132,7 @@ async fn enabled_system_replacement_stops_native_reconnects_permanently() -> any
         assert_eq!(client.wait_connected().await, Err(expected));
         assert_eq!(node.state().peek(), NodeState::Halted(halt_reason));
         assert!(node.system.root().is_none());
-        assert!(node.system.system_epoch().is_none());
+        assert!(node.system.catalog_epoch().is_none());
         client.shutdown().await?;
         Ok(())
     })

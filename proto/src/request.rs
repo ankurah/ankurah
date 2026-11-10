@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventFragment,
-    EventId, RegisterModel, RegisteredModel, StateFragment,
+    auth::Attested, clock::Clock, event::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState,
+    EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]

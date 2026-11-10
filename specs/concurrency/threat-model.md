@@ -141,7 +141,7 @@ Receive-side arms and the policy hook each gets (verified in
 | `EventBridge` | `apply_delta_inner` | yes | n/a | yes | catch-up batch |
 | `StateAndRelation` | `apply_delta_inner` | unimpl | unimpl | n/a | returns `InvalidUpdate` |
 | `GetEvents` resp, mid-BFS | `CachedEventGetter::get_event` | **NO** (#244) | n/a | n/a | stored via `add_event` unvalidated |
-| `GetEvents` req, served | `node.rs` `GetEvents` arm | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` |
+| `GetEvents` req, served | `node/inbound/handler.rs` `get_events` | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` |
 | `commit_remote_transaction` | `node.rs` same | via `check_event` | via `attest_state` | n/a | creation-event fork asymmetry (#243) |
 
 ("yes" = via `validate_and_stage`.) The key asymmetry: **every `apply_*` arm
@@ -165,7 +165,8 @@ Invariant: an event's id equals `SHA-256(bincode(entity_id) || bincode(operation
 || bincode(parent))`, recomputed from contents on every use, never read from the
 wire; a peer cannot present an event under an id its contents do not hash to.
 Trust tier: Byzantine-safe.
-Enforcing seam: `proto/src/data.rs` `EventId::from_parts` (the hash) and `Event::id()`
+Enforcing seam: `proto/src/event_id.rs` `EventId::from_genesis_parts` and
+`EventId::from_update_parts` (the hash) and `Event::id()`
 (recomputes on every call; no id field is stored or deserialized). `accumulator.rs`
 `accumulate` keys the DAG by `event.id()` and `retrieval.rs` `stage_event` keys
 staging by `event.id()`, so a lying declared id cannot enter the graph or be
@@ -183,7 +184,7 @@ may project an event through any Model in the entity's canonical membership set
 without changing its `EventId`.
 Trust tier: Byzantine-safe as a hashing fact; the receiver validates the carried
 Model projection against canonical membership before using it for policy.
-Enforcing seam: `proto/src/data.rs` hashes the event body itself; it contains no
+Enforcing seam: `proto/src/event.rs` hashes the event body itself; it contains no
 Model field. `EntityDelta`, `SubscriptionUpdateItem`, and commit requests carry
 their `ModelId` projection separately.
 Falsifying attack (T1): deliver an event for entity E through Model X when E is
@@ -373,7 +374,7 @@ Invariant: if `get_retrieve_or_create` inserts an empty-head resident for an
 update that then fails, no state is persisted. The weak entry expires when its
 last owner drops; a retained instance stays attached, preserving uniqueness.
 Trust tier: Byzantine-safe (local invariant).
-Enforcing seam: `node/applier.rs` prepares changes in `TemporaryEntity` and commits
+Enforcing seam: `node/inbound/applier.rs` prepares changes in `TemporaryEntity` and commits
 only accepted events. The guard `!event.is_entity_create() && self.head().is_empty()`
 in `apply_event` returns `MutationError::InvalidEvent`. `WeakEntitySet` never evicts
 or replaces a still-live instance.
@@ -409,7 +410,7 @@ does not decide trust.
 Trust tier: attestation-dependent (nil under PermissiveAgent).
 Enforcing seam: `node_applier.rs` `validate_and_stage` calls
 `node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)`
-before `stage_event`, in all three arms; `from_peer_id` is threaded from `node.rs`
+before `stage_event`, in all three arms; `from_peer_id` is threaded from `node/inbound.rs`
 `handle_update` through `apply_updates`.
 Falsifying attack (T2): craft an event a real agent rejects and send it on one of
 these arms; defeated only if the agent's validation is correct.
@@ -463,7 +464,7 @@ Trust tier: currently trusted-peer (no bound at all).
 Enforcing seam: **none today.** `node_applier.rs` `apply_update`/`apply_delta_inner`
 accept arbitrarily large `Vec<EventFragment>`; `proto/src/request.rs`
 `DeltaContent`/`UpdateContent` carry unbounded event vectors. `collect_event_bridge`
-(`node.rs`) walks the DAG backward with no depth or count bound (the comparison
+(`node/inbound/delta.rs`) walks the DAG backward with no depth or count bound (the comparison
 sub-step is capped at 100000, the walk is not), so a peer with a very old or empty
 head forces the durable node to serialize an entire entity history.
 Falsifying attack (T1): a huge `EventBridge`/`EventOnly` list to exhaust receiver
@@ -480,7 +481,7 @@ Invariant: when a node serves events (the `GetEvents` handler and the `EventBrid
 builder), each event passes the read policy before leaving the node; a peer cannot
 read events it is not permitted to.
 Trust tier: attestation-dependent (nil under PermissiveAgent).
-Enforcing seam: `node.rs` `GetEvents` arm calls
+Enforcing seam: `node/inbound/handler.rs` `get_events` calls
 `can_access_collection(cdata, &collection)` then `check_read_event(cdata, &event)`
 per event, pushing only allowed events; `collect_event_bridge` runs
 `check_read_event` over the collected events (post-walk).
@@ -563,7 +564,7 @@ hashes only; no peer-claimed monotone distance (depth or generation) is read fro
 wire and trusted.
 Trust tier: Byzantine-safe.
 Enforcing seam: structural absence. The comparison engine and LWW resolution read only
-parent edges and event ids; `Event` (`proto/src/data.rs`) carries no depth/generation
+parent edges and event ids; `Event` (`proto/src/event.rs`) carries no depth/generation
 field to trust. When #266 adds generations they must be "local, derived, never trusted
 from the wire"; this claim is the standing audit obligation for that work.
 Falsifying attack (T1): the Matrix depth CVE analogue (Finding 11): inject an event
@@ -604,7 +605,7 @@ for a real PolicyAgent.
 | `node.rs commit_remote_transaction` (`check_event`) | attests a remote transaction's event and yields an attestation stored on the event | `PolicyAgent::check_event` | an unauthorized remote transaction is attested and persisted; on the creation-event path the entity is already mutated before the check (C4-19, #243) |
 | `context.rs commit_local_trx` (`check_event`) | attests a locally generated event on a fork | `PolicyAgent::check_event` | a local event that policy should reject is attested and committed |
 | `node_applier::save_state` and `apply_delta` (`attest_state`) | attaches an attestation to a saved state served to peers | `PolicyAgent::attest_state` (produces) / `validate_received_state` (consumes downstream) | a peer accepts a state the origin never legitimately attested; state authority is only as strong as this signature |
-| `node.rs GetEvents` + `collect_event_bridge` (`check_read_event`) | read-filters served events | `PolicyAgent::check_read_event` | events leak to an unauthorized reader (C4-18) |
+| `node/inbound/handler.rs` `get_events` + `node/inbound/delta.rs` `collect_event_bridge` (`check_read_event`) | read-filters served events | `PolicyAgent::check_read_event` | events leak to an unauthorized reader (C4-18) |
 | `PolicyAgent::validate_causal_assertion` (`CausalAssertion`) | would validate a peer's *claim* about lineage between two heads | **no consumer today** | defined but unused: `validate_causal_assertion` has zero call sites in core; `CausalAssertion`/`CausalAssertionFragment` (`proto/src/request.rs`) carry a `CausalRelation` + `AttestationSet` that nothing in the applier or comparison path consumes. If a future path trusts an asserted relation without re-deriving it, a lying peer substitutes a false `StrictDescends`/`Disjoint` for a real divergence. Gap G-9. |
 | `#271` sealed-prefix checkpoint (future) | a durable-tier attestation that a history prefix is canonical, carrying a genesis attestation so identity survives pruning | future `PolicyAgent` seal-validation | a lying seal lets a T3 durable node rewrite or amputate history below the seal, or forge the genesis binding so Disjoint detection accepts a foreign lineage. This is why #271 must justify sealing by *authority scope*, not by "everyone has it" (lit review Finding 4). |
 

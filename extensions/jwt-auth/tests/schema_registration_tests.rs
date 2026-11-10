@@ -300,7 +300,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let trx = context.begin();
         let id = trx.create(&ScopeProbe { body: "hello".into() }).await?.id();
         trx.commit().await?;
-        let epoch = client.system.system_epoch().unwrap();
+        let epoch = client.system.catalog_epoch().unwrap();
         let model = ScopeProbe::descriptor().bind_local(&client.catalog, epoch)?;
         assert_eq!(ScopeProbe::descriptor().resolved.get(epoch), Ok(model));
         assert!(ScopeProbe::descriptor().properties.iter().all(|property| property.resolved.get(epoch).is_ok()));

@@ -70,7 +70,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
             }
 
             fn new(entity: #base::entity::LocalTrxEntity) -> Result<Self, #base::error::RetrievalError> {
-                let model = __ANKURAH_MODEL_SCHEMA.model_id(entity.system_epoch())?;
+                let model = __ANKURAH_MODEL_SCHEMA.model_id(entity.catalog_epoch())?;
                 if !entity.has_membership(&model) {
                     return Err(#base::error::RetrievalError::MissingComponent { entity_id: entity.id(), model_id: model });
                 }
@@ -87,7 +87,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
                 pub fn #active_field_names(&self) -> Result<#active_field_types, #base::property::PropertyError> {
                     use #base::property::FromLocalTrxEntity;
                     const PROPERTY: &#base::schema::StructProperty = &__ANKURAH_MODEL_PROPERTIES[#active_field_indices];
-                    let property_id = PROPERTY.resolved_id(self.entity.system_epoch())?;
+                    let property_id = PROPERTY.resolved_id(self.entity.catalog_epoch())?;
                     <#active_field_types>::from_local_entity(property_id, &self.entity)
                 }
             )*

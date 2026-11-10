@@ -7,7 +7,7 @@ use ankurah_proto::{Attested, EntityId, EntityState, Event};
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::event_admissibility::check_genesis_membership;
+use crate::node::{durable_peer, event_admissibility::check_genesis_membership};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -60,7 +60,7 @@ impl Transaction {
         &self.entities[index]
     }
 
-    /// Mint an entity after registering its model in the current system epoch.
+    /// Mint an entity after registering its model in the current catalog epoch.
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let (model_id, epoch) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
 
@@ -181,7 +181,7 @@ impl Transaction {
         let mut entity_events = Vec::new();
         // Prepare once, outside the retry loop: every attempt re-applies and relays these exact events.
         for entity in self.entities.iter() {
-            if entity.system_epoch() != epoch {
+            if entity.catalog_epoch() != epoch {
                 return Err(MutationError::ForeignEntity);
             }
             let events = entity.prepare_events()?;
@@ -225,7 +225,7 @@ impl Transaction {
 
             if !relayed {
                 if let ContextAuth::Sessions(sessions) = auth {
-                    node.relay_to_required_peers(&sessions.write_credential()?, self.id.clone(), &attested_events).await?;
+                    durable_peer::relay_to_required_peers(node, &sessions.write_credential()?, self.id.clone(), &attested_events).await?;
                 }
                 relayed = true;
             }

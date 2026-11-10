@@ -103,7 +103,7 @@ impl ModelResolver for CatalogManager {
 /// the catalog for any other component and while those bindings have not yet been populated.
 pub(crate) struct DescriptorResolver<'a> {
     pub schemas: &'a [&'static ModelStructDescriptor],
-    pub epoch: SystemEpoch,
+    pub epoch: CatalogEpoch,
     pub catalog: &'a CatalogManager,
 }
 
@@ -141,13 +141,13 @@ impl ModelResolver for DescriptorResolver<'_> {
 pub(crate) fn resolve_component_selection(
     schemas: &[&'static ModelStructDescriptor],
     catalog: &CatalogManager,
-    epoch: Option<SystemEpoch>,
+    epoch: Option<CatalogEpoch>,
     selection: Selection<Parsed>,
 ) -> Result<Selection<Resolved>, RetrievalError> {
-    // Before the node has a system epoch, only system models resolve, under the bootstrap epoch.
+    // Before the node has a catalog epoch, only system models resolve, under the bootstrap epoch.
     let epoch = match (epoch, schemas.iter().find(|schema| schema.system.is_none())) {
         (Some(epoch), _) => epoch,
-        (None, None) => SystemEpoch::BOOTSTRAP,
+        (None, None) => CatalogEpoch::BOOTSTRAP,
         (None, Some(schema)) => return Err(RetrievalError::UnboundDeclaration { label: schema.label.to_string() }),
     };
     let components = schemas

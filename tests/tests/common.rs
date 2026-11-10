@@ -722,6 +722,6 @@ where
     SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
     PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
 {
-    let epoch = node.system.system_epoch().expect("a ready system");
+    let epoch = node.system.catalog_epoch().expect("a ready system");
     schema.field_by_name(name).expect("a compiled field").resolved.get(epoch).expect("field resolved under the current epoch")
 }

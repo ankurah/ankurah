@@ -1,4 +1,4 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, StateFragment};
+use crate::{auth::Attested, id::EntityId, state::EntityState, subscription::QueryId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

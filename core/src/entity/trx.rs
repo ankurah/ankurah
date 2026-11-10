@@ -12,7 +12,7 @@ use super::{
     state::EntityState,
     Entity,
 };
-use crate::schema::SystemEpoch;
+use crate::schema::CatalogEpoch;
 use ankurah_proto::{Attested, Event};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -21,7 +21,7 @@ pub(super) struct TrxEntityData {
     pub(super) state: EntityState,
     /// Events awaiting commit: a local entity's frozen events, or a remote fork's admitted ones.
     events: Mutex<Vec<Attested<Event>>>,
-    system_epoch: SystemEpoch,
+    catalog_epoch: CatalogEpoch,
     /// Coordinate proxy creation with the final outcome; otherwise a racing read could
     /// create a view that never receives the commit/rollback redirection.
     view: Mutex<TrxView>,
@@ -36,20 +36,20 @@ enum TrxView {
 }
 
 impl TrxEntityData {
-    fn new(state: EntityState, system_epoch: SystemEpoch) -> Self {
-        Self { state, events: Mutex::new(Vec::new()), system_epoch, view: Mutex::new(TrxView::Open(Weak::new())) }
+    fn new(state: EntityState, catalog_epoch: CatalogEpoch) -> Self {
+        Self { state, events: Mutex::new(Vec::new()), catalog_epoch, view: Mutex::new(TrxView::Open(Weak::new())) }
     }
 
     fn read(&self, target: ProxyTarget, rolled_back: impl FnOnce() -> RolledBackCreation) -> Entity {
         match &mut *self.view.lock().unwrap() {
             TrxView::Open(proxy) => Entity::from_proxy(proxy.upgrade().unwrap_or_else(|| {
-                let entity = Arc::new(EntityProxy::new(target, self.system_epoch));
+                let entity = Arc::new(EntityProxy::new(target, self.catalog_epoch));
                 *proxy = Arc::downgrade(&entity);
                 entity
             })),
             TrxView::Resident(entity) => Entity::from_resident(entity.clone()),
             TrxView::RolledBack => {
-                Entity::from_proxy(Arc::new(EntityProxy::new(ProxyTarget::RolledBack(rolled_back()), self.system_epoch)))
+                Entity::from_proxy(Arc::new(EntityProxy::new(ProxyTarget::RolledBack(rolled_back()), self.catalog_epoch)))
             }
         }
     }

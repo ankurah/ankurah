@@ -3,7 +3,7 @@ use super::{
     state::EntityState,
     trx::{LocalTrxEntityInner, RemoteTrxEntityInner},
 };
-use crate::{property::PropertyError, schema::SystemEpoch};
+use crate::{property::PropertyError, schema::CatalogEpoch};
 use ankurah_proto::EntityId;
 use ankurah_signals::broadcast::{Broadcast, ListenerGuard};
 use std::sync::{Arc, Mutex, RwLock};
@@ -14,7 +14,7 @@ pub(super) struct EntityProxy {
     target: RwLock<ProxyTarget>,
     /// Notifies readers when the target changes, so they can follow its signals.
     pub(super) broadcast: Broadcast,
-    pub(super) system_epoch: SystemEpoch,
+    pub(super) catalog_epoch: CatalogEpoch,
     subscription: Mutex<Option<ListenerGuard>>,
 }
 
@@ -52,10 +52,10 @@ impl RolledBackCreation {
 }
 
 impl EntityProxy {
-    pub(super) fn new(target: ProxyTarget, system_epoch: SystemEpoch) -> Self {
+    pub(super) fn new(target: ProxyTarget, catalog_epoch: CatalogEpoch) -> Self {
         let broadcast = Broadcast::new();
         let subscription = target.listen(&broadcast);
-        Self { target: RwLock::new(target), broadcast, system_epoch, subscription: Mutex::new(subscription) }
+        Self { target: RwLock::new(target), broadcast, catalog_epoch, subscription: Mutex::new(subscription) }
     }
 
     pub(super) fn id(&self) -> EntityId {

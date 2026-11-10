@@ -240,7 +240,7 @@ async fn scenario_2_mid_batch() -> Result<()> {
     // The system root persisted before the workload, so the reopened durable
     // node loads it and becomes ready on its own (no create/join). Seeding
     // must wait for that readiness: the seeded binding resolves under the
-    // node's system epoch, which exists only once the system is ready.
+    // node's catalog epoch, which exists only once the system is ready.
     node.system.wait_system_ready().await.unwrap();
     assert!(node.system.is_system_ready(), "reopened durable node must load its persisted system root");
     seed_album_catalog(&node)?;
@@ -409,7 +409,7 @@ async fn scenario_4_entity_creation() -> Result<()> {
 
     // Reconvergence via re-delivery of the identical creation event.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
-    // Seeding resolves the compiled binding under the node's system epoch,
+    // Seeding resolves the compiled binding under the node's catalog epoch,
     // which exists only once the reopened system is ready.
     node.system.wait_system_ready().await.unwrap();
     assert!(node.system.is_system_ready(), "reopened durable node must be system-ready");

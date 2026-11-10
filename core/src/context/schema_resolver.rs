@@ -12,7 +12,7 @@ use super::{ContextAuth, ContextInner};
 pub(crate) trait SchemaResolver: Send + Sync {
     /// Bind the descriptor's model and property IDs, registering missing declarations if needed.
     /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
-    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, SystemEpoch), RegistrationError>;
+    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, CatalogEpoch), RegistrationError>;
 
     /// Bind every component of a query as `ensure_registered` binds one, registering missing declarations.
     async fn ensure_components_registered(&self, components: &[&'static ModelStructDescriptor]) -> Result<(), RegistrationError> {
@@ -59,13 +59,13 @@ where
 {
     /// Bind the descriptor's model and property IDs, registering missing declarations if needed.
     /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
-    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, SystemEpoch), RegistrationError> {
+    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, CatalogEpoch), RegistrationError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
         if let Some(system) = schema.system {
-            return Ok((proto::ModelId::System(system), node.entities.system_epoch()));
+            return Ok((proto::ModelId::System(system), node.entities.catalog_epoch()));
         }
-        let epoch = node.system.system_epoch().ok_or(RegistrationError::SystemNotReady)?;
+        let epoch = node.system.catalog_epoch().ok_or(RegistrationError::SystemNotReady)?;
         if schema.resolved.get(epoch).is_err() {
             let mut registrant = schema.registrant(epoch);
             let auth = match &self.auth {
@@ -93,7 +93,7 @@ where
     /// Used by synchronous `Transaction::edit`.
     fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<ModelId, RetrievalError> {
         let node = self.node.upgrade()?;
-        let epoch = node.entities.system_epoch();
+        let epoch = node.entities.catalog_epoch();
         entity.check_epoch(epoch)?;
         let model = schema.bind_local(&node.catalog, epoch)?;
         if !entity.has_membership(&model) {
@@ -110,7 +110,7 @@ where
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let node = self.node.upgrade()?;
-        crate::schema::resolver::resolve_component_selection(components, &node.catalog, node.system.system_epoch(), selection)
+        crate::schema::resolver::resolve_component_selection(components, &node.catalog, node.system.catalog_epoch(), selection)
     }
 
     /// Resolve and policy-filter a livequery's initial or updated selection locally.
@@ -123,7 +123,7 @@ where
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
         crate::schema::resolver::validate_selection_names(components, &selection)?;
-        if node.system.system_epoch().is_none() {
+        if node.system.catalog_epoch().is_none() {
             return Err(RetrievalError::NodeNotReady);
         }
         if components.iter().any(|schema| schema.system.is_none()) {
@@ -155,7 +155,7 @@ where
         let system = node.system.clone();
 
         Box::pin(async move {
-            if system.system_epoch().is_none() {
+            if system.catalog_epoch().is_none() {
                 system.wait_system_ready().await?;
             }
 

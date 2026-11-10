@@ -42,7 +42,7 @@ pub struct DescRef {
 async fn reference_get_binds_target_lazily_and_reuses_the_binding() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
-    let epoch = server.system.system_epoch().unwrap();
+    let epoch = server.system.catalog_epoch().unwrap();
     let missing = EntityId::random();
     let trx = ctx.begin();
     let source = trx.create(&DescRef { artist: Ref::new(missing) }).await?.id();

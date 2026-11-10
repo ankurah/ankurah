@@ -1,152 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, author::AuthorId, clock::Clock, id::EntityId, AttestationSet, DecodeError};
-use ankurah_core_types::ModelId;
-
-/// Domain tag for genesis event ids. Separates the two preimage shapes so no
-/// genesis preimage can ever equal an update preimage, and versions the
-/// derivation scheme.
-pub const GENESIS_TAG: &[u8] = b"org.ankurah.genesis.v0";
-
-/// Domain tag for update event ids. See [`GENESIS_TAG`].
-pub const EVENT_TAG: &[u8] = b"org.ankurah.event.v0";
-
-#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
-pub struct EventId([u8; 32]);
-
-impl std::fmt::Debug for EventId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "EventId({})", self.to_base64()) }
-}
-
-impl EventId {
-    /// The id of a genesis event: `SHA-256(GENESIS_TAG || bincode(system,
-    /// nonce, timestamp, author, operations))`. Membership is carried in the
-    /// operations and therefore contributes to the entity's identity.
-    pub fn from_genesis_parts(
-        system: &Option<EntityId>,
-        nonce: &[u8; 32],
-        timestamp: u64,
-        author: &AuthorId,
-        operations: &OperationSet,
-    ) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(GENESIS_TAG);
-        hasher.update(bincode::serialize(system).unwrap());
-        hasher.update(bincode::serialize(nonce).unwrap());
-        hasher.update(bincode::serialize(&timestamp).unwrap());
-        hasher.update(bincode::serialize(author).unwrap());
-        hasher.update(bincode::serialize(operations).unwrap());
-        Self(hasher.finalize().into())
-    }
-
-    /// The id of an update event: `SHA-256(EVENT_TAG || bincode(entity_id,
-    /// author, nonce, timestamp, operations, parent))`. Model projections stay
-    /// outside the canonical event and its identity. The nonce is what makes an
-    /// event id unguessable to anyone who was not sent the event.
-    pub fn from_update_parts(
-        entity_id: &EntityId,
-        author: &AuthorId,
-        nonce: &[u8; 32],
-        timestamp: u64,
-        operations: &OperationSet,
-        parent: &Clock,
-    ) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(EVENT_TAG);
-        hasher.update(bincode::serialize(entity_id).unwrap());
-        hasher.update(bincode::serialize(author).unwrap());
-        hasher.update(bincode::serialize(nonce).unwrap());
-        hasher.update(bincode::serialize(&timestamp).unwrap());
-        hasher.update(bincode::serialize(operations).unwrap());
-        hasher.update(bincode::serialize(parent).unwrap());
-        Self(hasher.finalize().into())
-    }
-    pub fn to_base64(&self) -> String {
-        use base64::{engine::general_purpose, Engine as _};
-        general_purpose::URL_SAFE_NO_PAD.encode(self.0)
-    }
-    /// The first six characters of the base64 form. For compact diagnostics,
-    /// never durable identity.
-    pub fn to_base64_short(&self) -> String {
-        let value = self.to_base64();
-        value[..6].to_string()
-    }
-    pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {
-        use base64::{engine::general_purpose, Engine as _};
-        let decoded = general_purpose::URL_SAFE_NO_PAD.decode(input)?;
-        let v: [u8; 32] = decoded.try_into().map_err(|_| DecodeError::InvalidLength)?;
-
-        Ok(Self(v))
-    }
-    pub fn to_bytes(self) -> [u8; 32] { self.0 }
-    pub fn from_bytes(bytes: [u8; 32]) -> Self { Self(bytes) }
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
-}
-
-impl std::fmt::Display for EventId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if f.alternate() {
-            write!(f, "{}", self.to_base64_short())
-        } else {
-            write!(f, "{}", self.to_base64())
-        }
-    }
-}
-
-impl TryFrom<String> for EventId {
-    type Error = DecodeError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> { Self::from_base64(&s) }
-}
-
-impl From<[u8; 32]> for EventId {
-    fn from(bytes: [u8; 32]) -> Self { Self(bytes) }
-}
-
-/// An entity id IS the id of its genesis event. This conversion is the whole
-/// of that equality; nothing else turns one into the other.
-impl From<EventId> for EntityId {
-    fn from(id: EventId) -> Self { EntityId::from_bytes(id.0) }
-}
-impl TryFrom<Vec<u8>> for EventId {
-    type Error = DecodeError;
-
-    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
-        let v: [u8; 32] = bytes.try_into().map_err(|_| DecodeError::InvalidLength)?;
-        Ok(Self(v))
-    }
-}
-
-impl Serialize for EventId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
-        if serializer.is_human_readable() {
-            // Use base64 for human-readable formats like JSON
-            serializer.serialize_str(&self.to_base64())
-        } else {
-            // Use raw bytes as a fixed-size array for binary formats like bincode
-            self.0.serialize(serializer)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for EventId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: serde::Deserializer<'de> {
-        if deserializer.is_human_readable() {
-            // Deserialize from base64 string for human-readable formats
-            let s = String::deserialize(deserializer)?;
-            EventId::from_base64(s).map_err(serde::de::Error::custom)
-        } else {
-            // Deserialize from raw bytes as a fixed-size array for binary formats
-            let bytes = <[u8; 32]>::deserialize(deserializer)?;
-            Ok(EventId::from_bytes(bytes))
-        }
-    }
-}
+use crate::{
+    auth::{AttestationSet, Attested},
+    author::AuthorId,
+    clock::Clock,
+    event_id::EventId,
+    id::EntityId,
+    operation::OperationSet,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Event {
@@ -343,146 +204,6 @@ impl From<(EntityId, EventFragment)> for Attested<Event> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct StateFragment {
-    pub state: State,
-    pub attestations: AttestationSet,
-}
-
-impl From<Attested<EntityState>> for StateFragment {
-    fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
-}
-impl From<(EntityId, StateFragment)> for Attested<EntityState> {
-    fn from(value: (EntityId, StateFragment)) -> Self {
-        let entity_state = EntityState { entity_id: value.0, state: value.1.state };
-        Attested { payload: entity_state, attestations: value.1.attestations }
-    }
-}
-
-/// Ordered top-level mutations that make up one event's content-addressed
-/// payload.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
-pub struct OperationSet(pub Vec<Operation>);
-
-impl std::fmt::Display for OperationSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "OperationSet({})",
-            self.0
-                .iter()
-                .map(|operation| match operation {
-                    Operation::Backend { backend, operations } => {
-                        format!("{} => {}b", backend, operations.iter().map(|operation| operation.diff.len()).sum::<usize>())
-                    }
-                    Operation::Membership(Membership::Add(model)) => format!("membership +{model}"),
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    }
-}
-
-impl std::ops::Deref for OperationSet {
-    type Target = [Operation];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl OperationSet {
-    /// Build the event-level operation sequence for backend-generated diffs.
-    ///
-    /// The input map's stable ordering gives locally generated events a
-    /// deterministic operation order.
-    pub fn from_backends(backends: BTreeMap<String, Vec<BackendOperation>>) -> Self {
-        Self(backends.into_iter().map(|(backend, operations)| Operation::Backend { backend, operations }).collect())
-    }
-
-    /// Append one event-level operation.
-    pub fn push(&mut self, operation: Operation) { self.0.push(operation); }
-
-    /// Iterate backend operation batches in event order.
-    pub fn backends(&self) -> impl Iterator<Item = (&str, &[BackendOperation])> {
-        self.0.iter().filter_map(|operation| match operation {
-            Operation::Backend { backend, operations } => Some((backend.as_str(), operations.as_slice())),
-            Operation::Membership(_) => None,
-        })
-    }
-
-    /// Iterate all backend diffs addressed to `backend`, preserving event
-    /// order even if an untrusted event contains more than one batch.
-    pub fn backend_operations<'a>(&'a self, backend: &'a str) -> impl Iterator<Item = &'a BackendOperation> {
-        self.0.iter().flat_map(move |operation| match operation {
-            Operation::Backend { backend: candidate, operations } if candidate == backend => operations.iter(),
-            Operation::Backend { .. } | Operation::Membership(_) => [].iter(),
-        })
-    }
-
-    /// Iterate explicit membership mutations in event order.
-    pub fn memberships(&self) -> impl Iterator<Item = &Membership> {
-        self.0.iter().filter_map(|operation| match operation {
-            Operation::Membership(membership) => Some(membership),
-            Operation::Backend { .. } => None,
-        })
-    }
-}
-
-/// A top-level mutation carried by an entity event.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub enum Operation {
-    /// Apply opaque diffs to one property backend.
-    Backend {
-        /// Registered property backend name.
-        backend: String,
-        /// Ordered opaque operations understood by that backend.
-        operations: Vec<BackendOperation>,
-    },
-    /// Change the entity's explicit model-backed membership state.
-    Membership(Membership),
-}
-
-/// An explicit mutation of an entity's model-backed membership state: which
-/// model an ENTITY belongs to, asserted in the attested event stream (the
-/// sole authority for that fact). Distinct from the catalog's
-/// model-property memberships, which are property-to-model records
-/// (`_ankurah_model_property`).
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum Membership {
-    /// Add the model-backed membership.
-    Add(ModelId),
-}
-
-/// An opaque operation generated and interpreted by a named property backend.
-#[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
-pub struct BackendOperation {
-    /// Opaque diff interpreted by the selected property backend.
-    pub diff: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct EntityState {
-    pub entity_id: EntityId,
-    pub state: State,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct State {
-    /// The current accumulated state of the entity inclusive of all events up to this point
-    pub state_buffers: StateBuffers,
-    /// Model-backed memberships established by this entity's causal history.
-    pub memberships: BTreeSet<ModelId>,
-    /// The materialized head: the concurrent tips (usually one) applied to the state above, each with its
-    /// generation; empty before the genesis applies.
-    pub head: Clock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct StateBuffers(pub BTreeMap<String, Vec<u8>>);
-
-impl std::ops::Deref for StateBuffers {
-    type Target = BTreeMap<String, Vec<u8>>;
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
 impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -506,44 +227,8 @@ impl std::fmt::Display for EventFragment {
     }
 }
 
-impl std::fmt::Display for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "State({:#} buffers {})",
-            self.head,
-            self.state_buffers.iter().map(|(backend, buf)| format!("{} => {}b", backend, buf.len())).collect::<Vec<_>>().join(" ")
-        )
-    }
-}
-
-impl std::fmt::Display for StateFragment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StateFragment(state {} attestations: {})", self.state, self.attestations.len())
-    }
-}
-
-impl std::fmt::Display for EntityState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityState({} {})", self.entity_id.to_base64_short(), self.state)
-    }
-}
-
 impl From<Event> for Attested<Event> {
     fn from(val: Event) -> Self { Attested { payload: val, attestations: AttestationSet::default() } }
-}
-
-impl From<EntityState> for Attested<EntityState> {
-    fn from(val: EntityState) -> Self { Attested { payload: val, attestations: AttestationSet::default() } }
-}
-
-impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, StateFragment) {
-        (self.payload.entity_id, StateFragment { state: self.payload.state, attestations: self.attestations })
-    }
-    pub fn from_parts(entity_id: EntityId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, state: fragment.state }, attestations: fragment.attestations }
-    }
 }
 
 impl Attested<Event> {
@@ -555,29 +240,10 @@ impl Attested<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_event_id_json_serialization() {
-        let id = EventId::from_bytes([
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
-        ]);
-        let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, "\"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\"");
-        assert_eq!(id, serde_json::from_str(&json).unwrap());
-    }
-
-    #[test]
-    fn test_event_id_bincode_serialization() {
-        let id = EventId::from_bytes([
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
-        ]);
-        let bytes = bincode::serialize(&id).unwrap();
-        assert_eq!(
-            bytes,
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
-        );
-        assert_eq!(id, bincode::deserialize(&bytes).unwrap());
-    }
+    use crate::event_id::{EVENT_TAG, GENESIS_TAG};
+    use crate::operation::BackendOperation;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
 
     fn operations() -> OperationSet {
         OperationSet::from_backends(BTreeMap::from([("lww".to_string(), vec![BackendOperation { diff: vec![1, 2, 3] }])]))
@@ -731,32 +397,5 @@ mod tests {
         assert_eq!(update(Clock::new(vec![(3, EventId::from_bytes([1; 32])), (7, EventId::from_bytes([2; 32]))]).unwrap()).generation(), 8);
         assert_eq!(update(at(u32::MAX - 1)).generation(), u32::MAX);
         assert_eq!(update(at(u32::MAX)).generation(), u32::MAX);
-    }
-}
-
-#[cfg(test)]
-mod operation_wire_tests {
-    use super::*;
-    use ankurah_core_types::SystemModel;
-
-    /// Variant order is part of the bincode contract for event payloads:
-    /// Backend = 0, Membership = 1, and Membership::Add = 0. Payload
-    /// encodings inside the variants are pinned by ankurah-core-types' own
-    /// golden tests.
-    #[test]
-    fn operation_variant_order_is_pinned() {
-        let backend =
-            bincode::serialize(&Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![7] }] })
-                .unwrap();
-        assert_eq!(&backend[..4], [0, 0, 0, 0], "Operation::Backend must encode as variant 0");
-
-        let membership = bincode::serialize(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))).unwrap();
-        assert_eq!(&membership[..4], [1, 0, 0, 0], "Operation::Membership must encode as variant 1");
-        assert_eq!(&membership[4..8], [0, 0, 0, 0], "Membership::Add must encode as variant 0");
-
-        for bytes in [backend, membership] {
-            let round: Operation = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(bincode::serialize(&round).unwrap(), bytes);
-        }
     }
 }

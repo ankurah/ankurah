@@ -218,7 +218,7 @@ pub enum MutationError {
     NodeDropped(#[from] NodeDropped),
     #[error("node initialization is not complete")]
     NodeNotReady,
-    #[error("the entity belongs to another node's system epoch")]
+    #[error("the entity belongs to another node's catalog epoch")]
     ForeignEntity,
     #[error("node halted: {0}")]
     NodeHalted(#[from] NodeHaltReason),

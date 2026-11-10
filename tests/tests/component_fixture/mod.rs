@@ -177,5 +177,5 @@ impl Fixture {
 }
 
 pub fn stage<M: Model>(entity: &LocalTrxEntity, component: &M, model: ModelId) -> Result<(), PropertyError> {
-    component.initialize_new_entity(entity, model, entity.system_epoch())
+    component.initialize_new_entity(entity, model, entity.catalog_epoch())
 }

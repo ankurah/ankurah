@@ -14,7 +14,7 @@ async fn test_system() -> anyhow::Result<()> {
             let root = node.system.root().expect("created root");
             assert_eq!(root.payload.state.head.len(), 1);
             assert_eq!(node.system.items().len(), 1);
-            (root, node.system.system_epoch())
+            (root, node.system.catalog_epoch())
         };
 
         let node = Node::new_durable(engine, PermissiveAgent::new());
@@ -22,7 +22,7 @@ async fn test_system() -> anyhow::Result<()> {
         assert!(node.system.create().await.is_err(), "a persisted system cannot be created twice");
         assert_eq!(node.system.root(), Some(root));
         assert_eq!(node.system.items().len(), 1);
-        assert_ne!(node.system.system_epoch(), epoch, "each Node owns its own epoch");
+        assert_ne!(node.system.catalog_epoch(), epoch, "each Node owns its own epoch");
         Ok(())
     })
     .await?
@@ -55,7 +55,7 @@ async fn persisted_root_restores_the_system_before_ephemeral_catalog_readiness()
             }
             assert!(node.system.is_system_ready());
             assert_eq!(node.system.root(), Some(root.clone()));
-            assert!(node.system.system_epoch().is_some());
+            assert!(node.system.catalog_epoch().is_some());
             assert!(node.get_durable_peers().is_empty());
             assert!(node.state().peek().halt_reason().is_none());
             assert_eq!(node.context(DEFAULT_CONTEXT).is_ok(), durable);
@@ -75,17 +75,17 @@ async fn adopted_root_persists_and_reconnecting_keeps_the_epoch() -> anyhow::Res
             let node = Node::new(engine.clone(), PermissiveAgent::new());
             node.system.wait_loaded().await?;
             assert!(!node.system.is_system_ready());
-            assert!(node.system.system_epoch().is_none());
+            assert!(node.system.catalog_epoch().is_none());
             assert_eq!(node.state().peek(), NodeState::Uninitialized);
             node.system.adopt_system(root.clone()).await?;
             node.system.wait_system_ready().await?;
             let _connection = LocalProcessConnection::new(&server, &node).await?;
             node.wait_ready().await?;
-            let epoch = node.system.system_epoch();
+            let epoch = node.system.catalog_epoch();
             assert!(epoch.is_some());
             node.system.adopt_system(root.clone()).await?;
             assert_eq!(node.state().peek(), NodeState::Running);
-            assert_eq!(node.system.system_epoch(), epoch);
+            assert_eq!(node.system.catalog_epoch(), epoch);
             assert_eq!(node.system.root(), Some(root.clone()));
             epoch
         };
@@ -94,7 +94,7 @@ async fn adopted_root_persists_and_reconnecting_keeps_the_epoch() -> anyhow::Res
         node.system.wait_loaded().await?;
         node.system.wait_system_ready().await?;
         assert_eq!(node.system.root(), Some(root.clone()));
-        assert_ne!(node.system.system_epoch(), epoch);
+        assert_ne!(node.system.catalog_epoch(), epoch);
         assert!(node.get_durable_peers().is_empty());
         let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         assert_eq!(
@@ -123,7 +123,7 @@ async fn different_system_halts_by_default_without_wiping_storage() -> anyhow::R
         query.wait_durable_answered().await?;
         let retained = context.get::<PetView>(id).await?;
         let root = client.system.root().expect("adopted root");
-        let epoch = client.system.system_epoch();
+        let epoch = client.system.catalog_epoch();
         let selection = query.selection().peek();
         let state = engine.get_state(id).await?;
         let materializations = engine.list_materializations().await?;
@@ -137,7 +137,7 @@ async fn different_system_halts_by_default_without_wiping_storage() -> anyhow::R
         assert_eq!(client.state().peek(), NodeState::Halted(reason));
         assert!(!client.system.is_system_ready());
         assert_eq!(client.system.root(), Some(root.clone()));
-        assert_eq!(client.system.system_epoch(), epoch);
+        assert_eq!(client.system.catalog_epoch(), epoch);
         assert_eq!(engine.list_materializations().await?, materializations);
         assert_eq!(engine.get_state(id).await?, state);
         assert_eq!(query.selection().peek(), selection);
@@ -186,7 +186,7 @@ async fn enabled_replacement_wipes_storage_for_the_next_node() -> anyhow::Result
         assert_eq!(node_state.peek(), NodeState::Halted(halt_reason.clone()));
         assert!(!client.system.is_system_ready());
         assert!(client.system.root().is_none());
-        assert!(client.system.system_epoch().is_none());
+        assert!(client.system.catalog_epoch().is_none());
         assert!(client.system.items().is_empty());
         assert!(engine.list_materializations().await?.is_empty());
 

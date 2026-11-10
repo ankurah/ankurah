@@ -4,7 +4,7 @@
 use crate::internal::prelude::*;
 use crate::schema::registration::RegistrationError;
 
-pub use crate::node::handler::commit_transaction;
+pub use crate::node::inbound::handler::commit_transaction;
 
 /// Bind `schema`'s cells from a hand-built definition under the node's
 /// current epoch, bypassing registration and the catalog: deterministic
@@ -18,7 +18,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let epoch = node.system.system_epoch().ok_or(RegistrationError::SystemNotReady)?;
+    let epoch = node.system.catalog_epoch().ok_or(RegistrationError::SystemNotReady)?;
     crate::schema::catalog::register::accept(&mut schema.registrant(epoch), model)
 }
 

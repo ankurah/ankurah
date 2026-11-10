@@ -43,7 +43,7 @@ pub trait Model: Sized {
         &self,
         entity: &LocalTrxEntity,
         model_id: ModelId,
-        epoch: crate::schema::SystemEpoch,
+        epoch: crate::schema::CatalogEpoch,
     ) -> Result<(), PropertyError>;
 }
 

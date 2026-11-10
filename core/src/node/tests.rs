@@ -1,8 +1,9 @@
 use super::*;
 use crate::connector::SendError;
-use crate::node::handler::commit_transaction;
+use crate::node::inbound::handler::commit_transaction;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
 use crate::test_utils::TestStorage;
+use ankurah_proto::Attested;
 use ankurah_signals::Subscribe;
 
 mod commit;

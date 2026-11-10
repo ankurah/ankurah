@@ -87,7 +87,7 @@ impl NodeApplier {
             // the DAG ever sees it: the sender's framing of the entity id is
             // what the fragment supplies, and a genesis must derive its own.
             attested_event.payload.validate_structure()?;
-            super::event_admissibility::check_genesis_membership(&attested_event.payload)?;
+            crate::node::event_admissibility::check_genesis_membership(&attested_event.payload)?;
             node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
             event_getter.stage_event(attested_event.payload.clone());
             attested_events.push(attested_event);

@@ -78,7 +78,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         if !node.durable {
             // Fetch from peers and commit first response
-            match node.get_from_peer(vec![id], &cdata).await {
+            match crate::node::durable_peer::get_from_peer(&node, vec![id], &cdata).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if cached => (),
                 Err(e) => {
@@ -122,7 +122,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         // TODO honor CachePolicy::Local for fetch; Tracked currently behaves like Durable.
         let entities = if !node.durable {
-            node.fetch_from_peer(args.selection, &cdata).await
+            crate::node::durable_peer::fetch_from_peer(&node, args.selection, &cdata).await
         } else {
             let states = node.storage.fetch_states(&args.selection).await?;
 

@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 /// Test: StateAndEvent with divergence via subscription
 ///
-/// This tests the bug in node/applier.rs where StateAndEvent updates
+/// This tests the bug in node/inbound/applier.rs where StateAndEvent updates
 /// don't apply events when there's divergence between local and incoming state.
 ///
-/// Bug location: node/applier.rs:96-125
+/// Bug location: node/inbound/applier.rs, the StateAndEvent arm of `apply_update`
 /// When apply_state returns Ok(false) for DivergedSince, events are saved
 /// to storage but NOT applied to the entity in memory.
 ///

@@ -40,7 +40,7 @@ pub(crate) async fn start_policy_sync<SE: StorageEngine + Send + Sync + 'static>
     let initialize = async {
         let owner = node.upgrade().ok_or(ankurah_core::error::NodeDropped)?;
         let catalog = owner.catalog.clone();
-        let epoch = owner.system.system_epoch().ok_or(ankurah_core::error::RetrievalError::NodeNotReady)?;
+        let epoch = owner.system.catalog_epoch().ok_or(ankurah_core::error::RetrievalError::NodeNotReady)?;
         let changed = Mut::new(());
         let subscription = owner.catalog.subscribe_changes({
             let changed = changed.clone();

@@ -25,18 +25,18 @@ impl<SE> Clone for SystemManager<SE> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SystemEpochError {
+pub(crate) enum CatalogEpochError {
     #[error("system is not ready")]
     NotReady,
     #[error("node halted: {0}")]
     Halted(#[from] NodeHaltReason),
 }
 
-impl From<SystemEpochError> for MutationError {
-    fn from(error: SystemEpochError) -> Self {
+impl From<CatalogEpochError> for MutationError {
+    fn from(error: CatalogEpochError) -> Self {
         match error {
-            SystemEpochError::NotReady => Self::SystemNotReady,
-            SystemEpochError::Halted(error) => Self::NodeHalted(error),
+            CatalogEpochError::NotReady => Self::SystemNotReady,
+            CatalogEpochError::Halted(error) => Self::NodeHalted(error),
         }
     }
 }
@@ -96,12 +96,12 @@ where SE: StorageEngine + Send + Sync + 'static
     /// Whether a system is initialized and the node has not halted.
     pub fn is_system_ready(&self) -> bool { self.check_not_halted().is_ok() && *self.0.system_ready.read().unwrap() }
 
-    /// This node's immutable system epoch, absent until a system is ready or after a hard reset.
-    pub fn system_epoch(&self) -> Option<SystemEpoch> { self.0.system_ready.read().unwrap().then_some(self.0.entities.system_epoch()) }
+    /// This node's immutable catalog epoch, absent until a system is ready or after a hard reset.
+    pub fn catalog_epoch(&self) -> Option<CatalogEpoch> { self.0.system_ready.read().unwrap().then_some(self.0.entities.catalog_epoch()) }
 
-    pub(crate) fn require_system_ready(&self) -> Result<SystemEpoch, SystemEpochError> {
+    pub(crate) fn require_system_ready(&self) -> Result<CatalogEpoch, CatalogEpochError> {
         self.check_not_halted()?;
-        self.system_epoch().ok_or(SystemEpochError::NotReady)
+        self.catalog_epoch().ok_or(CatalogEpochError::NotReady)
     }
 
     pub(crate) fn set_allow_system_replacement(&self, allow: bool) { self.0.allow_system_replacement.store(allow, Ordering::Release); }
@@ -182,7 +182,7 @@ where SE: StorageEngine + Send + Sync + 'static
 
         // The root genesis alone has no parent system to bind.
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let pending = crate::entity::LocalTrxEntity::new(None, proto::AuthorId::Unknown, self.0.entities.system_epoch(), alive);
+        let pending = crate::entity::LocalTrxEntity::new(None, proto::AuthorId::Unknown, self.0.entities.catalog_epoch(), alive);
         pending.add_membership(proto::ModelId::System(proto::SystemModel::System))?;
         // Cannot fail: `pending` is open, and `get_backend` creates a missing LWW backend.
         let lww_backend = pending.get_backend::<LWWBackend>().expect("LWW Backend should exist");
@@ -190,7 +190,7 @@ where SE: StorageEngine + Send + Sync + 'static
 
         let mut events = pending.prepare_events()?;
         let attested_event = &mut events[0];
-        let system_entity = crate::entity::RemoteTrxEntity::new(&attested_event.payload, self.0.entities.system_epoch())?;
+        let system_entity = crate::entity::RemoteTrxEntity::new(&attested_event.payload, self.0.entities.catalog_epoch())?;
         let event_getter = LocalEventGetter::new(storage.clone(), true);
         system_entity.apply_events(&event_getter, std::slice::from_mut(attested_event), |_| Ok(None)).await?;
         let attested_state: Attested<EntityState> = EntityState { entity_id: system_entity.id(), state: system_entity.to_state()? }.into();

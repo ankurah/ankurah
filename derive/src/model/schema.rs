@@ -57,9 +57,9 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
     let model_resolved = match model.system() {
         Some(system) => {
             let variant = format_ident!("{}", <&str>::from(system));
-            quote! { #base::schema::PerSystemOnceCell::Pinned(#base::proto::ModelId::System(#base::proto::SystemModel::#variant)) }
+            quote! { #base::schema::PerCatalogOnceCell::Pinned(#base::proto::ModelId::System(#base::proto::SystemModel::#variant)) }
         }
-        None => quote! { #base::schema::PerSystemOnceCell::per_epoch() },
+        None => quote! { #base::schema::PerCatalogOnceCell::per_epoch() },
     };
 
     let active_types = model.active_field_types()?;
@@ -79,9 +79,9 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                     )
                 })?;
                 let variant = format_ident!("{}", <&str>::from(system));
-                quote! { #base::schema::PerSystemOnceCell::Pinned(#base::proto::PropertyId::System(#base::proto::SystemProperty::#variant)) }
+                quote! { #base::schema::PerCatalogOnceCell::Pinned(#base::proto::PropertyId::System(#base::proto::SystemProperty::#variant)) }
             }
-            None => quote! { #base::schema::PerSystemOnceCell::per_epoch() },
+            None => quote! { #base::schema::PerCatalogOnceCell::per_epoch() },
         };
 
         let mapping = map_value_type(&field.ty);

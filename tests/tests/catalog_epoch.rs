@@ -52,7 +52,7 @@ async fn system_replacement_does_not_wait_for_an_inflight_commit() -> anyhow::Re
 
         gate.release_held(&client).await;
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
-        assert!(client.system.system_epoch().is_none());
+        assert!(client.system.catalog_epoch().is_none());
         assert!(client.system.root().is_none());
         assert_eq!(client.system.wait_system_ready().await, Err(halt_reason));
         Ok(())
@@ -75,7 +75,7 @@ async fn halted_node_stops_queries_and_new_operations_but_retained_views_remain_
         let query = context.query_wait::<AlbumView>("true").await?;
         query.wait_durable_answered().await?;
         let retained = context.get::<AlbumView>(id).await?;
-        let epoch = client.system.system_epoch();
+        let epoch = client.system.catalog_epoch();
         let root = client.system.root().expect("original root");
         let transaction = context.begin();
         retained.edit(&transaction)?.name()?.replace("must not commit")?;
@@ -89,9 +89,9 @@ async fn halted_node_stops_queries_and_new_operations_but_retained_views_remain_
         assert_eq!(client.system.adopt_system(proposed).await, Err(PeerConnectionError::NodeHalted(halt_reason.clone())));
 
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
-        assert!(client.system.system_epoch().is_none());
+        assert!(client.system.catalog_epoch().is_none());
         assert_eq!(retained.name()?, "retained");
-        assert_eq!(Some(retained.entity().system_epoch()), epoch);
+        assert_eq!(Some(retained.entity().catalog_epoch()), epoch);
         tokio::time::timeout(Duration::from_secs(2), async {
             while query.loaded() {
                 tokio::task::yield_now().await;
@@ -146,7 +146,7 @@ async fn retained_views_keep_their_bindings_when_another_node_registers_the_same
         transaction.commit().await?;
         let retained = context.get::<AlbumView>(id).await?;
         let name_field = Album::descriptor().field_by_name("name").unwrap();
-        let old_property = name_field.resolved.get(retained.entity().system_epoch()).unwrap();
+        let old_property = name_field.resolved.get(retained.entity().catalog_epoch()).unwrap();
 
         let second = durable_sled_setup().await?;
         let context = second.context(DEFAULT_CONTEXT)?;
@@ -155,8 +155,8 @@ async fn retained_views_keep_their_bindings_when_another_node_registers_the_same
         transaction.commit().await?;
         let fresh = context.get::<AlbumView>(id).await?;
 
-        assert_ne!(fresh.entity().system_epoch(), retained.entity().system_epoch());
-        assert_ne!(name_field.resolved.get(fresh.entity().system_epoch()).unwrap(), old_property);
+        assert_ne!(fresh.entity().catalog_epoch(), retained.entity().catalog_epoch());
+        assert_ne!(name_field.resolved.get(fresh.entity().catalog_epoch()).unwrap(), old_property);
         assert_eq!(retained.name()?, "first node");
         assert_eq!(fresh.name()?, "second node");
         let transaction = context.begin();

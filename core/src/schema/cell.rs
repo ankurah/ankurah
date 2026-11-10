@@ -4,41 +4,41 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Identifies a node's system-scoped entities and descriptor bindings. Each node gets a fresh epoch;
 /// it never changes systems in place. Connections and disconnections retain the same epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SystemEpoch(u32);
+pub struct CatalogEpoch(u32);
 
-static NEXT_SYSTEM_EPOCH: AtomicU32 = AtomicU32::new(1);
+static NEXT_CATALOG_EPOCH: AtomicU32 = AtomicU32::new(1);
 
-impl SystemEpoch {
+impl CatalogEpoch {
     /// Reserved for temporary entities and pinned schema lookups before system readiness.
-    pub const BOOTSTRAP: SystemEpoch = SystemEpoch(0);
+    pub const BOOTSTRAP: CatalogEpoch = CatalogEpoch(0);
 
     pub(crate) fn allocate() -> Self {
-        let raw = NEXT_SYSTEM_EPOCH.fetch_add(1, Ordering::Relaxed);
-        assert!(raw != 0, "system epoch allocator exhausted (u32 wrapped)");
+        let raw = NEXT_CATALOG_EPOCH.fetch_add(1, Ordering::Relaxed);
+        assert!(raw != 0, "catalog epoch allocator exhausted (u32 wrapped)");
         Self(raw)
     }
 }
 
-/// A cell that is either pinned to a static value, or writable once per system epoch.
+/// A cell that is either pinned to a static value, or writable once per catalog epoch.
 #[derive(Debug)]
-pub enum PerSystemOnceCell<T: Copy> {
+pub enum PerCatalogOnceCell<T: Copy> {
     Pinned(T),
     PerEpoch(AppendOnlyVec<(u32, T)>),
 }
 
-/// The cell has no value for the requested system epoch.
+/// The cell has no value for the requested catalog epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("cell is not initialized for {epoch:?}")]
 pub struct UninitializedCell {
-    pub epoch: SystemEpoch,
+    pub epoch: CatalogEpoch,
 }
 
-impl<T: Copy> PerSystemOnceCell<T> {
+impl<T: Copy> PerCatalogOnceCell<T> {
     pub const fn per_epoch() -> Self { Self::PerEpoch(AppendOnlyVec::new()) }
 
     /// Return the value for `epoch`, or [`UninitializedCell`] if unset.
     /// Pinned values ignore the epoch.
-    pub fn get(&self, epoch: SystemEpoch) -> Result<T, UninitializedCell> {
+    pub fn get(&self, epoch: CatalogEpoch) -> Result<T, UninitializedCell> {
         match self {
             Self::Pinned(value) => Ok(*value),
             Self::PerEpoch(entries) => {
@@ -48,7 +48,7 @@ impl<T: Copy> PerSystemOnceCell<T> {
     }
 
     /// Record a resolution without replacing an epoch's first value.
-    pub fn set(&self, epoch: SystemEpoch, value: T) {
+    pub fn set(&self, epoch: CatalogEpoch, value: T) {
         match self {
             Self::Pinned(_) => {}
             Self::PerEpoch(entries) => {
@@ -62,11 +62,11 @@ impl<T: Copy> PerSystemOnceCell<T> {
 mod tests {
     use super::*;
 
-    fn epoch(n: u32) -> SystemEpoch { SystemEpoch(n) }
+    fn epoch(n: u32) -> CatalogEpoch { CatalogEpoch(n) }
 
     #[test]
     fn first_entry_for_an_epoch_wins_for_its_lifetime() {
-        let cell: PerSystemOnceCell<u8> = PerSystemOnceCell::per_epoch();
+        let cell: PerCatalogOnceCell<u8> = PerCatalogOnceCell::per_epoch();
         cell.set(epoch(1), 10);
         cell.set(epoch(1), 20); // a later differing append cannot retype the epoch
         assert_eq!(cell.get(epoch(1)), Ok(10));
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn epochs_are_isolated() {
-        let cell: PerSystemOnceCell<u8> = PerSystemOnceCell::per_epoch();
+        let cell: PerCatalogOnceCell<u8> = PerCatalogOnceCell::per_epoch();
         cell.set(epoch(1), 10);
         cell.set(epoch(2), 20);
         assert_eq!(cell.get(epoch(1)), Ok(10));
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn pinned_is_valid_at_every_epoch_and_ignores_writes() {
-        let cell = PerSystemOnceCell::Pinned(7u8);
+        let cell = PerCatalogOnceCell::Pinned(7u8);
         assert_eq!(cell.get(epoch(0)), Ok(7));
         assert_eq!(cell.get(epoch(99)), Ok(7));
         cell.set(epoch(0), 8);
@@ -97,8 +97,8 @@ mod tests {
 
     #[test]
     fn allocator_issues_distinct_values() {
-        let a = SystemEpoch::allocate();
-        let b = SystemEpoch::allocate();
+        let a = CatalogEpoch::allocate();
+        let b = CatalogEpoch::allocate();
         assert_ne!(a, b);
     }
 }
