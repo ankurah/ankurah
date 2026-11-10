@@ -63,8 +63,8 @@ async fn inbound_durable_claim_is_not_a_relay_target() -> anyhow::Result<()> {
 
     let key = NodeKey::generate();
     let (sent, relayed) = mpsc::channel();
-    let (handshake, claims) = keyed_peer_claims(node.id, &key, true);
-    node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(RecordingSender { sent })).await?;
+    let (mut handshake, claims) = keyed_peer_claims(node.id, PeerProvenance::Inbound, &key, true);
+    node.register_peer(key.sign_presence(claims), &mut handshake, Box::new(RecordingSender { sent })).await?;
     let durable_peers = node.get_durable_peers();
 
     let root = node.context_async(JwtContext::system()).await?;

@@ -2,15 +2,18 @@ use std::collections::BTreeMap;
 
 use ankurah_proto as proto;
 
-use super::PeerConnectionError;
+use super::{PeerConnectionError, PeerProvenance};
 
-/// What this node knows about one connection's handshake: the opening it sends, then the peer's
-/// opening and the version the two chose. [`Node::register_peer`](crate::Node::register_peer)
-/// checks the peer's presence against it, so a presence registers only the connection it answers.
+/// What this node knows about one connection's handshake: how the connection was reached, the
+/// opening this node sends, then the peer's opening and the version the two chose, and whether
+/// the peer has registered. [`Node::register_peer`](crate::Node::register_peer) checks the peer's
+/// presence against it, so a presence registers only the connection it answers, and only once.
 #[derive(Debug)]
 pub struct Handshake {
+    provenance: PeerProvenance,
     ours: proto::Opening,
     peer: Option<PeerOpening>,
+    registered: bool,
 }
 
 /// The peer's opening, and the version chosen from the two offers.
@@ -21,11 +24,15 @@ struct PeerOpening {
 }
 
 impl Handshake {
-    /// `node`'s side of a new connection: it offers the versions this build speaks, under a fresh challenge.
-    pub fn new(node: proto::NodeId) -> Self {
+    /// `node`'s side of a new connection reached as `provenance` says: it offers the versions this
+    /// build speaks, under a fresh challenge.
+    pub fn new(node: proto::NodeId, provenance: PeerProvenance) -> Self {
         let ours = proto::Opening { versions: proto::ProtocolVersions::SPOKEN, challenge: proto::HandshakeChallenge::new(node) };
-        Self { ours, peer: None }
+        Self { provenance, ours, peer: None, registered: false }
     }
+
+    /// How this node came to be connected to the peer.
+    pub(crate) fn provenance(&self) -> PeerProvenance { self.provenance }
 
     /// The opening to send as this connection's first frame.
     pub fn opening(&self) -> proto::Opening { self.ours }
@@ -75,11 +82,24 @@ impl Handshake {
         })
     }
 
-    /// Check that `presence` answers the challenge `receiver` issued here under a valid signature
-    /// from a node other than `receiver`, that the peer's opening carried a challenge that node
-    /// issued itself, and that it repeats the versions each side offered on this connection and
-    /// the version chosen, so a party between the two cannot change the offers unnoticed.
+    /// Refuse this node's presence on a connection it accepted whose dialer has not registered: an
+    /// accepting node signs nothing for a dialer it has not authenticated and registered.
+    pub(crate) fn check_may_present(&self) -> Result<(), PeerConnectionError> {
+        match self.provenance {
+            PeerProvenance::Inbound if !self.registered => Err(PeerConnectionError::PresenceBeforeRegistration),
+            PeerProvenance::Inbound | PeerProvenance::Configured => Ok(()),
+        }
+    }
+
+    /// Check that no peer has registered on this handshake, that `presence` answers the challenge
+    /// `receiver` issued here under a valid signature from a node other than `receiver`, that the
+    /// peer's opening carried a challenge that node issued itself, and that it repeats the
+    /// versions each side offered on this connection and the version chosen, so a party between
+    /// the two cannot change the offers unnoticed.
     pub(crate) fn authenticate(&self, receiver: proto::NodeId, presence: &proto::Presence) -> Result<(), PeerConnectionError> {
+        if self.registered {
+            return Err(PeerConnectionError::RepeatedRegistration);
+        }
         let claims = &presence.claims;
         let peer_id = claims.node_id;
         let peer = self.peer.as_ref().ok_or(PeerConnectionError::NoOpening)?;
@@ -106,6 +126,9 @@ impl Handshake {
         }
         Ok(())
     }
+
+    /// Record that the peer whose presence this handshake authenticated has registered.
+    pub(crate) fn record_registration(&mut self) { self.registered = true; }
 }
 
 #[cfg(test)]
@@ -121,7 +144,7 @@ mod tests {
 
     #[test]
     fn an_opening_offering_a_wider_range_settles_on_the_version_this_build_speaks() {
-        let mut handshake = Handshake::new(NodeKey::generate().node_id());
+        let mut handshake = Handshake::new(NodeKey::generate().node_id(), PeerProvenance::Configured);
         let peer = opening(versions(1, 3));
         handshake.receive_opening(peer).unwrap();
         let claims = handshake.presence_claims(NodeKey::generate().node_id(), false).unwrap();
@@ -132,7 +155,7 @@ mod tests {
 
     #[test]
     fn an_opening_sharing_no_version_is_refused_with_both_ranges() {
-        let mut handshake = Handshake::new(NodeKey::generate().node_id());
+        let mut handshake = Handshake::new(NodeKey::generate().node_id(), PeerProvenance::Configured);
         assert_eq!(
             handshake.receive_opening(opening(versions(2, 3))),
             Err(PeerConnectionError::NoCommonVersion { ours: versions(1, 1), theirs: versions(2, 3) })
@@ -149,7 +172,7 @@ mod tests {
 
     #[test]
     fn a_second_opening_is_refused_and_no_presence_answers_before_the_first() {
-        let mut handshake = Handshake::new(NodeKey::generate().node_id());
+        let mut handshake = Handshake::new(NodeKey::generate().node_id(), PeerProvenance::Configured);
         let node = NodeKey::generate().node_id();
         assert_eq!(handshake.presence_claims(node, false), Err(PeerConnectionError::NoOpening));
         handshake.read_opening(&proto::Message::Open(opening(versions(1, 1))).encode()).unwrap();
@@ -159,7 +182,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_opening_is_refused() {
-        let mut handshake = Handshake::new(NodeKey::generate().node_id());
+        let mut handshake = Handshake::new(NodeKey::generate().node_id(), PeerProvenance::Configured);
         assert!(matches!(handshake.read_opening(&[0; 3]), Err(PeerConnectionError::UnreadableOpening(_))));
         assert!(!handshake.opened());
     }

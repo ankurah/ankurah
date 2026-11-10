@@ -45,9 +45,9 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let (ours, mut presence_claims) = keyed_peer_claims(node.id, key, durable);
+    let (mut ours, mut presence_claims) = keyed_peer_claims(node.id, provenance, key, durable);
     claims(&mut presence_claims);
-    node.register_peer(key.sign_presence(presence_claims), &ours, provenance, sender).await
+    node.register_peer(key.sign_presence(presence_claims), &mut ours, sender).await
 }
 
 /// Register a peer with no node behind it: `key` signs a presence answering the node's side of a fresh handshake.
@@ -68,7 +68,7 @@ where
 #[tokio::test]
 async fn presence_signs_this_nodes_claims_and_a_halted_node_has_none() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    let (handshake, peer) = opened_handshakes(node.id, NodeKey::generate().node_id());
+    let (handshake, peer) = opened_handshakes(node.id, PeerProvenance::Configured, NodeKey::generate().node_id());
     let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(&handshake)).await.unwrap().unwrap();
     let claims = &presence.claims;
     assert_eq!(claims.node_id, node.id);
@@ -197,7 +197,7 @@ async fn presence_does_not_wait_for_startup() {
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
     assert_eq!(node.state().value(), NodeState::Startup);
-    let (handshake, _) = opened_handshakes(node.id, NodeKey::generate().node_id());
+    let (handshake, _) = opened_handshakes(node.id, PeerProvenance::Configured, NodeKey::generate().node_id());
     let presence = node.presence(&handshake);
     tokio::pin!(presence);
     let std::task::Poll::Ready(presence) = futures::poll!(&mut presence) else { panic!("presence waited for startup") };

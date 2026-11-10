@@ -154,14 +154,14 @@ async fn an_announcement_reaches_the_peers_plugin_of_the_same_name_inside_the_si
     let asked = AskedLog::default();
     let receiver = node_with([probe("shared", Answer::Accept, &asked), probe("only-on-the-receiver", Answer::Accept, &asked)]);
 
-    let (ours, theirs) = opened_handshakes(receiver.id, announcer.id);
+    let (mut ours, theirs) = opened_handshakes(receiver.id, PeerProvenance::Inbound, announcer.id);
     let presence = announcer.presence(&theirs).await.unwrap();
     let announced = BTreeMap::from([("only-on-the-announcer".to_owned(), vec![9]), ("shared".to_owned(), vec![1, 2, 3])]);
     assert_eq!(presence.claims.announcements, announced, "a plugin that announces nothing has no entry");
     assert!(presence.signature_is_valid());
 
     let (sent, _) = mpsc::channel();
-    receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(sent))).await.unwrap();
+    receiver.register_peer(presence, &mut ours, Box::new(RecordingSender(sent))).await.unwrap();
     let announcements: Vec<_> = asked.0.lock().unwrap().iter().map(|asked| (asked.plugin, asked.announcement.clone())).collect();
     assert_eq!(announcements, [("shared", Some(vec![1, 2, 3])), ("only-on-the-receiver", None)]);
 }
@@ -173,11 +173,11 @@ async fn an_announcement_changed_after_signing_fails_the_presence_signature_befo
     let asked = AskedLog::default();
     let receiver = node_with([probe("shared", Answer::Accept, &asked)]);
 
-    let (ours, theirs) = opened_handshakes(receiver.id, announcer.id);
+    let (mut ours, theirs) = opened_handshakes(receiver.id, PeerProvenance::Inbound, announcer.id);
     let mut presence = announcer.presence(&theirs).await.unwrap();
     presence.claims.announcements.insert("shared".into(), vec![4]);
     let (sent, _) = mpsc::channel();
-    let refused = receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(sent))).await;
+    let refused = receiver.register_peer(presence, &mut ours, Box::new(RecordingSender(sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::InvalidSignature(announcer.id)));
     assert!(asked.plugins().is_empty());
 }
@@ -214,7 +214,7 @@ where
 #[tokio::test]
 async fn a_plugin_that_cannot_announce_fails_the_presence() {
     let node = Node::builder(Arc::new(TestStorage::default()), PermissiveAgent::new()).plug(FailingAnnouncer).build().unwrap();
-    let (handshake, _) = opened_handshakes(node.id, NodeKey::generate().node_id());
+    let (handshake, _) = opened_handshakes(node.id, PeerProvenance::Configured, NodeKey::generate().node_id());
     let failure = AnnouncementFailure { plugin: "failing", reason: "the probe cannot read its data".into() };
     assert_eq!(node.presence(&handshake).await, Err(PeerConnectionError::AnnouncementFailed(failure)));
 }

@@ -61,19 +61,21 @@ state carrying the reason, and keeps backing off before it dials again.
 
 A node ignores a feature number it does not know, and an announcement under a
 name none of its plugins has; each of its plugins receives the announcement
-under its own name. This build assigns no feature numbers. Connectors hold each
-connection's side of the handshake in a `Handshake`, and `register_peer`
-checks a presence against it: it accepts the presence only if it answers the
-single-use challenge this node issued for that connection, its signature
-verifies under the key it names, the peer's opening carried a challenge the
-peer issued itself, it does not name this node itself, and it repeats the
-offers this node sent and saw and the version this node chose. Openings carry
-no signature, so a party between the two nodes could change the offers to
-lower the version chosen; the peer then signs offers that differ from this
-node's, and its presence is refused. A presence copied from another connection
-answers a different challenge and is refused. Nothing in the handshake
-compares datasets: two nodes that share no history connect as readily as two
-that share all of it.
+under its own name. This build assigns no feature numbers. Connectors hold
+each connection's side of the handshake in a `Handshake`, which knows whether
+this node dialed or accepted the connection. `presence` signs nothing on an
+accepted connection until its dialer has registered on it, and `register_peer`
+registers one peer per handshake and checks a presence against it: it accepts
+the presence only if it answers the single-use challenge this node issued for
+that connection, its signature verifies under the key it names, the peer's
+opening carried a challenge the peer issued itself, it does not name this node
+itself, and it repeats the offers this node sent and saw and the version this
+node chose. Openings carry no signature, so a party between the two nodes
+could change the offers to lower the version chosen; the peer then signs
+offers that differ from this node's, and its presence is refused. A presence
+copied from another connection answers a different challenge and is refused.
+Nothing in the handshake compares datasets: two nodes that share no history
+connect as readily as two that share all of it.
 
 What the handshake does not give: a node that dials an address sends its
 presence before it knows who answers there, so whoever answers can use that
@@ -87,9 +89,9 @@ connection of the peer the frame names as its sender.
 ## Peer Trust
 
 Whether a peer counts as durable follows from how it was reached, not from
-its claim. Each connector states a `PeerProvenance`: a node that dialed the
-peer from its own configuration registers it as `Configured`, and a node that
-accepted the connection registers it as `Inbound`. `PolicyAgent::peer_trust`
+its claim. Each connector begins a connection's handshake with a
+`PeerProvenance`: `Configured` on a connection this node dialed from its own
+configuration, `Inbound` on one it accepted. `PolicyAgent::peer_trust`
 turns the provenance and the claim into a `PeerTrust`. The default trusts a
 durable claim only from a configured peer; a policy agent may override it,
 for example to trust peers listed by key. Only a peer trusted as durable

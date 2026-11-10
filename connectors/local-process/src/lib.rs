@@ -163,13 +163,14 @@ where
     SE2: StorageEngine + Send + Sync + 'static,
     PA2: PolicyAgent + Send + Sync + 'static,
 {
-    let (mut dialer_side, mut acceptor_side) = (dialer.begin_handshake(), acceptor.begin_handshake());
+    let (mut dialer_side, mut acceptor_side) =
+        (dialer.begin_handshake(PeerProvenance::Configured), acceptor.begin_handshake(PeerProvenance::Inbound));
     dialer_side.receive_opening(acceptor_side.opening())?;
     acceptor_side.receive_opening(dialer_side.opening())?;
     let dialer_presence = dialer.presence(&dialer_side).await?;
-    let acceptor_registration = acceptor.register_peer(dialer_presence, &acceptor_side, PeerProvenance::Inbound, to_dialer).await?;
+    let acceptor_registration = acceptor.register_peer(dialer_presence, &mut acceptor_side, to_dialer).await?;
     let registered = match acceptor.presence(&acceptor_side).await {
-        Ok(acceptor_presence) => dialer.register_peer(acceptor_presence, &dialer_side, PeerProvenance::Configured, to_acceptor).await,
+        Ok(acceptor_presence) => dialer.register_peer(acceptor_presence, &mut dialer_side, to_acceptor).await,
         Err(refusal) => Err(refusal),
     };
     match registered {

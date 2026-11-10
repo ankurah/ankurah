@@ -65,7 +65,7 @@ impl Connection {
         let state = RwLock::new(ConnectionState::Connecting { url: url.clone() });
         let (mut incoming, mut messages) = mpsc::channel(MAX_QUEUED_MESSAGES);
 
-        let handshake = RefCell::new(Some(node.begin_handshake()));
+        let handshake = RefCell::new(Some(node.begin_handshake(PeerProvenance::Configured)));
         let me = Connection(Arc::new(SendWrapper::new(ConnectionInner {
             ws: Arc::new(ws),
             url,
@@ -215,7 +215,7 @@ impl Connection {
                     match state {
                         ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
                         ConnectionState::Connecting { .. } => {
-                            let Some(handshake) = self.handshake.borrow_mut().take() else {
+                            let Some(mut handshake) = self.handshake.borrow_mut().take() else {
                                 warn!("Received duplicate server presence, ignoring");
                                 return None;
                             };
@@ -227,8 +227,7 @@ impl Connection {
                             let sender = Box::new(WebSocketPeerSender { ws: SendWrapper::new(self.ws.clone()) });
                             return Some(
                                 async move {
-                                    let registered =
-                                        node.register_peer(server_presence.clone(), &handshake, PeerProvenance::Configured, sender).await;
+                                    let registered = node.register_peer(server_presence.clone(), &mut handshake, sender).await;
                                     let Some(connection) = weak.upgrade().map(Connection) else {
                                         if let Ok(registration) = registered {
                                             node.deregister_peer(registration);

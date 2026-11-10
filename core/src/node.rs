@@ -302,34 +302,31 @@ where
     /// The identity this node mints and signs under.
     pub fn identity(&self) -> proto::Identity { self.id.identity() }
 
-    /// Begin this node's side of one new connection's handshake. Each side sends its opening and
-    /// takes the peer's into it. A dialing node then sends its presence ([`Node::presence`]) and
-    /// registers the accepting node on that node's presence ([`Node::register_peer`]); an
-    /// accepting node registers the dialer on its presence first and only then signs its own, so
-    /// it signs nothing for a dialer it has not authenticated and registered.
-    pub fn begin_handshake(&self) -> Handshake { Handshake::new(self.id) }
+    /// Begin this node's side of one new connection's handshake, reached as `provenance` says.
+    pub fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake { Handshake::new(self.id, provenance) }
 
     /// Sign this node's presence answering the peer on `handshake`'s connection, carrying each
     /// plugin's announcement; a halted node signs none, nor one whose plugin cannot announce, and
-    /// none answers before the peer's opening arrives.
+    /// none answers before the peer's opening arrives, or on a connection this node accepted
+    /// before it registered the dialer.
     pub async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
         self.lifecycle.check_not_halted()?;
+        handshake.check_may_present()?;
         let mut claims = handshake.presence_claims(self.id, self.durable)?;
         claims.announcements = self.plugins.announcements(self).await.map_err(PeerConnectionError::AnnouncementFailed)?;
         Ok(self.key.sign_presence(claims))
     }
 
-    /// Register a peer connection whose presence completes `handshake`, this node's side of it.
-    /// `provenance` says how the connection was made; the policy agent's [`PolicyAgent::peer_trust`]
-    /// decides from it whether the peer is durable. Then each plugin is asked, in the order
-    /// plugged, and the first refusal leaves the peer unregistered. The connector holds the
+    /// Register a peer connection whose presence completes `handshake`, this node's side of it,
+    /// once per handshake. How the connection was reached decides, through the policy agent's
+    /// [`PolicyAgent::peer_trust`], whether the peer is durable. Then each plugin is asked, in the
+    /// order plugged, and the first refusal leaves the peer unregistered. The connector holds the
     /// registration returned while the connection is open.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.claims.node_id.to_base64_short(), durable = %presence.claims.durable)))]
     pub async fn register_peer(
         &self,
         presence: proto::Presence,
-        handshake: &Handshake,
-        provenance: PeerProvenance,
+        handshake: &mut Handshake,
         sender: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError> {
         action_info!(self, "register_peer", "{}", &presence);
@@ -338,6 +335,7 @@ where
             warn!("Node({}) refusing peer: {}", self.id, refusal);
             return Err(refusal);
         }
+        let provenance = handshake.provenance();
         let claims = &presence.claims;
         let peer = claims.node_id;
         let trust = self.policy_agent.peer_trust(&peer, provenance, claims.durable);
@@ -354,6 +352,7 @@ where
         self.lifecycle.check_not_halted()?;
         let subscription_handler = SubscriptionHandler::new(peer, self);
         let registration = self.peers.register(peer, sender, trust, subscription_handler, self.subscription_relay.as_ref());
+        handshake.record_registration();
         // TODO send hello message to the peer, including present head state for all relevant collections
         Ok(registration)
     }

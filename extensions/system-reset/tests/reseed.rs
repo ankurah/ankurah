@@ -335,9 +335,9 @@ async fn a_durable_peer_whose_announcement_cannot_be_read_registers_and_the_node
     let own = create_system(&node, Some("its own")).await?.unwrap();
 
     let key = NodeKey::generate();
-    let (handshake, mut claims) = keyed_peer_claims(node.id, &key, true);
+    let (mut handshake, mut claims) = keyed_peer_claims(node.id, PeerProvenance::Configured, &key, true);
     claims.announcements.insert(PLUGIN_NAME.into(), vec![7; 33]);
-    node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Configured, Box::new(Discard)).await?;
+    node.register_peer(key.sign_presence(claims), &mut handshake, Box::new(Discard)).await?;
     assert_eq!(node.granted_trust(&key.node_id()), Some(PeerTrust { durable: true }));
     assert_eq!(node.state().value(), NodeState::Running);
     assert!(engine.get_state(own).await.is_ok());

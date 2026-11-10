@@ -61,6 +61,8 @@ impl ConnectionStateEnum {
                 Some(PeerConnectionError::RelayedChallenge { .. }) => "RelayedChallenge",
                 Some(PeerConnectionError::SelfConnection(_)) => "SelfConnection",
                 Some(PeerConnectionError::OfferMismatch(_)) => "OfferMismatch",
+                Some(PeerConnectionError::RepeatedRegistration) => "RepeatedRegistration",
+                Some(PeerConnectionError::PresenceBeforeRegistration) => "PresenceBeforeRegistration",
                 Some(PeerConnectionError::Refused(_)) => "Refused",
                 Some(PeerConnectionError::AnnouncementFailed(_)) => "AnnouncementFailed",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",

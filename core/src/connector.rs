@@ -6,7 +6,7 @@ use crate::{node::ConnectionRegistration, policy::PolicyAgent, storage::StorageE
 mod handshake;
 pub use handshake::Handshake;
 
-/// A peer rejected before its connection becomes available to the node.
+/// Why a connection's handshake does not make its peer available to the node.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PeerConnectionError {
     #[error("this node speaks protocol versions {ours} and the peer speaks {theirs}, with none in common")]
@@ -29,6 +29,12 @@ pub enum PeerConnectionError {
     SelfConnection(proto::NodeId),
     #[error("presence from node {0} does not repeat the versions offered and chosen on this connection")]
     OfferMismatch(proto::NodeId),
+    /// A second presence was registered on a handshake that has already registered its peer.
+    #[error("this connection's handshake has already registered its peer")]
+    RepeatedRegistration,
+    /// This node was asked to present on a connection it accepted before it registered the dialer.
+    #[error("this node accepted the connection and presents only once it has registered the dialer")]
+    PresenceBeforeRegistration,
     #[error("{0}")]
     Refused(crate::node::PeerRefusal),
     #[error("{0}")]
@@ -73,15 +79,16 @@ impl From<anyhow::Error> for SendError {
 #[async_trait]
 pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::NodeId;
-    /// Begin this node's side of one new connection's handshake.
-    fn begin_handshake(&self) -> Handshake;
+    /// Begin this node's side of one new connection's handshake, reached as `provenance` says.
+    fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake;
     /// Sign this node's presence answering the peer on `handshake`'s connection; a halted node signs none.
     async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError>;
+    /// Register the peer whose presence completes `handshake`; `sender` holds the frames it is
+    /// given until the connector has written this node's presence.
     async fn register_peer(
         &self,
         presence: proto::Presence,
-        handshake: &Handshake,
-        provenance: PeerProvenance,
+        handshake: &mut Handshake,
         sender: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError>;
     fn state(&self) -> ankurah_signals::Read<NodeState>;
@@ -94,16 +101,15 @@ pub trait NodeComms: Send + Sync {
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
     fn id(&self) -> proto::NodeId { self.id }
-    fn begin_handshake(&self) -> Handshake { self.begin_handshake() }
+    fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake { self.begin_handshake(provenance) }
     async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> { self.presence(handshake).await }
     async fn register_peer(
         &self,
         presence: proto::Presence,
-        handshake: &Handshake,
-        provenance: PeerProvenance,
+        handshake: &mut Handshake,
         sender: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError> {
-        self.register_peer(presence, handshake, provenance, sender).await
+        self.register_peer(presence, handshake, sender).await
     }
     fn state(&self) -> ankurah_signals::Read<NodeState> { self.state() }
     fn deregister_peer(&self, registration: ConnectionRegistration) { self.deregister_peer(registration); }

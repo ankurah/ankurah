@@ -103,9 +103,8 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
 
     let key = NodeKey::generate();
     let (tx, mut replies) = mpsc::unbounded_channel();
-    let (handshake, claims) = keyed_peer_claims(node.id, &key, false);
-    let registration =
-        node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(ReplySender { tx })).await?;
+    let (mut handshake, claims) = keyed_peer_claims(node.id, PeerProvenance::Inbound, &key, false);
+    let registration = node.register_peer(key.sign_presence(claims), &mut handshake, Box::new(ReplySender { tx })).await?;
     let model = proto::RegisterModel::from(RegistrationRecord::descriptor());
     let response = wire_register(&node, registration, &mut replies, proto::AuthData::default(), model.clone()).await?;
     assert!(
@@ -151,9 +150,8 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
         let node = setup().await?;
         let key = NodeKey::generate();
         let (tx, mut replies) = mpsc::unbounded_channel();
-        let (handshake, claims) = keyed_peer_claims(node.id, &key, false);
-        let registration =
-            node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(ReplySender { tx })).await?;
+        let (mut handshake, claims) = keyed_peer_claims(node.id, PeerProvenance::Inbound, &key, false);
+        let registration = node.register_peer(key.sign_presence(claims), &mut handshake, Box::new(ReplySender { tx })).await?;
         let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
         let auth = proto::AuthData(common::sign_token(&common::test_keys(), &claims).into_bytes());
         let model = proto::RegisterModel::from(Role::descriptor());

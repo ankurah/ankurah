@@ -1183,10 +1183,12 @@ mod tests {
         let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let storage = Arc::new(TestStorage::default());
         let client = Node::new(storage.clone(), PermissiveAgent::new());
-        let (handshake, theirs) = opened_handshakes(client.id, server.id);
+        let (mut handshake, mut theirs) = opened_handshakes(client.id, PeerProvenance::Configured, server.id);
+        let (sent, _) = std::sync::mpsc::channel();
+        server.register_peer(client.presence(&handshake).await.unwrap(), &mut theirs, Box::new(Recorder(sent))).await.unwrap();
         let presence = server.presence(&theirs).await.unwrap();
         let (sent, _messages) = std::sync::mpsc::channel();
-        client.register_peer(presence, &handshake, PeerProvenance::Configured, Box::new(Recorder(sent))).await.unwrap();
+        client.register_peer(presence, &mut handshake, Box::new(Recorder(sent))).await.unwrap();
 
         let model = ModelId::EntityId(EntityId::from_bytes([9; 32]));
         let (entered, entered_rx) = tokio::sync::oneshot::channel();
@@ -1204,11 +1206,11 @@ mod tests {
 
         // A server that dials an address presents to whoever answers there, answering the challenge
         // that answer carried: here the client's, relayed.
-        let (handshake, theirs) = opened_handshakes(client.id, server.id);
+        let (mut handshake, theirs) = opened_handshakes(client.id, PeerProvenance::Inbound, server.id);
         let relayed = server.presence(&theirs).await.unwrap();
         let (relayer_sent, relayer_messages) = std::sync::mpsc::channel();
         let relayer = Box::new(Recorder(relayer_sent));
-        client.register_peer(relayed, &handshake, PeerProvenance::Inbound, relayer).await.unwrap();
+        client.register_peer(relayed, &mut handshake, relayer).await.unwrap();
 
         release.send(()).unwrap();
         let outcome =

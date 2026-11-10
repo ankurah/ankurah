@@ -74,7 +74,7 @@ struct AdmissionState {
 #[async_trait]
 impl NodeComms for HeldAdmission {
     fn id(&self) -> proto::NodeId { self.0.key.node_id() }
-    fn begin_handshake(&self) -> Handshake { Handshake::new(self.id()) }
+    fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake { Handshake::new(self.id(), provenance) }
     /// The first presence waits for `release_presence`; any later one, on a later connection, does not.
     async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
         let release = self.0.release_presence.lock().unwrap().take();
@@ -87,8 +87,7 @@ impl NodeComms for HeldAdmission {
     async fn register_peer(
         &self,
         presence: proto::Presence,
-        _: &Handshake,
-        _: PeerProvenance,
+        _: &mut Handshake,
         _: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError> {
         let release = self.0.release.lock().unwrap().take().unwrap();
@@ -110,8 +109,8 @@ impl NodeComms for HeldAdmission {
 /// presence with. The fixture's registration reads neither, so the presence answers a client of
 /// its own.
 fn server_handshake(server: &NodeKey) -> (Vec<u8>, Vec<u8>) {
-    let mut handshake = Handshake::new(server.node_id());
-    handshake.receive_opening(Handshake::new(NodeKey::generate().node_id()).opening()).unwrap();
+    let mut handshake = Handshake::new(server.node_id(), PeerProvenance::Inbound);
+    handshake.receive_opening(Handshake::new(NodeKey::generate().node_id(), PeerProvenance::Configured).opening()).unwrap();
     let presence = server.sign_presence(handshake.presence_claims(server.node_id(), true).unwrap());
     (proto::Message::Open(handshake.opening()).encode(), proto::Message::Presence(presence).encode())
 }

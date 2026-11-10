@@ -294,7 +294,7 @@ where
         // Taken when the server registers; given back to deregister it once the connection ends.
         let mut registration: Option<ConnectionRegistration> = None;
         let mut outgoing_rx: Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>> = None;
-        let handshake = inner.node.begin_handshake();
+        let handshake = inner.node.begin_handshake(PeerProvenance::Configured);
         let opening = proto::Message::Open(handshake.opening());
         // Taken when the server's presence registers it.
         let mut handshake = Some(handshake);
@@ -491,13 +491,12 @@ where
     ) -> Result<()> {
         info!("Received server presence: {}", server_presence.claims.node_id);
 
-        let Some(handshake) = handshake.take() else {
+        let Some(mut handshake) = handshake.take() else {
             warn!("Ignoring duplicate server presence");
             return Ok(());
         };
         let (sender, rx) = WebsocketPeerSender::new(server_presence.claims.node_id);
-        *registration =
-            Some(inner.node.register_peer(server_presence.clone(), &handshake, PeerProvenance::Configured, Box::new(sender)).await?);
+        *registration = Some(inner.node.register_peer(server_presence.clone(), &mut handshake, Box::new(sender)).await?);
         *outgoing_rx = Some(rx);
 
         inner.connected.store(true, Ordering::Release);

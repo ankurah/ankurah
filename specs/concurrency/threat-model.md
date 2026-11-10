@@ -473,8 +473,9 @@ Trust tier: trusted-peer, for a peer this node was configured to dial.
 Enforcing seam: `node.rs` `register_peer` verifies the signed presence against the
 challenge, the challenge issuer and the version offers of this node's side of the
 connection's handshake (`Handshake::authenticate` in `connector/handshake.rs`), then asks
-`PolicyAgent::peer_trust` whether the peer is durable. Every connector's accepting side
-registers the dialer before it signs its own presence, so it signs none for a dialer whose
+`PolicyAgent::peer_trust` whether the peer is durable. `node.rs` `presence` signs on a
+connection this node accepted only once its dialer has registered on it
+(`Handshake::check_may_present`), so an accepting node signs none for a dialer whose
 opening relayed another node's challenge. By
 default only a peer reached as `PeerProvenance::Configured` may be; an `Inbound`
 peer's durable claim is ignored. Only a durable-trusted peer enters `durable_peers`,

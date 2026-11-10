@@ -124,7 +124,7 @@ where
     info!("Websocket server connected to {}", client_ip);
 
     let (socket, mut receiver) = socket.split();
-    let handshake = node.begin_handshake();
+    let handshake = node.begin_handshake(PeerProvenance::Inbound);
     let opening = proto::Message::Open(handshake.opening());
     let mut conn = Connection::Initial { socket: Some(socket), handshake: Some(handshake) };
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
@@ -219,7 +219,7 @@ async fn read_opening(
 async fn answer_presence<SE, PA>(
     presence: proto::Presence,
     mut socket: Socket,
-    handshake: Handshake,
+    mut handshake: Handshake,
     client_ip: IpAddr,
     state: &mut Connection,
     node: &Node<SE, PA>,
@@ -232,7 +232,7 @@ where
     debug!("Received client presence from {}", client_ip);
     let (sender, writer) = WebSocketClientSender::new(presence.claims.node_id);
     // Outside the deadline, so no plugin's hook is cut off partway.
-    match node.register_peer(presence, &handshake, PeerProvenance::Inbound, Box::new(sender.clone())).await {
+    match node.register_peer(presence, &mut handshake, Box::new(sender.clone())).await {
         // Held by the connection from here, so the peer is deregistered however the connection ends.
         Ok(registration) => *state = Connection::Established { sender, registration },
         Err(refusal) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
