@@ -162,7 +162,6 @@ Example: with `claims.sub = "user123"`, the filter `"assigned_to = $jwt.sub"` is
 let keys = SigningKeys::generate()?;  // or SigningKeys::from_pem(pem)
 let agent = JwtAgent::new_durable(keys, "path/to/policy.json")?;
 let node = Node::new_durable(storage, agent.clone());
-node.system.create().await?;
 agent.set_policy(&node, &agent.config()).await?;  // or agent.set_policy_from_file(&node, path)
 node.wait_ready().await?;
 ```
@@ -207,7 +206,7 @@ let node = Node::new(storage, agent.clone());
 
 #### `start`
 
-Core calls `start` after the system and catalog have loaded, and the node does not report ready (`Node::wait_ready`, `context_async`) until it returns; an error halts the node. `JwtAgent::start` spawns `start_policy_sync` (see Loading under Stored Policy) and returns once the first policy load completes. The livequeries live as long as the agent; dropping the last `JwtAgent` clone cancels the task.
+Core calls `start` after the catalog has its durable answer, and the node does not report ready (`Node::wait_ready`, `context_async`) until it returns; an error halts the node. `JwtAgent::start` spawns `start_policy_sync` (see Loading under Stored Policy) and returns once the first policy load completes. The livequeries live as long as the agent; dropping the last `JwtAgent` clone cancels the task.
 
 #### `preflight`
 
@@ -287,7 +286,7 @@ Core first applies the retrieval predicate to the entity, or to the event's enti
 `PolicyAgent` may then impose additional restrictions in `check_reads` and
 `check_read_event`; `JwtAgent` keeps the trait defaults, which add none.
 
-#### `validate_received_event` / `validate_received_state` / `attest_state` / `validate_causal_assertion`
+#### `validate_received_event` / `validate_received_state` / `request_state_attestation` / `validate_causal_assertion`
 
 Currently permissive (return `Ok(())` or `None`).
 
