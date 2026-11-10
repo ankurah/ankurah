@@ -7,7 +7,7 @@ use ankurah_proto::{EntityId, EntityState, Event};
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::{attestation, event_admissibility::check_operations};
+use crate::node::{attestation, event_admissibility::AdmittedOperations};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -178,6 +178,7 @@ impl Transaction {
         let policy = ContextPolicy::new(&node.policy_agent, auth.clone());
 
         let mut entity_events = Vec::new();
+        let mut admitted = AdmittedOperations::new();
         // Prepare once, outside the retry loop: every attempt re-applies and relays these exact events.
         for entity in self.entities.iter() {
             if entity.system_epoch() != epoch {
@@ -186,7 +187,7 @@ impl Transaction {
             let events = entity.prepare_events()?;
             for event in &events {
                 event.payload.validate_structure()?;
-                check_operations(&event.payload)?;
+                admitted.admit(&event.payload)?;
             }
             if !events.is_empty() {
                 entity_events.push((entity, events));
@@ -212,7 +213,7 @@ impl Transaction {
                 let expected_head = entity_after.head();
                 let mut events = events.clone();
                 entity_after
-                    .apply_events(&event_getter, &mut events, |event| {
+                    .apply_events(&event_getter, &mut events, &admitted, |event| {
                         Ok(attestation::on_event(node, event, policy.check_write_event(node, &entity_before, &after, event)?))
                     })
                     .await?;

@@ -9,6 +9,7 @@ use crate::{
     },
     error::{MutationError, RetrievalError, StateError},
     event_dag::EventLayers,
+    node::event_admissibility::AdmittedOperations,
     property::PropertyError,
     retrieval::{GetEvents, GetState},
     schema::SystemEpoch,
@@ -81,12 +82,14 @@ impl RemoteTrxEntity {
         self.0.data().state.apply_state(getter, state).await
     }
 
-    /// Prepare the whole batch with one comparison, then apply and check each event in causal order.
+    /// Prepare the whole batch with one comparison, then apply and check each event in causal order,
+    /// using the operations `admitted` read as the events entered.
     /// Preparation failure changes nothing. After application or policy failure, discard the fork; do not commit it.
     pub(crate) async fn apply_events<G>(
         &self,
         getter: &G,
         events: &mut [Attested<Event>],
+        admitted: &AdmittedOperations,
         mut check: impl FnMut(&Event) -> Result<Option<SealedAttestation>, MutationError>,
     ) -> Result<(), MutationError>
     where
@@ -101,7 +104,7 @@ impl RemoteTrxEntity {
         let data = self.0.data();
         let mut head = data.state.head();
         let getter = TransactionEventGetter::new(&data.events, events.iter().map(|event| &event.payload), getter);
-        let prepared = EventLayers::prepare(&getter, events, &head).await?;
+        let prepared = EventLayers::prepare(&getter, events, &head, admitted).await?;
         for (event, layers) in events.iter_mut().zip(prepared.per_event()) {
             let applied = data.state.apply_prepared_layers(&mut head, layers)?;
             if let Some(attestation) = check(&event.payload)? {

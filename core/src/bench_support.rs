@@ -14,6 +14,7 @@ use crate::event_dag::accumulator::ComparisonResult;
 use crate::event_dag::compare as compare_internal;
 use crate::event_dag::layers::EventLayers;
 use crate::event_dag::ordering::topo_sort_events as topo_sort_internal;
+use crate::node::event_admissibility::AdmittedOperations;
 use crate::retrieval::GetEvents;
 use ankurah_proto::{Attested, Clock, Event, EventId};
 
@@ -59,7 +60,7 @@ pub async fn prepare_layers<E: GetEvents + Send + Sync>(
     events: &[&Event],
     head: &Clock,
 ) -> Result<BenchEventLayers, MutationError> {
-    Ok(BenchEventLayers(EventLayers::prepare(getter, events, head).await?))
+    Ok(BenchEventLayers(EventLayers::prepare(getter, events, head, &AdmittedOperations::new()).await?))
 }
 
 /// Opaque wrapper over the crate-internal, fully loaded `EventLayers`.

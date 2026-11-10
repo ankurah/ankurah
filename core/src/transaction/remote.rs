@@ -1,6 +1,6 @@
 use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
-use crate::node::{attestation, event_admissibility::check_operations};
+use crate::node::{attestation, event_admissibility::AdmittedOperations};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -66,7 +66,8 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         // Clear only on success, so errors and dropped futures leave the transaction poisoned.
         self.failed = true;
         event.payload.validate_structure()?;
-        check_operations(&event.payload)?;
+        let mut admitted = AdmittedOperations::new();
+        admitted.admit(&event.payload)?;
         let entity = self.get_entity(&event.payload).await?;
         let expected_head = entity.head();
 
@@ -74,7 +75,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let before = &self.entities.entries[&entity.id()].before;
         let after = entity.read();
         entity
-            .apply_events(&self.event_getter, std::slice::from_mut(&mut event), |event| {
+            .apply_events(&self.event_getter, std::slice::from_mut(&mut event), &admitted, |event| {
                 Ok(attestation::on_event(self.node, event, self.policy.check_write_event(self.node, before, &after, event)?))
             })
             .await?;

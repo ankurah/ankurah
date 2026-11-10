@@ -1,6 +1,7 @@
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     event_dag::{AbstractCausalRelation, EventLayer, EventLayers, LayerEvent, DEFAULT_BUDGET},
+    node::event_admissibility::AdmittedOperations,
     property::backend::{backend_from_string, PropertyBackend},
     retrieval::GetEvents,
     value::Value,
@@ -196,7 +197,7 @@ impl EntityState {
         let mut head = self.head();
         const MAX_RETRIES: usize = 5;
         for _ in 0..MAX_RETRIES {
-            let prepared = EventLayers::prepare(getter, events, &head).await?;
+            let prepared = EventLayers::prepare(getter, events, &head, &AdmittedOperations::new()).await?;
             let applied: Vec<_> = prepared.per_event().map(|layers| !layers.is_empty()).collect();
             if !applied.iter().any(|applied| *applied) {
                 return Ok(applied);

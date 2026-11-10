@@ -2,6 +2,7 @@
 
 use crate::error::RetrievalError;
 use crate::event_dag::{EventLayer, LayerEvent};
+use crate::node::event_admissibility::AdmittedOperations;
 use crate::property::backend::lww::LWWBackend;
 use crate::property::backend::PropertyBackend;
 use crate::retrieval::GetEvents;
@@ -2078,8 +2079,15 @@ mod phase4_mixed_parent_merge {
         }
 
         // Meet = [A], current head = [B]
-        let layers =
-            crate::event_dag::layers::EventLayers::load(accumulator, vec![id_a.clone()], vec![id_b.clone()], &[&ev_e]).await.unwrap();
+        let layers = crate::event_dag::layers::EventLayers::load(
+            accumulator,
+            vec![id_a.clone()],
+            vec![id_b.clone()],
+            &[&ev_e],
+            &AdmittedOperations::new(),
+        )
+        .await
+        .unwrap();
         let all_layers = layers.layers();
 
         // Verify we got multiple layers and all events are covered
@@ -2201,7 +2209,7 @@ mod phase4_eager_storage_bfs {
         assert!(dag.contains_key(&id_e), "BFS should have accumulated event E");
 
         // Preparation must also load layers from the eagerly stored history.
-        let layers = crate::event_dag::EventLayers::prepare(&retriever, &[&ev_d], &clock_e).await.unwrap();
+        let layers = crate::event_dag::EventLayers::prepare(&retriever, &[&ev_d], &clock_e, &AdmittedOperations::new()).await.unwrap();
         assert!(!layers.layers().is_empty(), "Should produce at least one layer from eagerly stored events");
         for layer in layers.layers() {
             assert!(!layer.to_apply.is_empty() || !layer.already_applied.is_empty(), "Layer should not be empty");
@@ -3240,7 +3248,7 @@ mod generation_comparison {
         assert_eq!(meet.iter().cloned().collect::<std::collections::BTreeSet<_>>(), [m1.id(), m2.id()].into_iter().collect());
         let backend = LWWBackend::new();
         backend.apply_layer(&layer_from_refs(&[], &[&stored])).unwrap();
-        let layers = EventLayers::prepare(&retriever, &[&joined], &Clock::singleton(&current)).await.unwrap();
+        let layers = EventLayers::prepare(&retriever, &[&joined], &Clock::singleton(&current), &AdmittedOperations::new()).await.unwrap();
         for layer in layers.layers() {
             backend.apply_layer(layer).unwrap();
         }
@@ -3259,7 +3267,9 @@ mod generation_comparison {
         for event in [&root, &head, &first, &last] {
             accumulator.accumulate(event);
         }
-        let layers = EventLayers::load(accumulator, vec![head.id()], vec![head.id()], &[&head, &first, &last]).await.unwrap();
+        let layers = EventLayers::load(accumulator, vec![head.id()], vec![head.id()], &[&head, &first, &last], &AdmittedOperations::new())
+            .await
+            .unwrap();
         assert_eq!(layers.per_event().map(|layers| layers.len()).collect::<Vec<_>>(), vec![0, 1, 1]);
         let [first_layer, last_layer] = layers.layers() else { panic!("expected the two new writes") };
         assert_eq!(layer_events(&first_layer.to_apply), vec![first.clone()]);
@@ -3273,11 +3283,11 @@ mod generation_comparison {
     async fn already_applied_comparisons_have_no_layers() {
         let (retriever, history) = linear_history(2);
         let current = Clock::singleton(&history[1]);
-        let layers = EventLayers::prepare(&retriever, &[&history[1], &history[1]], &current).await.unwrap();
+        let layers = EventLayers::prepare(&retriever, &[&history[1], &history[1]], &current, &AdmittedOperations::new()).await.unwrap();
         assert!(layers.layers().is_empty());
         assert_eq!(layers.per_event().map(|layers| layers.len()).collect::<Vec<_>>(), vec![0, 0]);
 
-        let layers = EventLayers::prepare(&retriever, &[&history[0]], &current).await.unwrap();
+        let layers = EventLayers::prepare(&retriever, &[&history[0]], &current, &AdmittedOperations::new()).await.unwrap();
         assert!(layers.layers().is_empty());
         assert_eq!(layers.per_event().map(|layers| layers.len()).collect::<Vec<_>>(), vec![0]);
     }
@@ -3290,7 +3300,7 @@ mod generation_comparison {
         retriever.add_event(left.clone());
         retriever.add_event(right.clone());
         assert!(matches!(
-            EventLayers::prepare(&retriever, &[&left], &Clock::singleton(&right)).await,
+            EventLayers::prepare(&retriever, &[&left], &Clock::singleton(&right), &AdmittedOperations::new()).await,
             Err(MutationError::LineageError(LineageError::Disjoint))
         ));
     }
@@ -3305,7 +3315,7 @@ mod generation_comparison {
             retriever.add_event(other.clone());
         }
         assert!(matches!(
-            EventLayers::prepare(&retriever, &[history.last().unwrap()], &Clock::singleton(&other)).await,
+            EventLayers::prepare(&retriever, &[history.last().unwrap()], &Clock::singleton(&other), &AdmittedOperations::new()).await,
             Err(MutationError::LineageError(LineageError::BudgetExceeded {
                 original_budget, subject_frontier, other_frontier,
             })) if original_budget == crate::event_dag::DEFAULT_BUDGET + 1
@@ -3322,7 +3332,8 @@ mod generation_comparison {
         let mut events = MockRetriever::new();
         events.add_event(incoming.clone());
         let retriever = CountingRetriever::new(events);
-        let layers = EventLayers::prepare(&retriever, &[&incoming], &Clock::from_events([&left, &right])).await.unwrap();
+        let layers =
+            EventLayers::prepare(&retriever, &[&incoming], &Clock::from_events([&left, &right]), &AdmittedOperations::new()).await.unwrap();
         let [layer] = layers.layers() else { panic!("expected one layer") };
         assert!(layer.already_applied.is_empty());
         assert_eq!(layer_events(&layer.to_apply), vec![incoming.clone()]);
@@ -3339,7 +3350,7 @@ mod generation_comparison {
         let retriever = CountingRetriever::new(events);
         compare(retriever.clone(), &Clock::singleton(&genesis), &Clock::default(), 100).await.unwrap();
         assert_eq!(retriever.reads(), 0, "empty-head comparison needs no history");
-        let layers = EventLayers::prepare(&retriever, &[&genesis], &Clock::default()).await.unwrap();
+        let layers = EventLayers::prepare(&retriever, &[&genesis], &Clock::default(), &AdmittedOperations::new()).await.unwrap();
         let [layer] = layers.layers() else { panic!("expected one layer") };
         assert!(layer.already_applied.is_empty());
         assert_eq!(layer_events(&layer.to_apply), vec![genesis]);
@@ -3353,7 +3364,10 @@ mod generation_comparison {
         let mut events = MockRetriever::new();
         events.add_event(update.clone());
         let retriever = CountingRetriever::new(events);
-        assert!(matches!(EventLayers::prepare(&retriever, &[&update], &Clock::default()).await, Err(MutationError::InvalidEvent)));
+        assert!(matches!(
+            EventLayers::prepare(&retriever, &[&update], &Clock::default(), &AdmittedOperations::new()).await,
+            Err(MutationError::InvalidEvent)
+        ));
         assert_eq!(retriever.reads(), 0);
     }
 }

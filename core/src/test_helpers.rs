@@ -39,7 +39,13 @@ pub fn apply_backend_event(backend: &dyn crate::property::backend::PropertyBacke
         async fn event_stored(&self, _: &proto::EventId) -> Result<bool, RetrievalError> { Ok(false) }
     }
     async {
-        let layers = crate::event_dag::EventLayers::prepare(&Incoming(event), &[event], &event.parent).await?;
+        let layers = crate::event_dag::EventLayers::prepare(
+            &Incoming(event),
+            &[event],
+            &event.parent,
+            &crate::node::event_admissibility::AdmittedOperations::new(),
+        )
+        .await?;
         for layer in layers.layers() {
             backend.apply_layer(layer)?;
         }

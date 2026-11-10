@@ -1,6 +1,7 @@
 use crate::entity::RemoteTrxEntity;
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
+use crate::node::event_admissibility::AdmittedOperations;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::storage::StorageTransaction;
@@ -65,21 +66,22 @@ impl NodeApplier {
         Ok(())
     }
 
-    /// Validate each event fragment structurally and against policy, then
-    /// stage it for causal comparison. Application checks its lineage later.
+    /// Validate each event fragment structurally and against policy, reading its operations once,
+    /// then stage it for causal comparison. Application checks its lineage later.
     fn validate_and_stage<SE, PA, E>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::NodeId,
         entity_id: proto::EntityId,
         event_fragments: Vec<proto::EventFragment>,
         event_getter: &E,
-    ) -> Result<Vec<Attested<proto::Event>>, MutationError>
+    ) -> Result<(Vec<Attested<proto::Event>>, AdmittedOperations), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
         E: SuspenseEvents + Send + Sync,
     {
         let mut attested_events = Vec::new();
+        let mut admitted = AdmittedOperations::new();
         for fragment in event_fragments {
             let attested_event: Attested<proto::Event> = (entity_id, fragment).into();
             // A genesis whose id the entity it claims does not derive, or a
@@ -87,12 +89,12 @@ impl NodeApplier {
             // the DAG ever sees it: the sender's framing of the entity id is
             // what the fragment supplies, and a genesis must derive its own.
             attested_event.payload.validate_structure()?;
-            super::event_admissibility::check_operations(&attested_event.payload)?;
+            admitted.admit(&attested_event.payload)?;
             node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
             event_getter.stage_event(attested_event.payload.clone());
             attested_events.push(attested_event);
         }
-        Ok(attested_events)
+        Ok((attested_events, admitted))
     }
 
     async fn apply_update<SE, PA, E, S>(
@@ -113,14 +115,14 @@ impl NodeApplier {
 
         match content {
             proto::UpdateContent::EventOnly(event_fragments) => {
-                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, event_fragments, event_getter)?;
+                let (attested_events, admitted) = Self::validate_and_stage(node, from_peer_id, entity_id, event_fragments, event_getter)?;
                 // Batch preparation requires parents before their children; wire order is untrusted.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
-                Self::apply_and_commit_events(node, &attested_events, event_getter).await
+                Self::apply_and_commit_events(node, &attested_events, &admitted, event_getter).await
             }
 
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
-                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, event_fragments, event_getter)?;
+                let (attested_events, admitted) = Self::validate_and_stage(node, from_peer_id, entity_id, event_fragments, event_getter)?;
                 // Batch preparation requires parents before their children.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
 
@@ -135,7 +137,7 @@ impl NodeApplier {
                     .get_or_retrieve(state_getter, event_getter, &entity_id)
                     .await?
                     .ok_or(RetrievalError::EntityNotFound(entity_id))?;
-                Self::apply_and_commit_state(node, &entity, &state.payload, &attested_events, event_getter).await
+                Self::apply_and_commit_state(node, &entity, &state.payload, &attested_events, &admitted, event_getter).await
             }
         }
     }
@@ -232,6 +234,7 @@ impl NodeApplier {
         entity: &crate::entity::Entity,
         snapshot: &proto::EntityState,
         events: &[Attested<proto::Event>],
+        admitted: &AdmittedOperations,
         event_getter: &E,
     ) -> Result<Option<EntityChange>, MutationError>
     where
@@ -250,7 +253,7 @@ impl NodeApplier {
             if adopted {
                 Self::check_snapshot_events(node, snapshot, &expected_head, &events, event_getter).await?;
             } else {
-                candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
+                candidate.apply_events(event_getter, &mut events, admitted, |_| Ok(None)).await?;
             }
             let state: Attested<proto::EntityState> = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? }.into();
             let mut storage_trx = node.storage.transaction();
@@ -276,6 +279,7 @@ impl NodeApplier {
     async fn apply_and_commit_events<SE, PA, E>(
         node: &Node<SE, PA>,
         events: &[Attested<proto::Event>],
+        admitted: &AdmittedOperations,
         event_getter: &E,
     ) -> Result<Option<EntityChange>, MutationError>
     where
@@ -290,7 +294,7 @@ impl NodeApplier {
             let candidate = RemoteTrxEntity::for_event(&node.entities, &state_getter, event_getter, &first.payload).await?;
             let expected_head = candidate.head();
             let mut events = events.to_vec();
-            candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
+            candidate.apply_events(event_getter, &mut events, admitted, |_| Ok(None)).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state.into()).await?;
@@ -385,17 +389,17 @@ impl NodeApplier {
                     .get_or_retrieve(state_getter, event_getter, &delta.entity_id)
                     .await?
                     .ok_or(RetrievalError::EntityNotFound(delta.entity_id))?;
-                Self::apply_and_commit_state(node, &entity, &attested_state.payload, &[], event_getter).await
+                Self::apply_and_commit_state(node, &entity, &attested_state.payload, &[], &AdmittedOperations::new(), event_getter).await
             }
 
             proto::DeltaContent::EventBridge { events } => {
                 // Bridge events pass the same policy gate as subscription
                 // updates; transport must not decide trust.
-                let attested_events = Self::validate_and_stage(node, from_peer_id, delta.entity_id, events, event_getter)?;
+                let (attested_events, admitted) = Self::validate_and_stage(node, from_peer_id, delta.entity_id, events, event_getter)?;
 
                 // Batch preparation requires parents before their children; wire order is untrusted.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
-                let change = Self::apply_and_commit_events(node, &attested_events, event_getter).await?;
+                let change = Self::apply_and_commit_events(node, &attested_events, &admitted, event_getter).await?;
 
                 // An already-applied bridge changes nothing. Avoid emitting an empty
                 // Update to subscriptions that already hold this entity.
