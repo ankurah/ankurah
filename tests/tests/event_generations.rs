@@ -130,7 +130,7 @@ async fn an_ephemeral_node_stamps_an_edit_of_a_snapshot_without_fetching_its_hea
 async fn an_ephemeral_node_admits_an_honest_update_over_parents_it_does_not_hold_without_fetching() -> Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
-    let (_connection, _gate, requested) = connect_recording_event_requests(&client, &server).await;
+    let (connection, _gate, requested) = connect_recording_event_requests(&client, &server).await;
     let server_ctx = server.context_async(c).await?;
     let client_ctx = client.context_async(c).await?;
     // A standing query with the server lets the client accept pushed updates from it.
@@ -152,9 +152,8 @@ async fn an_ephemeral_node_admits_an_honest_update_over_parents_it_does_not_hold
         predicate_relevance: vec![],
     };
     let body = proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] });
-    client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate { id: proto::UpdateId::new(), from: server.id, to: client.id, body }))
-        .await?;
+    let update = proto::NodeMessage::Update(proto::NodeUpdate { id: proto::UpdateId::new(), from: server.id, to: client.id, body });
+    client.handle_message(connection.other_registration(), update).await?;
 
     assert_eq!(record.title()?, "t1", "the honest update is admitted");
     assert!(!requested.lock().unwrap().contains(&genesis), "nothing asked the server for the parent");

@@ -11,11 +11,12 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-use crate::connector::{PeerConnectionError, PeerSender};
+use crate::connector::{Handshake, PeerConnectionError, PeerProvenance, PeerSender};
 use crate::context::{Context, ContextAuth, ContextInner};
 use crate::entity::WeakEntitySet;
 use crate::error::{NodeHaltReason, NodeReadinessError, RequestError};
 use crate::peer_subscription::{SubscriptionHandler, SubscriptionRelay};
+use crate::policy::PeerTrust;
 use crate::reactor::Reactor;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
 use crate::util::Iterable;
@@ -23,7 +24,7 @@ use crate::{action_info, notice_info};
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 mod builder;
 mod erased;
@@ -46,7 +47,8 @@ use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub(crate) use peers::durable_peer;
 pub use peers::peer_state::PeerState;
-use peers::PeerRegistry;
+pub use peers::ConnectionRegistration;
+use peers::{PeerRegistry, RequiredTrust};
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
@@ -92,6 +94,8 @@ where PA: PolicyAgent
     pub id: proto::NodeId,
     pub durable: bool,
     pub storage: Arc<SE>,
+    /// Signs this node's presence; never handed to the policy agent.
+    key: NodeKey,
 
     pub(crate) entities: WeakEntitySet,
     /// Hold across storage commit and WeakEntitySet publication: register a new resident entity
@@ -237,6 +241,7 @@ where
 
         let node = Node(Arc::new(NodeInner {
             id,
+            key,
             storage: engine,
             entities: entityset,
             commit_publication_lock: tokio::sync::Mutex::new(()),
@@ -287,59 +292,100 @@ where
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
 
-    /// The identity this node mints under.
+    /// The identity this node mints and signs under.
     pub fn identity(&self) -> proto::Identity { self.id.identity() }
 
-    /// Build our handshake identity; a halted node has none.
-    pub async fn presence(&self) -> Result<proto::Presence, NodeHaltReason> {
+    /// Begin this node's side of one new connection's handshake, reached as `provenance` says.
+    pub fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake { Handshake::new(self.id, provenance) }
+
+    /// Sign this node's presence answering the peer on `handshake`'s connection; a halted node
+    /// signs none, and none answers before the peer's opening arrives, or on a connection this
+    /// node accepted before it registered the dialer.
+    pub async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
         self.lifecycle.check_not_halted()?;
-        Ok(proto::Presence { node_id: self.id, durable: self.durable, protocol_version: proto::PROTOCOL_VERSION })
+        handshake.check_may_present()?;
+        let claims = handshake.presence_claims(self.id, self.durable)?;
+        Ok(self.key.sign_presence(claims))
     }
 
-    /// Register a peer connection after its Presence handshake.
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
-    pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError> {
+    /// Register a peer connection whose presence completes `handshake`, this node's side of it,
+    /// once per handshake. How the connection was reached decides, through the policy agent's
+    /// [`PolicyAgent::peer_trust`], whether the peer is durable. The connector holds the
+    /// registration returned while the connection is open. `sender` holds the frames it is given
+    /// until the connector has written this node's presence.
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.claims.node_id.to_base64_short(), durable = %presence.claims.durable)))]
+    pub async fn register_peer(
+        &self,
+        presence: proto::Presence,
+        handshake: &mut Handshake,
+        sender: Box<dyn PeerSender>,
+    ) -> Result<ConnectionRegistration, PeerConnectionError> {
         action_info!(self, "register_peer", "{}", &presence);
 
-        if !proto::protocol_compatible(presence.protocol_version) {
-            let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
-            warn!("Node({}) refusing peer {}: {}", self.id, presence.node_id, rejection);
-            return Err(rejection.into());
+        if let Err(refusal) = handshake.authenticate(self.id, &presence) {
+            warn!("Node({}) refusing peer: {}", self.id, refusal);
+            return Err(refusal);
+        }
+        let provenance = handshake.provenance();
+        let claims = &presence.claims;
+        let peer = claims.node_id;
+        let trust = self.policy_agent.peer_trust(&peer, provenance, claims.durable);
+        if claims.durable && !trust.durable {
+            info!("Node({}) serves {:?} peer {} as not durable despite its durable claim", self.id, provenance, peer);
         }
 
         self.lifecycle.check_not_halted()?;
-        let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
-        self.peers.connections.insert(presence.node_id, Arc::new(PeerState::new(sender, presence.durable, subscription_handler)));
-        if presence.durable {
-            self.peers.durable.insert(presence.node_id);
-            if let Some(ref relay) = self.subscription_relay {
-                relay.notify_peer_connected(presence.node_id);
-            }
-        }
+        let subscription_handler = SubscriptionHandler::new(peer, self);
+        let registration = self.peers.register(peer, sender, trust, subscription_handler, self.subscription_relay.as_ref());
+        handshake.record_registration();
         // TODO send hello message to the peer, including present head state for all relevant collections
-        Ok(())
+        Ok(registration)
     }
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %node_id.to_base64_short())))]
-    pub fn deregister_peer(&self, node_id: proto::NodeId) {
+    /// Remove `registration`, which [`Node::register_peer`] returned; a newer registration of the
+    /// same peer stays.
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %registration.peer().to_base64_short())))]
+    pub fn deregister_peer(&self, registration: ConnectionRegistration) {
+        let node_id = registration.peer();
         notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
 
-        self.peers.durable.remove(&node_id);
-        // Get and cleanup subscriptions before removing the peer
-        if let Some(peer_state) = self.peers.connections.remove(&node_id) {
+        if let Some(peer_state) = self.peers.deregister(registration, self.subscription_relay.as_ref()) {
             action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
             // ReactorSubscription is automatically unsubscribed on drop
         }
-
-        // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)
-        if let Some(ref relay) = self.subscription_relay {
-            relay.notify_peer_disconnected(node_id);
-        }
     }
     /// Send a request to a connected peer and wait for its response.
-    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
     pub async fn request<'a, C>(
         &self,
         node_id: proto::NodeId,
+        cdata: &C,
+        request_body: proto::NodeRequestBody,
+    ) -> Result<proto::NodeResponseBody, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        self.send_request(node_id, RequiredTrust::Any, cdata, request_body).await
+    }
+
+    /// Send a request to a peer chosen because it is durable, and wait for its response. It is
+    /// refused with [`RequestError::NotTrustedAsDurable`] unless the connection now registered
+    /// for that peer is trusted as durable.
+    pub async fn request_durable<C>(
+        &self,
+        node_id: proto::NodeId,
+        cdata: &C,
+        request_body: proto::NodeRequestBody,
+    ) -> Result<proto::NodeResponseBody, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        self.send_request(node_id, RequiredTrust::Durable, cdata, request_body).await
+    }
+
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
+    async fn send_request<C>(
+        &self,
+        node_id: proto::NodeId,
+        required: RequiredTrust,
         cdata: &C,
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError>
@@ -358,7 +404,8 @@ where
         let auth = if bypasses_policy { Vec::new() } else { self.policy_agent.sign_request(self, cdata, &request)? };
 
         {
-            let connection = self.peers.connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
+            // Checked and sent with no await between, through the connection that was checked.
+            let connection = self.peers.trusted_connection(&node_id, required)?;
             connection.pending_requests.insert(request_id, response_tx);
             connection.send_message(proto::NodeMessage::Request { auth, request })?;
         }
@@ -377,7 +424,7 @@ where
         let id = proto::UpdateId::new();
 
         // Get the peer connection
-        let Some(connection) = self.peers.connections.get(&node_id) else {
+        let Some(connection) = self.peers.connection(&node_id) else {
             warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
             return;
         };
@@ -398,11 +445,13 @@ where
         // response_rx.await.map_err(|_| RequestError::InternalChannelClosed)??;
     }
 
-    // TODO add a node id argument to this function rather than getting it from the message
-    // (does this actually make it more secure? or just move the place they could lie to us to the handshake?)
-    // Not if its signed by a node key.
+    /// Handle a frame that arrived on the connection `registration` registered. A frame naming
+    /// another node as its sender, or arriving once a newer registration of the peer replaced
+    /// this one, is refused and logged, and the connection stays up.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
-    pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> { inbound::handle_message(self, message).await }
+    pub async fn handle_message(&self, registration: ConnectionRegistration, message: proto::NodeMessage) -> anyhow::Result<()> {
+        inbound::handle_message(self, registration, message).await
+    }
 
     /// Return the resident entity if a live handle keeps it in memory.
     pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
@@ -427,16 +476,13 @@ where
         Context(Arc::new(ContextInner { node: NodeHandle::Strong(Node::clone(self)), auth: ContextAuth::Privileged }))
     }
 
-    /// Get a random durable peer node ID.
-    ///
-    /// Draws from the node's seeded RNG (not `thread_rng`) so the simulation harness can reproduce
-    /// selections. The candidate slice is sorted first: `choose` indexes by position, so a stable
-    /// candidate order is required for a given seed to yield a given peer.
+    /// A durable peer drawn from the node's seeded source of randomness.
     pub fn get_durable_peer_random(&self) -> Option<proto::NodeId> { self.peers.random_durable() }
 
-    /// Get all durable peer node IDs, sorted by id for a stable fan-out order.
-    /// The underlying set is unordered; callers that emit per peer (relay, random selection)
-    /// depend on this stable order for the C1 determinism audit.
+    /// The trust this node granted a connected peer.
+    pub fn granted_trust(&self, peer: &proto::NodeId) -> Option<PeerTrust> { self.peers.granted_trust(peer) }
+
+    /// The durable peers' ids, sorted by id for a stable fan-out order.
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.peers.durable_peers() }
 
     /// TEST ONLY: Create a phantom entity with a specific ID.
@@ -482,7 +528,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::NodeId>) -> anyhow::Result<()> {
-        for (peer_id, item) in self.peers.connections.get_list(peers) {
+        for (peer_id, item) in self.peers.connections(peers) {
             if let Some(connection) = item {
                 connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: self.id, query_id })?;
             } else {

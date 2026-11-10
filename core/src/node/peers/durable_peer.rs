@@ -1,3 +1,5 @@
+//! The work a node asks a durable peer to do.
+
 use crate::internal::prelude::*;
 use crate::node::{inbound::applier, Node};
 use crate::retrieval::{CachedEventGetter, LocalStateGetter};
@@ -18,7 +20,8 @@ where
     // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
     // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
     for peer_id in node.get_durable_peers() {
-        match node.request(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() }).await {
+        let body = proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() };
+        match node.request_durable(peer_id, cdata, body).await {
             Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
             Err(error) => return Err(RetrievalError::from(error).into()),
             Ok(proto::NodeResponseBody::Error(e)) => {
@@ -48,7 +51,7 @@ where
     node.lifecycle.check_not_halted()?;
     let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-    match node.request(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
+    match node.request_durable(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
         proto::NodeResponseBody::Get(results) => {
             if results.len() != ids.len() || results.iter().zip(&ids).any(|(result, id)| result.entity_id() != *id) {
                 return Err(RetrievalError::Other("Peer Get did not answer the requested identities".into()));
@@ -89,7 +92,7 @@ where
         known_matched_entities.iter().map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() }).collect();
 
     let selection_clone = selection.clone();
-    match node.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches }).await? {
+    match node.request_durable(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches }).await? {
         proto::NodeResponseBody::Fetch(deltas) => {
             let event_getter = CachedEventGetter::new(node, cdata);
             let state_getter = LocalStateGetter::new(node.storage.clone());

@@ -46,13 +46,11 @@ impl Captured {
 #[derive(Clone)]
 pub struct SimSender {
     src: usize,
-    /// The recipient's real node id, required by the `PeerSender` contract.
-    recipient: proto::NodeId,
     captured: Captured,
 }
 
 impl SimSender {
-    pub fn new(src: usize, recipient: proto::NodeId, captured: Captured) -> Self { Self { src, recipient, captured } }
+    pub fn new(src: usize, captured: Captured) -> Self { Self { src, captured } }
 }
 
 #[async_trait::async_trait]
@@ -61,8 +59,6 @@ impl PeerSender for SimSender {
         self.captured.push(Outbound { src: self.src, message });
         Ok(())
     }
-
-    fn recipient_node_id(&self) -> proto::NodeId { self.recipient }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

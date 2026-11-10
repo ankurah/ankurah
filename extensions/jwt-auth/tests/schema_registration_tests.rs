@@ -1,14 +1,16 @@
 mod common;
 
 use ankurah::{Model, Node, Ref};
+use ankurah_connector_local_process::register_each_other;
 use ankurah_core::{
-    connector::{PeerSender, SendError},
+    connector::{PeerProvenance, PeerSender, SendError},
     error::{MutationError, RetrievalError},
-    node::NodeKey,
+    node::{ConnectionRegistration, NodeKey},
     policy::AccessDenied,
     schema::catalog::SysModelRowView,
     signals::Get,
     storage::StorageEngine,
+    test_helpers::keyed_peer_claims,
 };
 use ankurah_jwt_auth::{JwtAgent, JwtContext, Role};
 use ankurah_proto as proto;
@@ -49,7 +51,6 @@ async fn catalog_states(node: &TestNode) -> anyhow::Result<Vec<proto::Attested<p
 
 #[derive(Clone)]
 struct ReplySender {
-    peer: proto::NodeId,
     tx: mpsc::UnboundedSender<proto::NodeMessage>,
 }
 
@@ -57,28 +58,30 @@ impl PeerSender for ReplySender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         self.tx.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.peer }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 async fn wire_register(
     node: &TestNode,
-    peer: proto::NodeId,
+    registration: ConnectionRegistration,
     replies: &mut mpsc::UnboundedReceiver<proto::NodeMessage>,
     auth: proto::AuthData,
     model: proto::RegisterModel,
 ) -> anyhow::Result<proto::NodeResponseBody> {
     let id = proto::RequestId::new();
-    node.handle_message(proto::NodeMessage::Request {
-        // One empty entry is an anonymous credential, not an empty credential set.
-        auth: vec![auth],
-        request: proto::NodeRequest {
-            id: id.clone(),
-            from: peer,
-            to: node.id,
-            body: proto::CarriedBody::encode(&proto::NodeRequestBody::RegisterSchema { model }),
+    node.handle_message(
+        registration,
+        proto::NodeMessage::Request {
+            // One empty entry is an anonymous credential, not an empty credential set.
+            auth: vec![auth],
+            request: proto::NodeRequest {
+                id: id.clone(),
+                from: registration.peer(),
+                to: node.id,
+                body: proto::CarriedBody::encode(&proto::NodeRequestBody::RegisterSchema { model }),
+            },
         },
-    })
+    )
     .await?;
     match replies.try_recv()? {
         proto::NodeMessage::Response(response) => {
@@ -98,15 +101,12 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     assert!(error.to_string().contains("Anonymous contexts cannot change the catalog"), "{error}");
     assert_eq!(catalog_states(&node).await?, before, "no model, reference target, property, or membership may be persisted");
 
-    let peer = NodeKey::generate().node_id();
+    let key = NodeKey::generate();
     let (tx, mut replies) = mpsc::unbounded_channel();
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(ReplySender { peer, tx }),
-    )
-    .await?;
+    let (mut handshake, claims) = keyed_peer_claims(node.id, PeerProvenance::Inbound, &key, false);
+    let registration = node.register_peer(key.sign_presence(claims), &mut handshake, Box::new(ReplySender { tx })).await?;
     let model = proto::RegisterModel::from(RegistrationRecord::descriptor());
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), model.clone()).await?;
+    let response = wire_register(&node, registration, &mut replies, proto::AuthData::default(), model.clone()).await?;
     assert!(
         matches!(response, proto::NodeResponseBody::Error(ref error) if error.contains("Anonymous contexts cannot change the catalog")),
         "{response:?}"
@@ -115,7 +115,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
 
     let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
     let token = common::sign_token(&common::test_keys(), &claims);
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData(token.into_bytes()), model.clone()).await?;
+    let response = wire_register(&node, registration, &mut replies, proto::AuthData(token.into_bytes()), model.clone()).await?;
     let registered = match response {
         proto::NodeResponseBody::SchemaRegistered { model } => model,
         other => anyhow::bail!("authenticated registration must succeed: {other:?}"),
@@ -123,7 +123,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     let after = catalog_states(&node).await?;
     assert!(after.len() > before.len());
 
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), model.clone()).await?;
+    let response = wire_register(&node, registration, &mut replies, proto::AuthData::default(), model.clone()).await?;
     assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { model } if model.id == registered.id));
     assert_eq!(catalog_states(&node).await?, after, "anonymous no-op registration is still allowed");
     assert_eq!(anonymous.resolve_model_id::<RegistrationRecord>().await?, proto::ModelId::EntityId(registered.id));
@@ -134,13 +134,13 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     extra.name = "extra".into();
     extra.build_id = [0x42; 16];
     extension.properties.push(extra);
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), extension).await?;
+    let response = wire_register(&node, registration, &mut replies, proto::AuthData::default(), extension).await?;
     assert!(
         matches!(response, proto::NodeResponseBody::Error(ref error) if error.contains("Anonymous contexts cannot change the catalog")),
         "{response:?}"
     );
     assert_eq!(catalog_states(&node).await?, after, "an existing model must not permit anonymous schema extension");
-    node.deregister_peer(peer);
+    node.deregister_peer(registration);
     Ok(())
 }
 
@@ -148,13 +148,10 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
 async fn signed_registration_cannot_change_policy_membership_optionality() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         let node = setup().await?;
-        let peer = NodeKey::generate().node_id();
+        let key = NodeKey::generate();
         let (tx, mut replies) = mpsc::unbounded_channel();
-        node.register_peer(
-            proto::Presence { node_id: peer, durable: false, protocol_version: proto::PROTOCOL_VERSION },
-            Box::new(ReplySender { peer, tx }),
-        )
-        .await?;
+        let (mut handshake, claims) = keyed_peer_claims(node.id, PeerProvenance::Inbound, &key, false);
+        let registration = node.register_peer(key.sign_presence(claims), &mut handshake, Box::new(ReplySender { tx })).await?;
         let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
         let auth = proto::AuthData(common::sign_token(&common::test_keys(), &claims).into_bytes());
         let model = proto::RegisterModel::from(Role::descriptor());
@@ -167,7 +164,7 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
         let mut changed = model.clone();
         assert_eq!(changed.properties.len(), 1);
         changed.properties[0].optional = true;
-        let response = wire_register(&node, peer, &mut replies, auth.clone(), changed).await?;
+        let response = wire_register(&node, registration, &mut replies, auth.clone(), changed).await?;
         assert!(
             matches!(response, proto::NodeResponseBody::Error(ref error) if error.contains("Only privileged contexts may change JWT policy schema")),
             "{response:?}"
@@ -180,16 +177,16 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
         shared.label = "shared_role_name".into();
         shared.name = "SharedRoleName".into();
         shared.properties[0].explicit_id = Some(property_id);
-        let response = wire_register(&node, peer, &mut replies, auth.clone(), shared.clone()).await?;
+        let response = wire_register(&node, registration, &mut replies, auth.clone(), shared.clone()).await?;
         assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { .. }), "{response:?}");
         shared.properties[0].optional = true;
-        let response = wire_register(&node, peer, &mut replies, auth, shared).await?;
+        let response = wire_register(&node, registration, &mut replies, auth, shared).await?;
         assert!(
             matches!(response, proto::NodeResponseBody::SchemaRegistered { ref model } if model.properties[0].optional),
             "{response:?}"
         );
         assert!(!node.catalog.membership_by_id(&membership_id)?.expect("unchanged role membership").optional);
-        node.deregister_peer(peer);
+        node.deregister_peer(registration);
         Ok::<(), anyhow::Error>(())
     })
     .await?
@@ -241,18 +238,9 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
         let (server_tx, mut server_rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
-        client
-            .register_peer(
-                proto::Presence { node_id: server.id, durable: true, protocol_version: proto::PROTOCOL_VERSION },
-                Box::new(ReplySender { peer: server.id, tx: server_tx }),
-            )
-            .await?;
-        server
-            .register_peer(
-                proto::Presence { node_id: client.id, durable: false, protocol_version: proto::PROTOCOL_VERSION },
-                Box::new(ReplySender { peer: client.id, tx: client_tx }),
-            )
-            .await?;
+        let to_server = Box::new(ReplySender { tx: server_tx });
+        let to_client = Box::new(ReplySender { tx: client_tx });
+        let (server_registration, client_registration) = register_each_other(&client, &server, to_server, to_client).await?;
 
         let held = Arc::new(Mutex::new(None::<Vec<proto::NodeMessage>>));
         let server_task = {
@@ -261,7 +249,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                 while let Some(message) = server_rx.recv().await {
                     let server = server.clone();
                     tokio::spawn(async move {
-                        server.handle_message(message).await.unwrap();
+                        server.handle_message(client_registration, message).await.unwrap();
                     });
                 }
             })
@@ -279,7 +267,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                     }
                     let client = client.clone();
                     tokio::spawn(async move {
-                        client.handle_message(message).await.unwrap();
+                        client.handle_message(server_registration, message).await.unwrap();
                     });
                 }
             })
@@ -330,7 +318,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         }
         let updates = held.lock().unwrap().take().unwrap();
         for update in updates {
-            client.handle_message(update).await?;
+            client.handle_message(server_registration, update).await?;
         }
 
         let query = context.query::<ScopeProbeView>("body = 'hello'")?;
@@ -338,8 +326,8 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         assert!(query.get().iter().any(|row| row.id() == id));
         assert_eq!(context.fetch::<ScopeProbeView>("body = 'hello'").await?.len(), 1);
 
-        server.deregister_peer(client.id);
-        client.deregister_peer(server.id);
+        server.deregister_peer(client_registration);
+        client.deregister_peer(server_registration);
         server_task.abort();
         client_task.abort();
         Ok::<(), anyhow::Error>(())

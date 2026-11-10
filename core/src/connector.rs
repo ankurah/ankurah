@@ -1,27 +1,58 @@
 use ankurah_proto as proto;
 use async_trait::async_trait;
 
-use crate::{policy::PolicyAgent, storage::StorageEngine, Node, NodeState};
+use crate::{node::ConnectionRegistration, policy::PolicyAgent, storage::StorageEngine, Node, NodeState};
 
-/// A peer rejected before its connection becomes available to the node.
+mod handshake;
+pub use handshake::Handshake;
+
+/// Why a connection's handshake does not make its peer available to the node.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PeerConnectionError {
-    #[error("{0}")]
-    Protocol(#[from] proto::PresenceRejection),
+    #[error("this node speaks protocol versions {ours} and the peer speaks {theirs}, with none in common")]
+    NoCommonVersion { ours: proto::ProtocolVersions, theirs: proto::ProtocolVersions },
+    #[error("the peer's opening frame cannot be read: {0}")]
+    UnreadableOpening(String),
+    #[error("the peer sent a second opening frame")]
+    RepeatedOpening,
+    #[error("no opening frame has been received from the peer on this connection")]
+    NoOpening,
+    #[error("presence from node {0} answers a challenge this connection did not issue")]
+    ChallengeMismatch(proto::NodeId),
+    #[error("presence signature is not valid for node {0}")]
+    InvalidSignature(proto::NodeId),
+    /// The peer's opening carried another node's challenge, as a node relaying that node's
+    /// handshake would send it.
+    #[error("node {peer}'s opening carried a challenge issued by node {issuer}")]
+    RelayedChallenge { peer: proto::NodeId, issuer: proto::NodeId },
+    #[error("node {0} refused a connection to itself")]
+    SelfConnection(proto::NodeId),
+    #[error("presence from node {0} does not repeat the versions offered and chosen on this connection")]
+    OfferMismatch(proto::NodeId),
+    /// A presence offered on a handshake that has already registered its peer.
+    #[error("this connection's handshake has already registered its peer")]
+    RepeatedRegistration,
+    /// This node was asked to present on a connection it accepted before it registered the dialer.
+    #[error("this node accepted the connection and presents only once it has registered the dialer")]
+    PresenceBeforeRegistration,
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
 }
 
-// TODO redesign this such that:
-// - the sender and receiver are disconnected at the same time
-// - a connection id or dyn Ord/Eq/Hash is used to identify the connection for deregistration
-//   so that we can have multiple connections to the same node without things getting mixed up
+/// How this node came to be connected to a peer. Trust in the peer's durable claim follows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerProvenance {
+    /// This node dialed the peer from its own configuration.
+    Configured,
+    /// The peer connected to this node.
+    Inbound,
+}
+
+// TODO redesign this such that the sender and receiver are disconnected at the same time
 
 #[async_trait]
 pub trait PeerSender: Send + Sync {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
-    /// The node ID of the recipient of this message
-    fn recipient_node_id(&self) -> proto::NodeId;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }
 
@@ -44,30 +75,43 @@ impl From<anyhow::Error> for SendError {
 #[async_trait]
 pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::NodeId;
-    /// Build our handshake identity; a halted node has none.
-    async fn presence(&self) -> Result<proto::Presence, crate::error::NodeHaltReason>;
-    async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError>;
+    /// Begin this node's side of one new connection's handshake, reached as `provenance` says.
+    fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake;
+    /// Sign this node's presence answering the peer on `handshake`'s connection. A halted node signs none,
+    /// and a node that accepted the connection signs none before it has registered the dialer.
+    async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError>;
+    /// Register the peer whose presence completes `handshake`; `sender` holds the frames it is
+    /// given until the connector has written this node's presence.
+    async fn register_peer(
+        &self,
+        presence: proto::Presence,
+        handshake: &mut Handshake,
+        sender: Box<dyn PeerSender>,
+    ) -> Result<ConnectionRegistration, PeerConnectionError>;
     fn state(&self) -> ankurah_signals::Read<NodeState>;
-    fn deregister_peer(&self, node_id: proto::NodeId);
-    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
+    fn deregister_peer(&self, registration: ConnectionRegistration);
+    /// Handle a frame that arrived on the connection `registration` registered.
+    async fn handle_message(&self, registration: ConnectionRegistration, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
     fn id(&self) -> proto::NodeId { self.id }
-    async fn presence(&self) -> Result<proto::Presence, crate::error::NodeHaltReason> { self.presence().await }
-    async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError> {
-        self.register_peer(presence, sender).await
+    fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake { self.begin_handshake(provenance) }
+    async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> { self.presence(handshake).await }
+    async fn register_peer(
+        &self,
+        presence: proto::Presence,
+        handshake: &mut Handshake,
+        sender: Box<dyn PeerSender>,
+    ) -> Result<ConnectionRegistration, PeerConnectionError> {
+        self.register_peer(presence, handshake, sender).await
     }
     fn state(&self) -> ankurah_signals::Read<NodeState> { self.state() }
-    fn deregister_peer(&self, node_id: proto::NodeId) {
-        //
-        self.deregister_peer(node_id);
-    }
-    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
-        //
-        self.handle_message(message).await
+    fn deregister_peer(&self, registration: ConnectionRegistration) { self.deregister_peer(registration); }
+    async fn handle_message(&self, registration: ConnectionRegistration, message: proto::NodeMessage) -> anyhow::Result<()> {
+        self.handle_message(registration, message).await
     }
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }

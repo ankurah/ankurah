@@ -2,50 +2,85 @@ use super::*;
 use crate::connector::SendError;
 use crate::node::inbound::handler::commit_transaction;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
+use crate::test_helpers::{keyed_peer_claims, opened_handshakes};
 use crate::test_utils::TestStorage;
 use ankurah_proto::Attested;
 use ankurah_signals::Subscribe;
 
 mod commit;
+mod connections;
 mod identity;
 mod reset;
 mod unreadable_bodies;
 
 #[derive(Clone)]
-struct ClosedSender(proto::NodeId);
+struct ClosedSender;
 
 impl PeerSender for ClosedSender {
     fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Err(SendError::ConnectionClosed) }
-    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 #[derive(Clone)]
-struct RecordingSender(proto::NodeId, std::sync::mpsc::Sender<proto::NodeMessage>);
+struct RecordingSender(std::sync::mpsc::Sender<proto::NodeMessage>);
 
 impl PeerSender for RecordingSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-        self.1.send(message).map_err(|_| SendError::ConnectionClosed)
+        self.0.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-fn presence(id: proto::NodeId) -> proto::Presence {
-    proto::Presence { node_id: id, durable: false, protocol_version: proto::PROTOCOL_VERSION }
+/// Register a peer with no node behind it: `key` signs the claims `claims` makes of what its side
+/// of the handshake would claim.
+async fn register_keyed_peer_claiming<SE, PA>(
+    node: &Node<SE, PA>,
+    key: &NodeKey,
+    durable: bool,
+    claims: impl FnOnce(&mut proto::PresenceClaims),
+    provenance: PeerProvenance,
+    sender: Box<dyn PeerSender>,
+) -> Result<ConnectionRegistration, PeerConnectionError>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let (mut ours, mut presence_claims) = keyed_peer_claims(node.id, provenance, key, durable);
+    claims(&mut presence_claims);
+    node.register_peer(key.sign_presence(presence_claims), &mut ours, sender).await
+}
+
+/// Register a peer with no node behind it: `key` signs a presence answering the node's side of a fresh handshake.
+async fn register_keyed_peer<SE, PA>(
+    node: &Node<SE, PA>,
+    key: &NodeKey,
+    durable: bool,
+    provenance: PeerProvenance,
+    sender: Box<dyn PeerSender>,
+) -> Result<ConnectionRegistration, PeerConnectionError>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    register_keyed_peer_claiming(node, key, durable, |_| {}, provenance, sender).await
 }
 
 #[tokio::test]
-async fn presence_does_not_require_an_adopted_system_but_rejects_a_halted_node() {
+async fn presence_signs_this_nodes_claims_and_a_halted_node_has_none() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence()).await.unwrap().unwrap();
-    assert_eq!(presence.node_id, node.id);
-    assert!(!presence.durable);
-    assert_eq!(presence.protocol_version, proto::PROTOCOL_VERSION);
+    let (handshake, peer) = opened_handshakes(node.id, PeerProvenance::Configured, NodeKey::generate().node_id());
+    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(&handshake)).await.unwrap().unwrap();
+    let claims = &presence.claims;
+    assert_eq!(claims.node_id, node.id);
+    assert!(!claims.durable);
+    assert_eq!(claims.challenge, peer.opening().challenge);
+    assert!(presence.signature_is_valid());
+    let spoken = proto::ProtocolVersions::SPOKEN;
+    assert_eq!(claims.negotiation, proto::VersionNegotiation { offered: spoken, peer_offered: spoken, chosen: proto::PROTOCOL_VERSION });
 
     let halt_reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("test failure".into()));
     assert_eq!(node.state().value(), NodeState::Halted(halt_reason.clone()));
-    assert_eq!(node.presence().await.unwrap_err(), halt_reason);
+    assert_eq!(node.presence(&handshake).await.unwrap_err(), PeerConnectionError::NodeHalted(halt_reason));
 }
 
 #[tokio::test]
@@ -162,25 +197,27 @@ async fn presence_does_not_wait_for_startup() {
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
     assert_eq!(node.state().value(), NodeState::Startup);
-    let presence = node.presence();
+    let (handshake, _) = opened_handshakes(node.id, PeerProvenance::Configured, NodeKey::generate().node_id());
+    let presence = node.presence(&handshake);
     tokio::pin!(presence);
     let std::task::Poll::Ready(presence) = futures::poll!(&mut presence) else { panic!("presence waited for startup") };
     let presence = presence.unwrap();
-    assert_eq!(presence.node_id, node.id);
-    assert!(presence.durable);
+    assert_eq!(presence.claims.node_id, node.id);
+    assert!(presence.claims.durable);
 }
 
 #[tokio::test]
 async fn disconnect_releases_pending_requests() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    let peer = NodeKey::generate().node_id();
+    let key = NodeKey::generate();
+    let peer = key.node_id();
     let (sent, _messages) = std::sync::mpsc::channel();
-    node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await.unwrap();
+    let registration = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(sent))).await.unwrap();
     let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
     tokio::pin!(request);
     assert!(futures::poll!(&mut request).is_pending());
 
-    node.deregister_peer(peer);
+    node.deregister_peer(registration);
     assert!(matches!(futures::poll!(&mut request), std::task::Poll::Ready(Err(RequestError::InternalChannelClosed))));
 }
 
@@ -192,8 +229,9 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let transaction = node.privileged_context().begin();
     let id = transaction.create(&crate::schema::catalog::SysModelRow { label: "test".into(), name: "Test".into() }).await.unwrap().id();
     transaction.commit().await.unwrap();
-    let peer = NodeKey::generate().node_id();
-    node.register_peer(presence(peer), Box::new(ClosedSender(peer))).await.unwrap();
+    let key = NodeKey::generate();
+    let peer = key.node_id();
+    let registration = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(ClosedSender)).await.unwrap();
 
     let model = ModelId::System(proto::SystemModel::Model);
     let (entered, entered_rx) = oneshot::channel();
@@ -213,7 +251,8 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
         node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id] }).await,
         Err(RequestError::NodeHalted(error)) if error == reason
     ));
-    assert!(node.handle_message(proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() }).await.is_err());
+    let unsubscribe = proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() };
+    assert!(node.handle_message(registration, unsubscribe).await.is_err());
 }
 
 /// Each read that asks a durable peer reports a halt as the halt, as local reads do.
@@ -222,8 +261,7 @@ async fn a_halted_node_asked_to_read_from_a_peer_reports_its_halt() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let key = NodeKey::generate();
     let (sent, _) = std::sync::mpsc::channel();
-    let presence = proto::Presence { node_id: key.node_id(), durable: true, protocol_version: proto::PROTOCOL_VERSION };
-    node.register_peer(presence, Box::new(RecordingSender(key.node_id(), sent))).await.unwrap();
+    register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await.unwrap();
     let reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
     let cdata = vec![DEFAULT_CONTEXT];
     let selection = ankql::ast::Selection::<Resolved> {

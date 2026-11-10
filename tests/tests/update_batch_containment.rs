@@ -40,7 +40,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    let connection = LocalProcessConnection::new(&client, &server).await?;
 
     let ctx_s = server.context_async(c).await?;
     let ctx_c = client.context_async(c).await?;
@@ -90,7 +90,8 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         to: client.id,
         body: proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] }),
     };
-    client.handle_message(proto::NodeMessage::Update(update)).await?;
+    let from_server = connection.registration_held_by(client.id).expect("the client registered the server");
+    client.handle_message(from_server, proto::NodeMessage::Update(update)).await?;
 
     // Both events applied in causal order: the parent's write survives.
     assert_eq!(view.title().unwrap(), "t-child", "child's write applied");
@@ -113,7 +114,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    let connection = LocalProcessConnection::new(&client, &server).await?;
 
     let ctx_s = server.context_async(c).await?;
     let ctx_c = client.context_async(c).await?;
@@ -161,7 +162,8 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     // NodeUpdateAck::Error rather than its own return value; the aggregate
     // ApplyError::Items surfaces there. What this test pins is the state
     // outcome: containment, not batch poisoning.
-    client.handle_message(proto::NodeMessage::Update(update)).await?;
+    let from_server = connection.registration_held_by(client.id).expect("the client registered the server");
+    client.handle_message(from_server, proto::NodeMessage::Update(update)).await?;
 
     // Items one and three applied despite the failure in the middle.
     assert_eq!(view_a.title().unwrap(), "a1", "item 1 must apply");

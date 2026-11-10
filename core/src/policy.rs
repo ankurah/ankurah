@@ -1,3 +1,4 @@
+use crate::connector::PeerProvenance;
 use crate::error::{NodeDropped, ValidationError};
 use crate::internal::prelude::*;
 use crate::util::Iterable;
@@ -52,6 +53,14 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 
 impl AccessDenied {}
 
+/// What this node grants a connected peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTrust {
+    /// Whether this node treats the peer as durable: a relay target for local commits and a source
+    /// for durable reads.
+    pub durable: bool,
+}
+
 // The registration plan vocabulary (RegistrationPlan and friends) lives
 // with its builder in crate::schema::registration and is re-exported here
 // because it is part of this trait's surface.
@@ -62,6 +71,7 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - checking access for requests. If approved, yield a ContextData
 /// - attesting events for requests that were approved
 /// - validating attestations for events
+/// - deciding what a connected peer is trusted with
 ///
 /// Read checks may receive several credentials, one, or none. Implementations
 /// must decide the empty case explicitly and authorize actual entity memberships,
@@ -206,6 +216,17 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         peer_id: &proto::NodeId,
         head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied>;
+
+    /// The trust this node grants a peer whose presence verified, from how the connection was
+    /// reached and whether the peer claims to be durable; by default, durable only for a peer this
+    /// node dialed. A verified presence does not show that the peer is the far end of the
+    /// connection (docs/internals/node-identity.md, "What the handshake does not give").
+    fn peer_trust(&self, _peer: &proto::NodeId, provenance: PeerProvenance, claimed_durable: bool) -> PeerTrust {
+        match provenance {
+            PeerProvenance::Configured => PeerTrust { durable: claimed_durable },
+            PeerProvenance::Inbound => PeerTrust { durable: false },
+        }
+    }
 
     // // For checking if a context can subscribe to changes
     // fn can_subscribe(&self, data: &Self::ContextData, collection: &ModelId, predicate: &Predicate) -> AccessResult;

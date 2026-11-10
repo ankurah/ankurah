@@ -270,4 +270,4 @@ fn assert_expected_change(change: Vec<(EntityId, ChangeKind)>, expected: EntityI
         assert!(matches!(kind, ChangeKind::Add | ChangeKind::Update), "unexpected change kind {:?}", kind);
     }
 }
-// start_test_server lives in common.rs (shared with protocol_version.rs)
+// start_test_server lives in common.rs (shared with handshake/)

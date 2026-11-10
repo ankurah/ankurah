@@ -304,9 +304,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
     /// Handle peer disconnection - mark all predicates for that peer as needing re-registration
     ///
-    /// This should be called when a durable peer disconnects. All predicates registered
-    /// with that peer will be marked as pending and will be automatically re-registered
-    /// when the peer reconnects or another suitable peer becomes available.
+    /// This should be called when a durable peer disconnects or registers again without
+    /// durable trust. All predicates registered with that peer will be marked as pending
+    /// and will be automatically re-registered when the peer reconnects or another
+    /// suitable peer becomes available.
     pub fn notify_peer_disconnected(&self, peer_id: proto::NodeId) {
         debug!("Peer {} disconnected, orphaning predicate registrations", peer_id);
 
@@ -341,6 +342,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         // Trigger setup with all connected peers
         self.setup_remote_subscriptions();
     }
+
+    /// Whether the relay counts this peer as a connected durable source.
+    #[cfg(test)]
+    pub(crate) fn is_connected(&self, peer_id: &proto::NodeId) -> bool { self.inner.connected_peers.contains(peer_id) }
 
     /// Whether a query is established with, or being sent to, this peer.
     pub(crate) fn has_subscription_with_peer(&self, peer_id: &proto::NodeId) -> bool {
@@ -494,6 +499,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             // Retrieval errors from fetching are generally not retryable
             RetrievalError::RequestError(req_err) => match req_err {
                 RequestError::PeerNotConnected => true,
+                // The peer stopped being durable; another one may serve the subscription.
+                RequestError::NotTrustedAsDurable(_) => true,
                 RequestError::ConnectionLost => true,
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
@@ -577,7 +584,7 @@ where
 
         // 2. Send subscribe request with known_matches
         let response = node
-            .request(
+            .request_durable(
                 peer_id,
                 &context_data,
                 ankurah_proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_matches },
@@ -1151,5 +1158,67 @@ mod tests {
         let weak = relay.weak();
         drop(relay);
         assert!(weak.upgrade().is_none());
+    }
+
+    /// A subscription chose its durable peer, then, while it read local storage, an inbound
+    /// registration under that peer's id replaced the connection. The send is refused; nothing
+    /// reaches the replacing sender.
+    #[tokio::test]
+    async fn a_subscription_send_refuses_a_peer_whose_connection_lost_durable_trust() {
+        use crate::connector::{PeerProvenance, PeerSender, SendError};
+        use crate::node::Node;
+        use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
+        use crate::test_helpers::opened_handshakes;
+        use crate::test_utils::TestStorage;
+
+        #[derive(Clone)]
+        struct Recorder(std::sync::mpsc::Sender<proto::NodeMessage>);
+        impl PeerSender for Recorder {
+            fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+                self.0.send(message).map_err(|_| SendError::ConnectionClosed)
+            }
+            fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+        }
+
+        let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
+        let storage = Arc::new(TestStorage::default());
+        let client = Node::new(storage.clone(), PermissiveAgent::new());
+        let (mut handshake, mut theirs) = opened_handshakes(client.id, PeerProvenance::Configured, server.id);
+        let (sent, _) = std::sync::mpsc::channel();
+        server.register_peer(client.presence(&handshake).await.unwrap(), &mut theirs, Box::new(Recorder(sent))).await.unwrap();
+        let presence = server.presence(&theirs).await.unwrap();
+        let (sent, _messages) = std::sync::mpsc::channel();
+        client.register_peer(presence, &mut handshake, Box::new(Recorder(sent))).await.unwrap();
+
+        let model = ModelId::EntityId(EntityId::from_bytes([9; 32]));
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        storage.hold_fetch.lock().unwrap().insert(model, (entered, release_rx));
+        let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::MemberOf(model), order_by: None, limit: None };
+        let weak = client.weak();
+        let subscribe = TNode::remote_subscribe(&weak, server.id, proto::QueryId::new(), selection, vec![DEFAULT_CONTEXT], 0);
+        tokio::pin!(subscribe);
+        tokio::select! {
+            biased;
+            _ = entered_rx => {}
+            _ = &mut subscribe => panic!("the subscription finished before its local read"),
+        }
+
+        // A server that dials an address presents to whoever answers there, answering the challenge
+        // that answer carried: here the client's, relayed.
+        let (mut handshake, theirs) = opened_handshakes(client.id, PeerProvenance::Inbound, server.id);
+        let relayed = server.presence(&theirs).await.unwrap();
+        let (relayer_sent, relayer_messages) = std::sync::mpsc::channel();
+        let relayer = Box::new(Recorder(relayer_sent));
+        client.register_peer(relayed, &mut handshake, relayer).await.unwrap();
+
+        release.send(()).unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(2), subscribe).await.expect("the send was refused, not left waiting");
+        assert!(
+            matches!(outcome, Err(RetrievalError::RequestError(RequestError::NotTrustedAsDurable(peer))) if peer == server.id),
+            "{outcome:?}"
+        );
+        assert_eq!(relayer_messages.try_iter().count(), 0, "no frame, and so no auth data, reached the replacing sender");
     }
 }

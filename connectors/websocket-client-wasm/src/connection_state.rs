@@ -8,6 +8,7 @@ pub enum ConnectionState {
     None,
     Connecting { url: String },
     Connected { url: String, server_presence: proto::Presence },
+    RefusedByServer { url: String, reason: String },
     Closed,
     Error { message: String, cause: Option<ankurah_core::connector::PeerConnectionError> },
 }
@@ -36,13 +37,32 @@ impl ConnectionStateEnum {
         }
     }
 
+    /// The reason the server gave for refusing this node, in the `RefusedByServer` state.
+    #[wasm_bindgen(getter)]
+    pub fn refusal_reason(&self) -> Option<String> {
+        match &self.0 {
+            ConnectionState::RefusedByServer { reason, .. } => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
     #[wasm_bindgen(getter)]
     pub fn error_kind(&self) -> Option<String> {
         use ankurah_core::connector::PeerConnectionError;
         let ConnectionState::Error { cause, .. } = &self.0 else { return None };
         Some(
             match cause {
-                Some(PeerConnectionError::Protocol(_)) => "Protocol",
+                Some(PeerConnectionError::NoCommonVersion { .. }) => "NoCommonVersion",
+                Some(PeerConnectionError::UnreadableOpening(_)) => "UnreadableOpening",
+                Some(PeerConnectionError::RepeatedOpening) => "RepeatedOpening",
+                Some(PeerConnectionError::NoOpening) => "NoOpening",
+                Some(PeerConnectionError::ChallengeMismatch(_)) => "ChallengeMismatch",
+                Some(PeerConnectionError::InvalidSignature(_)) => "InvalidSignature",
+                Some(PeerConnectionError::RelayedChallenge { .. }) => "RelayedChallenge",
+                Some(PeerConnectionError::SelfConnection(_)) => "SelfConnection",
+                Some(PeerConnectionError::OfferMismatch(_)) => "OfferMismatch",
+                Some(PeerConnectionError::RepeatedRegistration) => "RepeatedRegistration",
+                Some(PeerConnectionError::PresenceBeforeRegistration) => "PresenceBeforeRegistration",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",
                 None => "Transport",
             }
@@ -55,6 +75,7 @@ impl ConnectionStateEnum {
             ConnectionState::None => "None",
             ConnectionState::Connecting { .. } => "Connecting",
             ConnectionState::Connected { .. } => "Connected",
+            ConnectionState::RefusedByServer { .. } => "RefusedByServer",
             ConnectionState::Closed => "Closed",
             ConnectionState::Error { .. } => "Error",
         }

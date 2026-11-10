@@ -1,13 +1,16 @@
+use super::{register_keyed_peer, RecordingSender};
+use crate::connector::PeerProvenance;
 use crate::error::{MutationError, NodeHaltReason, RetrievalError};
 use crate::node::inbound::handler::commit_transaction;
-use crate::node::{Node, NodeState};
+use crate::node::{Node, NodeKey, NodeState};
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
+use crate::retrieval::{CachedEventGetter, GetEvents};
 use crate::schema::catalog::SysModelRow;
 use crate::storage::StorageEngine;
 use crate::test_utils::TestStorage;
 use ankurah_proto as proto;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -106,6 +109,46 @@ async fn a_commit_reaching_storage_after_a_reset_is_refused() {
         assert!(commit.await.unwrap(), "the commit is refused for the reset");
         assert!(storage.fetch_states(&ankql::ast::Predicate::True.into()).await.unwrap().is_empty(), "nothing was written after the wipe");
     }
+}
+
+/// A peer's answer that reaches a fetch after the node reset is not written to the wiped store.
+#[tokio::test(start_paused = true)]
+async fn an_event_fetched_from_a_peer_after_a_reset_is_not_stored() {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new(storage.clone(), PermissiveAgent::new());
+    let key = NodeKey::generate();
+    let peer = key.node_id();
+    let (sent, messages) = mpsc::channel();
+    let registration = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await.unwrap();
+    let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]));
+    let event = proto::Event::genesis(
+        key.node_id().identity(),
+        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
+    );
+
+    let getter = CachedEventGetter::new(&node, &DEFAULT_CONTEXT);
+    let id = event.id();
+    let fetch = getter.get_event(&id);
+    tokio::pin!(fetch);
+    assert!(futures::poll!(&mut fetch).is_pending());
+    let request_id = messages
+        .try_iter()
+        .find_map(|message| match message {
+            proto::NodeMessage::Request { request, .. }
+                if matches!(request.body.decode(), Ok(proto::NodeRequestBody::GetEvents { .. })) =>
+            {
+                Some(request.id)
+            }
+            _ => None,
+        })
+        .expect("the fetch asked the peer");
+    let body = proto::NodeResponseBody::GetEvents(vec![event.clone().into()]);
+    let response = proto::NodeResponse { request_id, from: peer, to: node.id, body: proto::CarriedBody::encode(&body) };
+    node.handle_message(registration, proto::NodeMessage::Response(response)).await.unwrap();
+
+    node.reset().await.unwrap();
+    assert!(matches!(fetch.await, Err(RetrievalError::NodeHalted(NodeHaltReason::Reset))));
+    assert!(storage.get_events(vec![event.id()]).await.unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
