@@ -86,7 +86,7 @@ impl SealedAttestation {
 
 /// The bytes an attestation signature covers: [`DomainTag::Attestation`], then the statement's bytes.
 fn signed_bytes(statement: &[u8]) -> Vec<u8> {
-    let mut bytes = DomainTag::Attestation.encoded();
+    let mut bytes = DomainTag::Attestation.encoded().to_vec();
     bytes.extend_from_slice(statement);
     bytes
 }
@@ -114,7 +114,7 @@ impl Subject {
 
 /// SHA-256 over [`DomainTag::State`], then the encoding of `state`.
 pub fn state_digest(state: &EntityState) -> [u8; 32] {
-    let mut preimage = DomainTag::State.encoded();
+    let mut preimage = DomainTag::State.encoded().to_vec();
     encoding::encode_into(&mut preimage, state);
     Sha256::digest(&preimage).into()
 }

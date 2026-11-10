@@ -121,7 +121,7 @@ impl PresenceClaims {
 
     /// The bytes a presence signature covers: [`DomainTag::Presence`], then the encoded claims.
     fn signed_bytes(&self) -> Vec<u8> {
-        let mut bytes = DomainTag::Presence.encoded();
+        let mut bytes = DomainTag::Presence.encoded().to_vec();
         encoding::encode_into(&mut bytes, self);
         bytes
     }
@@ -258,7 +258,7 @@ mod tests {
 
         let decoded: PresenceClaims = decode_exact(&swapped).unwrap();
         assert_eq!(decoded, claims);
-        let signature = Signature::Ed25519(key(42).sign(&[&DomainTag::Presence.encoded()[..], &swapped].concat()).to_bytes());
+        let signature = Signature::Ed25519(key(42).sign(&[DomainTag::Presence.encoded(), &swapped].concat()).to_bytes());
         assert!(!Presence { claims: decoded, signature }.signature_is_valid());
         assert!(claims.sign(sign_as(&key(42))).signature_is_valid(), "the same claims signed in order");
     }

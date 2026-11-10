@@ -36,7 +36,7 @@ impl EventId {
 
     /// SHA-256 over `tag`, then the encoding of `fields`.
     fn from_preimage(tag: DomainTag, fields: &impl Serialize) -> Self {
-        let mut preimage = tag.encoded();
+        let mut preimage = tag.encoded().to_vec();
         encoding::encode_into(&mut preimage, fields);
         Self(Sha256::digest(&preimage).into())
     }

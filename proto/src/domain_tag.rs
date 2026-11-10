@@ -23,25 +23,16 @@ pub enum DomainTag {
 }
 
 impl DomainTag {
-    fn bytes(self) -> &'static [u8] {
-        match self {
-            Self::Genesis => b"ankurah.genesis.v1",
-            Self::Update => b"ankurah.update.v1",
-            Self::Operation => b"ankurah.operation.v1",
-            Self::Presence => b"ankurah.presence.v1",
-            Self::Attestation => b"ankurah.attestation.v1",
-            Self::State => b"ankurah.state.v1",
-        }
-    }
-
     /// This tag as it opens a hashed or signed string: one length byte, then the tag's bytes.
-    pub fn encoded(self) -> Vec<u8> {
-        let bytes = self.bytes();
-        let mut encoded = Vec::with_capacity(1 + bytes.len());
-        // Every tag is shorter than 256 bytes, so its length fits the byte; the tests pin each tag.
-        encoded.push(bytes.len() as u8);
-        encoded.extend_from_slice(bytes);
-        encoded
+    pub const fn encoded(self) -> &'static [u8] {
+        match self {
+            Self::Genesis => b"\x12ankurah.genesis.v1",
+            Self::Update => b"\x11ankurah.update.v1",
+            Self::Operation => b"\x14ankurah.operation.v1",
+            Self::Presence => b"\x13ankurah.presence.v1",
+            Self::Attestation => b"\x16ankurah.attestation.v1",
+            Self::State => b"\x10ankurah.state.v1",
+        }
     }
 }
 
@@ -52,14 +43,21 @@ mod tests {
     const ALL: [DomainTag; 6] =
         [DomainTag::Genesis, DomainTag::Update, DomainTag::Operation, DomainTag::Presence, DomainTag::Attestation, DomainTag::State];
 
+    /// The encoded tags of specs/protocol/bytes.md section 2.
     #[test]
-    fn each_tag_is_these_exact_bytes() {
-        assert_eq!(DomainTag::Genesis.encoded(), b"\x12ankurah.genesis.v1");
-        assert_eq!(DomainTag::Update.encoded(), b"\x11ankurah.update.v1");
-        assert_eq!(DomainTag::Operation.encoded(), b"\x14ankurah.operation.v1");
-        assert_eq!(DomainTag::Presence.encoded(), b"\x13ankurah.presence.v1");
-        assert_eq!(DomainTag::Attestation.encoded(), b"\x16ankurah.attestation.v1");
-        assert_eq!(DomainTag::State.encoded(), b"\x10ankurah.state.v1");
+    fn each_tag_is_its_length_then_its_bytes_as_the_byte_specification_lists_it() {
+        for (tag, hex) in [
+            (DomainTag::Genesis, "12616e6b757261682e67656e657369732e7631"),
+            (DomainTag::Update, "11616e6b757261682e7570646174652e7631"),
+            (DomainTag::Operation, "14616e6b757261682e6f7065726174696f6e2e7631"),
+            (DomainTag::Presence, "13616e6b757261682e70726573656e63652e7631"),
+            (DomainTag::Attestation, "16616e6b757261682e6174746573746174696f6e2e7631"),
+            (DomainTag::State, "10616e6b757261682e73746174652e7631"),
+        ] {
+            let encoded = tag.encoded();
+            assert_eq!(hex::encode(encoded), hex, "{tag:?}");
+            assert_eq!(usize::from(encoded[0]), encoded.len() - 1, "{tag:?}: the first byte counts the rest");
+        }
     }
 
     #[test]
@@ -67,7 +65,7 @@ mod tests {
         for (i, a) in ALL.iter().enumerate() {
             for (j, b) in ALL.iter().enumerate() {
                 if i != j {
-                    assert!(!b.encoded().starts_with(&a.encoded()), "{a:?} opens {b:?}");
+                    assert!(!b.encoded().starts_with(a.encoded()), "{a:?} opens {b:?}");
                 }
             }
         }
