@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, carried_body::CarriedBody, clock::Clock, data::Event, id::EntityId, identity::NodeId, subscription::QueryId,
+    attestation::Attested, carried_body::CarriedBody, clock::Clock, event::Event, id::EntityId, identity::NodeId, subscription::QueryId,
     transaction::TransactionId, EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
 };
 
@@ -93,7 +93,7 @@ pub struct CausalAssertion {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CausalAssertionFragment {
     pub relation: CausalRelation,
-    pub attestations: crate::auth::AttestationSet,
+    pub attestations: crate::attestation::AttestationSet,
 }
 
 /// Content for entity initialization - either bridge, state, or attested state
