@@ -60,7 +60,10 @@ impl Entity {
 
     pub fn has_membership(&self, model: &ModelId) -> bool { self.memberships().contains(model) }
 
-    /// This entity seen through `V`'s component; fails with `MissingComponent` if the entity lacks that component.
+    /// This entity seen through `V`'s component. Fails with `MissingComponent` if the entity lacks that component,
+    /// `UnboundDeclaration` if this node has not bound `V`'s model at the entity's epoch, and a `TransactionClosed`
+    /// property error for a creation whose transaction rolled back. A cast cannot register a model: a query
+    /// on `V`, or `Context::resolve_model_id` for its model, must have bound it on this node.
     pub fn cast<V: View>(&self) -> Result<V, RetrievalError> { V::from_entity(self.clone()) }
 
     /// Whether this handle still has an entity to read; false only for a creation whose transaction rolled back.

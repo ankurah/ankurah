@@ -49,7 +49,8 @@ impl From<ModelResolutionError> for RetrievalError {
 }
 
 pub trait ModelResolver {
-    /// Look up a model label for membership or a path qualifier such as `album.name`.
+    /// Look up a model by label: for `memberof`, for a `Component::` qualifier that names no component of the
+    /// selection by display name, and for a leading dotted label (`album.name`) in a one-model selection.
     fn resolve_model(&self, _name: &str) -> Result<Option<ModelId>, ModelResolutionError> { Ok(None) }
 
     fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError>;
@@ -153,6 +154,8 @@ pub(crate) fn resolve_component_selection(
         .collect::<Result<Vec<_>, RetrievalError>>()?;
     let resolver = DescriptorResolver { schemas, epoch, catalog };
     let selection = resolve_names_across(&components, &resolver, selection)?;
+    // The first component's `MemberOf` ends up outermost, which decides whose membership changes wake the
+    // query and which materialization an engine scans.
     Ok(components.iter().rev().fold(selection, |selection, component| selection.and_member_of(component.model)))
 }
 

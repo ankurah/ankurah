@@ -8,7 +8,9 @@ use super::{resolve_system_property, system_property_value_type, unknown_propert
 use crate::internal::prelude::*;
 use crate::value::ValueType;
 
-/// A component a query returns: every match is a member of it, and its property names need no qualifier.
+/// A component whose property names a selection may write without a qualifier, and the names a `Component::`
+/// qualifier may use for it. A typed query also requires every match to be a member of each of its components;
+/// a one-model selection, such as a policy predicate, only reads its names.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct QueryComponent<'a> {
     pub model: ModelId,
