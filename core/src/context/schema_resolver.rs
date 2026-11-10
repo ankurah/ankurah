@@ -14,6 +14,9 @@ pub(crate) trait SchemaResolver: Send + Sync {
     /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
     async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, SystemEpoch), RegistrationError>;
 
+    /// Bind every component of a query as `ensure_registered` binds one, registering missing declarations.
+    async fn ensure_components_registered(&self, components: &[&'static ModelStructDescriptor]) -> Result<(), RegistrationError>;
+
     /// Check entity ownership and bind the given descriptor locally, without registration or network access.
     /// Used by synchronous `Transaction::edit`.
     fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<ModelId, RetrievalError>;
@@ -79,6 +82,14 @@ where
             node.policy_agent.preflight(node.as_ref(), model).await?;
         }
         Ok((model, epoch))
+    }
+
+    /// Bind every component of a query as `ensure_registered` binds one, registering missing declarations.
+    async fn ensure_components_registered(&self, components: &[&'static ModelStructDescriptor]) -> Result<(), RegistrationError> {
+        for schema in components {
+            self.ensure_registered(schema).await?;
+        }
+        Ok(())
     }
 
     /// Check entity ownership and bind the given descriptor locally, without registration or network access.
@@ -151,9 +162,7 @@ where
                 system.wait_system_ready().await?;
             }
 
-            for schema in &components {
-                context.ensure_registered(schema).await?;
-            }
+            context.ensure_components_registered(&components).await?;
             resolve_and_scope(&context, &components, selection)
         })
     }

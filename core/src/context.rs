@@ -92,9 +92,7 @@ impl Context {
     ) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
         let components = R::components();
-        for schema in &components {
-            self.0.schema_resolver().ensure_registered(schema).await?;
-        }
+        self.0.schema_resolver().ensure_components_registered(&components).await?;
         let args = MatchArgs {
             selection: self.0.schema_resolver().resolve_selection_with_descriptors(&components, args.selection)?,
             cache_policy: args.cache_policy,
