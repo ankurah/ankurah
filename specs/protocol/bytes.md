@@ -263,9 +263,24 @@ the signed bytes.
 
 ### 4.7 Verification
 
-A signature verifies only under strict ed25519 verification: a key that is not
-the canonical encoding of its point, a weak key, and a non-canonical signature
-all verify as false.
+An ed25519 signature is 64 bytes: the encoding of a point `R`, then a
+little-endian integer `S`. It verifies under the key `A`, the identity's 32
+bytes, over the signed bytes `M` only if all of these hold:
+
+- `S` is less than the group order L = 2^252 + 27742317777372353535851937790883648493;
+- `A` and `R` each encode a point on the curve, and each is that point's own
+  encoding: its y coordinate below p = 2^255 - 19, and its sign bit clear when
+  x is 0;
+- neither `A` nor `R` is of small order, that is, neither is a point P with
+  [8]P the identity;
+- [S]B = R + [k]A without the cofactor, where B is the base point and k is
+  SHA-512(R || A || M), read as a little-endian integer, mod L.
+
+This is what ed25519-dalek 2's `verify_strict` checks, with the key's encoding
+checked as well. It refuses signatures that RFC 8032's cofactored check and
+ZIP-215 accept, so an implementation must apply these rules exactly for two
+nodes to agree on whether a presence or an attestation verifies. Section 5
+gives vectors for these rules.
 
 ## 5. Vectors
 
@@ -358,6 +373,28 @@ eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 
 The line breaks and spaces in the last four vectors separate fields; the
 string is the bytes alone.
+
+Signatures over the signed bytes `6d657373616765` (the ASCII of `message`),
+under the rules of 4.7. The base point B encodes as `58` followed by 31 bytes
+of `66`; as a key it has the secret scalar 1, so its signatures can be written
+down. Each signature refused below holds the equation of 4.7 and breaks one
+other rule, except the last, which holds only the cofactored equation
+[8][S]B = [8]R + [8][k]A.
+
+| Key | Signature | Verifies | Why |
+|---|---|---|---|
+| `5866666666666666666666666666666666666666666666666666666666666666` | `5866666666666666666666666666666666666666666666666666666666666666f4a5bddca212b9849c7b53f96034edaf51addd8a2dc7cd06e20c117e5546b204` | yes | R = B and S = 1 + k |
+| `0100000000000000000000000000000000000000000000000000000000000000` | `58666666666666666666666666666666666666666666666666666666666666660100000000000000000000000000000000000000000000000000000000000000` | no | the key is the identity point, of small order |
+| `5866666666666666666666666666666666666666666666666666666666666666` | `0100000000000000000000000000000000000000000000000000000000000000ce3838e9daae0d280fb00ea0aaeb78b58b6deadcfff78187974fedb20ac4d80f` | no | R is the identity point, of small order |
+| `5866666666666666666666666666666666666666666666666666666666666666` | `5866666666666666666666666666666666666666666666666666666666666666e179b339bd75cbdc72184b9c3f2eccc451addd8a2dc7cd06e20c117e5546b214` | no | S is the first signature's S plus L |
+| `5866666666666666666666666666666666666666666666666666666666666666` | `98519eadf35b995233b51b5cd23e9cc5a28b639b5a4af0ec903cb960d81b78192827bea5c0e0ad7153f2599106042da3a250ea9c45bacdca959d700a7d53f30b` | no | R is B plus the point `c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a` of order 8 |
+
+The key `f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f` verifies
+no signature: its y is 3 + p, a second encoding of the point whose y is 3. No
+signature that holds the equation under it can be written down without that
+point's secret scalar. Nor can one for an `R` that breaks only the encoding
+rule, since the only points with a second encoding whose secret scalar is known
+are of small order.
 
 ## 6. The frames that open a connection
 

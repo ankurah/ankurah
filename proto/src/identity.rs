@@ -48,10 +48,8 @@ impl Identity {
         }
     }
 
-    /// Whether `signature` is this identity's signature over `message`.
-    ///
-    /// Bytes that are not the canonical encoding of a key, a weak key, and a
-    /// non-canonical signature all verify as false.
+    /// Whether `signature` is this identity's signature over `message`, by the rule of
+    /// specs/protocol/bytes.md section 4.7.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
         match (self, signature) {
             (Self::Ed25519(key), Signature::Ed25519(signature)) => strict_ed25519_key(key)
@@ -313,14 +311,60 @@ mod tests {
         assert!(!identity.verify(b"message", &Signature::Ed25519(tampered)));
     }
 
+    /// The ed25519 vectors of specs/protocol/bytes.md section 5, over the message `message`: one
+    /// signature the rule of section 4.7 accepts, then one for each rule that refuses a signature
+    /// on its own.
     #[test]
-    fn verify_refuses_a_weak_or_non_canonical_key() {
-        // The identity point: a weak key any signature could be forged against.
+    fn verify_follows_the_rule_and_the_vectors_of_the_byte_specification() {
+        let base_point = "5866666666666666666666666666666666666666666666666666666666666666";
+        for (key, signature, verifies, case) in [
+            (
+                base_point,
+                "5866666666666666666666666666666666666666666666666666666666666666f4a5bddca212b9849c7b53f96034edaf51addd8a2dc7cd06e20c117e5546b204",
+                true,
+                "R = B and S = 1 + k",
+            ),
+            (
+                "0100000000000000000000000000000000000000000000000000000000000000",
+                "58666666666666666666666666666666666666666666666666666666666666660100000000000000000000000000000000000000000000000000000000000000",
+                false,
+                "a key of small order",
+            ),
+            (
+                base_point,
+                "0100000000000000000000000000000000000000000000000000000000000000ce3838e9daae0d280fb00ea0aaeb78b58b6deadcfff78187974fedb20ac4d80f",
+                false,
+                "an R of small order",
+            ),
+            (
+                base_point,
+                "5866666666666666666666666666666666666666666666666666666666666666e179b339bd75cbdc72184b9c3f2eccc451addd8a2dc7cd06e20c117e5546b214",
+                false,
+                "an S not below the group order",
+            ),
+            (
+                base_point,
+                "98519eadf35b995233b51b5cd23e9cc5a28b639b5a4af0ec903cb960d81b78192827bea5c0e0ad7153f2599106042da3a250ea9c45bacdca959d700a7d53f30b",
+                false,
+                "a signature valid only under the cofactored equation",
+            ),
+        ] {
+            let key = Identity::Ed25519(hex::decode(key).unwrap().try_into().unwrap());
+            let signature = Signature::Ed25519(hex::decode(signature).unwrap().try_into().unwrap());
+            assert_eq!(key.verify(b"message", &signature), verifies, "{case}");
+        }
+    }
+
+    /// ed25519-dalek's `VerifyingKey::from_bytes` takes both keys below; this build refuses each before it verifies.
+    #[test]
+    fn a_key_of_small_order_or_not_in_its_points_own_encoding_is_refused() {
+        // The identity point, under which the signature R = B, S = 1 holds the equation for any message.
         let mut identity_point = [0u8; 32];
         identity_point[0] = 1;
-        assert!(!Identity::Ed25519(identity_point).verify(b"message", &Signature::Ed25519([0; 64])));
+        assert!(ed25519_dalek::VerifyingKey::from_bytes(&identity_point).is_ok());
+        assert!(strict_ed25519_key(&identity_point).is_none());
 
-        // 3 + p, a second encoding of the point whose y is 3. The library accepts it as a sound key.
+        // 3 + p, a second encoding of the point whose y is 3.
         let mut non_canonical = [0xff; 32];
         non_canonical[0] = 0xf0;
         non_canonical[31] = 0x7f;
@@ -328,6 +372,5 @@ mod tests {
         assert!(!accepted.is_weak());
         assert_ne!(accepted.to_edwards().compress().to_bytes(), non_canonical);
         assert!(strict_ed25519_key(&non_canonical).is_none());
-        assert!(!Identity::Ed25519(non_canonical).verify(b"message", &Signature::Ed25519([0; 64])));
     }
 }
