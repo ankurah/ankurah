@@ -262,9 +262,8 @@ where
     }
 }
 
-/// Close a connection whose dialer this node will not register, or cannot present to, for
-/// `refusal`. Unless this node itself has halted, it first tells the dialer why, best effort and
-/// within the handshake deadline.
+/// Refuse the dialer for `refusal` and close: unless this node itself has halted, tell the dialer
+/// why first, best effort and within the handshake deadline.
 async fn refuse(
     socket: &mut Socket,
     refusal: PeerConnectionError,
