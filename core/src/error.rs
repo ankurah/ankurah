@@ -14,7 +14,8 @@ pub enum NodeHaltReason {
     CatalogLoad(String),
     #[error("failed to initialize policy: {0}")]
     PolicyAgentStartFailed(String),
-    /// [`crate::Node::reset`] halted this node and wiped its storage; the host builds a new node on it.
+    /// Halted for [`crate::Node::reset`]; the storage is wiped once a reset returns `Ok`, and the host
+    /// then builds a new node on it.
     #[error("the node was reset; a new node must be built on the wiped store")]
     Reset,
 }
@@ -279,6 +280,12 @@ pub enum MutationError {
     TOCTOUAttemptsExhausted,
     #[error("entity state changed before storage commit")]
     WriteConflict,
+    /// [`crate::Node::reset`] could not wipe the storage; the next reset tries again.
+    #[error("the reset could not wipe the storage: {0}")]
+    WipeFailed(Arc<MutationError>),
+    /// The reset's wipe ended without reporting whether it succeeded; the next reset tries again.
+    #[error("the reset's wipe of the storage ended without reporting")]
+    WipeAbandoned,
 }
 
 impl From<NodeReadinessError> for MutationError {

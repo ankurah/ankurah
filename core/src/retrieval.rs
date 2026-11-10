@@ -201,7 +201,7 @@ where
                 let event = answering_event(peer_events, event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))?;
                 let mut transaction = self.node.storage.transaction();
                 transaction.add_events(std::slice::from_ref(&event)).await?;
-                transaction.commit().await?.committed()?;
+                self.node.lifecycle.begin_storage_write()?.commit(transaction).await?.committed()?;
                 Ok(event.payload)
             }
             proto::NodeResponseBody::Error(e) => Err(RetrievalError::storage(format!("Error from peer: {}", e))),

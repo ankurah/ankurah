@@ -5,7 +5,7 @@ use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     },
 };
@@ -23,6 +23,8 @@ pub(crate) struct TestStorage {
     pub hold_delete_all: Mutex<Option<Pause>>,
     pub reject_state_read: Mutex<Option<EntityId>>,
     fail_next_commit: AtomicBool,
+    fail_next_delete_all: AtomicBool,
+    delete_all_calls: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -36,6 +38,11 @@ impl TestStorage {
     pub fn set_state(&self, state: Attested<EntityState>) { self.data.lock().unwrap().states.insert(state.payload.entity_id, state); }
 
     pub fn fail_next_commit(&self) { self.fail_next_commit.store(true, Ordering::SeqCst); }
+
+    pub fn fail_next_delete_all(&self) { self.fail_next_delete_all.store(true, Ordering::SeqCst); }
+
+    /// How many times `delete_all` has been called, failed calls included.
+    pub fn delete_all_calls(&self) -> usize { self.delete_all_calls.load(Ordering::SeqCst) }
 }
 
 pub(crate) struct TestStorageTransaction<'a> {
@@ -181,10 +188,14 @@ impl StorageEngine for TestStorage {
     }
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
+        self.delete_all_calls.fetch_add(1, Ordering::SeqCst);
         let hold = self.hold_delete_all.lock().unwrap().take();
         if let Some((entered, release)) = hold {
             entered.send(()).unwrap();
             release.await.unwrap();
+        }
+        if self.fail_next_delete_all.swap(false, Ordering::SeqCst) {
+            return Err(MutationError::General("test storage wipe failed".into()));
         }
         *self.data.lock().unwrap() = TestData::default();
         Ok(true)

@@ -191,11 +191,11 @@ where
     /// Configure a node's role, key and plugins before it starts.
     pub fn builder(engine: Arc<SE>, policy_agent: PA) -> NodeBuilder<SE, PA> { NodeBuilder::new(engine, policy_agent) }
 
-    /// Halt this node with [`NodeHaltReason::Reset`], then delete everything in its storage.
-    /// The wipe finishes even if the caller drops the returned future. The host then discards this
-    /// node with its contexts and live queries, and builds a fresh node on the wiped store. A host
-    /// that finds the node already halted by a reset it did not await (a plugin's, say) calls this
-    /// to wait for that reset's wipe.
+    /// Halt this node with [`NodeHaltReason::Reset`] (a node already halted keeps its reason) and wipe
+    /// its storage. The wipe starts on the first poll, finishes without the caller, and waits for any
+    /// storage commit in flight; none commits after the halt. A call during or after another reset
+    /// waits for that wipe rather than wiping again, and retries one that failed. `Ok` means the
+    /// store is wiped; the host then builds a fresh node on it.
     pub async fn reset(&self) -> Result<(), MutationError> { self.lifecycle.reset().await }
 
     /// Initialization and terminal halt state; independent of peer connectivity.
