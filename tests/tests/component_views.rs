@@ -4,10 +4,9 @@
 //! and `Component::name` names a property of one component, in the tuple or outside it.
 //! Each scenario runs on sled and on in-memory SQLite.
 
-use ankurah::core::schema::resolver::ComponentScopeError;
 use ankurah::core::storage::StorageEngine;
 use ankurah::entity::{Entity, LocalTrxEntity};
-use ankurah::error::RetrievalError;
+use ankurah::error::{ComponentScopeError, RetrievalError};
 use ankurah::policy::DEFAULT_CONTEXT;
 use ankurah::property::{Json, PropertyError};
 use ankurah::signals::Peek;
