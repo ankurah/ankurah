@@ -12,7 +12,7 @@ use super::{ContextAuth, ContextInner};
 pub(crate) trait SchemaResolver: Send + Sync {
     /// Bind the descriptor's model and property IDs, registering missing declarations if needed.
     /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
-    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, SystemEpoch), RegistrationError>;
+    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, CatalogEpoch), RegistrationError>;
 
     /// Check entity ownership and bind the given descriptor locally, without registration or network access.
     /// Used by synchronous `Transaction::edit`.
@@ -51,9 +51,9 @@ where
 {
     /// Bind the descriptor's model and property IDs, registering missing declarations if needed.
     /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
-    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, SystemEpoch), RegistrationError> {
+    async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, CatalogEpoch), RegistrationError> {
         let node = self.node.upgrade()?;
-        let epoch = node.system_epoch()?;
+        let epoch = node.catalog_epoch()?;
         if let Some(system) = schema.system {
             return Ok((proto::ModelId::System(system), epoch));
         }
@@ -84,7 +84,7 @@ where
     /// Used by synchronous `Transaction::edit`.
     fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<ModelId, RetrievalError> {
         let node = self.node.upgrade()?;
-        let epoch = node.entities.system_epoch();
+        let epoch = node.entities.catalog_epoch();
         entity.check_epoch(epoch)?;
         let model = schema.bind_local(&node.catalog, epoch)?;
         if !entity.has_membership(&model) {
@@ -101,7 +101,7 @@ where
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let node = self.node.upgrade()?;
-        schema.resolve_selection(&node.catalog, node.system_epoch()?, selection)
+        schema.resolve_selection(&node.catalog, node.catalog_epoch()?, selection)
     }
 
     /// Resolve and policy-filter a livequery's initial or updated selection locally.

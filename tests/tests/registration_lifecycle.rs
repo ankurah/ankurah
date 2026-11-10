@@ -14,10 +14,10 @@ use std::time::Duration;
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
 /// Whether this compiled shape's identity cells are resolved for the node's
-/// current system epoch -- the registered-right-now probe, read from the
+/// current catalog epoch -- the registered-right-now probe, read from the
 /// descriptor itself.
 fn schema_registered(node: &TestNode, schema: &'static ankurah::core::schema::ModelStructDescriptor) -> bool {
-    node.system_epoch().is_ok_and(|epoch| schema.resolved.get(epoch).is_ok())
+    node.catalog_epoch().is_ok_and(|epoch| schema.resolved.get(epoch).is_ok())
 }
 
 // Distinct models per behavior so the collections never collide.
@@ -783,7 +783,7 @@ async fn halted_node_cannot_reregister_even_an_already_bound_descriptor() -> any
 
         let ctx = client.context_async(DEFAULT_CONTEXT).await?;
         let retained_view = ctx.get::<GizmoView>(gizmo_id).await?;
-        let epoch = client.system_epoch().expect("a node that has not halted has an epoch");
+        let epoch = client.catalog_epoch().expect("a node that has not halted has an epoch");
         let binding = Gizmo::descriptor().resolved.get(epoch).expect("Gizmo is registered before halting");
         assert!(schema_registered(&client, Gizmo::descriptor()));
         assert!(!schema_registered(&client, Gadget::descriptor()));
@@ -798,7 +798,7 @@ async fn halted_node_cannot_reregister_even_an_already_bound_descriptor() -> any
         assert!(matches!(unbound_error, RegistrationError::Retrieval(RetrievalError::NodeHalted(error)) if error == halt_reason));
 
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
-        assert_eq!(client.system_epoch(), Err(halt_reason));
+        assert_eq!(client.catalog_epoch(), Err(halt_reason));
         assert_eq!(Gizmo::descriptor().resolved.get(epoch), Ok(binding), "existing views keep their original bindings");
         assert_eq!(retained_view.title()?, "retained binding");
         assert!(Gadget::descriptor().resolved.get(epoch).is_err());
@@ -894,7 +894,7 @@ async fn catalog_lookup_waits_for_subscription_delivery() -> anyhow::Result<()> 
 
     server_ctx.resolve_model_id::<ColdCatalog>().await?;
     let schema = ColdCatalog::descriptor();
-    let epoch = server.system_epoch().unwrap();
+    let epoch = server.catalog_epoch().unwrap();
     let model = schema.resolved.get(epoch).unwrap();
     let property = schema.field_by_name("value").unwrap().resolved.get(epoch).unwrap();
     let proto::ModelId::EntityId(model_id) = model else { unreachable!() };

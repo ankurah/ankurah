@@ -35,7 +35,7 @@ async fn catalog_get_cannot_relabel_a_nonresident_private_entity() -> anyhow::Re
             id
         };
         assert!(matches!(context.get::<SysModelRowView>(private_id).await, Err(RetrievalError::MissingComponent { .. })));
-        let ModelId::EntityId(model_id) = Private::descriptor().resolved.get(node.system_epoch().unwrap()).unwrap() else {
+        let ModelId::EntityId(model_id) = Private::descriptor().resolved.get(node.catalog_epoch().unwrap()).unwrap() else {
             unreachable!("user model")
         };
         assert_eq!(context.get::<SysModelRowView>(model_id).await?.name()?, "Private");

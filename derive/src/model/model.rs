@@ -33,7 +33,7 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
                 &self,
                 entity: &#base::entity::LocalTrxEntity,
                 model_id: #base::proto::ModelId,
-                epoch: #base::schema::SystemEpoch,
+                epoch: #base::schema::CatalogEpoch,
             ) -> Result<(), #base::property::PropertyError> {
                 entity.add_membership(model_id)?;
                 use #base::property::InitializeWith;

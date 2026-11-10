@@ -43,7 +43,7 @@ The two transaction types have different capabilities:
 | `RemoteTrxEntity` | `New`: identity comes from the received genesis | `Mut`: retains and forks the resident entity | Existing events and state snapshots |
 
 Their private `TrxEntityData` holds the common machinery: working state,
-retained events, the transaction's alive flag, system epoch, and coordination
+retained events, the transaction's alive flag, catalog epoch, and coordination
 with its readable proxy. Each transaction entity owns its own data; sharing the
 implementation does not share working state between transactions.
 

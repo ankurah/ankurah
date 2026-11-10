@@ -723,6 +723,6 @@ where
     SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
     PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
 {
-    let epoch = node.system_epoch().expect("a node that has not halted");
+    let epoch = node.catalog_epoch().expect("a node that has not halted");
     schema.field_by_name(name).expect("a compiled field").resolved.get(epoch).expect("field resolved under the current epoch")
 }

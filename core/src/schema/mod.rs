@@ -1,7 +1,7 @@
 //! Durable model and property identities.
 //!
 //! Catalog entities persist the schema; compiled descriptors cache its IDs
-//! per system epoch so names are resolved before storage or evaluation.
+//! per catalog epoch so names are resolved before storage or evaluation.
 
 pub mod catalog;
 pub mod cell;
@@ -10,7 +10,7 @@ pub mod registration;
 pub use crate::storage::CatalogResolver;
 pub use catalog::resolver;
 
-pub use cell::{PerSystemOnceCell, SystemEpoch, UninitializedCell};
+pub use cell::{CatalogEpoch, PerCatalogOnceCell, UninitializedCell};
 pub use compiled::{ModelStructDescriptor, StructProperty};
 
 use ankurah_proto::{ModelId, SystemModel};

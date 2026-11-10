@@ -3,9 +3,9 @@
 use super::catalog::register::{Registrant, RegistrantProperty};
 use super::catalog::resolver::{resolve_selection, DescriptorResolver};
 use super::catalog::{CatalogManager, SysModelRow, SysPropertyRow};
-use super::cell::PerSystemOnceCell;
+use super::cell::PerCatalogOnceCell;
 use super::registration::{RegistrationError, RegistrationError::Retrieval};
-use super::SystemEpoch;
+use super::CatalogEpoch;
 use ankql::ast::{Parsed, Resolved, Selection};
 use ankurah_proto::{EntityId, ModelId, PropertyId, RegisterModel, RegisterProperty, SystemModel};
 
@@ -26,8 +26,8 @@ pub struct ModelStructDescriptor {
     pub explicit_id: Option<&'static str>,
     /// Per-build declaration identity, reserved as a future fallback key.
     pub build_id: [u8; 16],
-    /// Durable model identity resolved for each system epoch.
-    pub resolved: PerSystemOnceCell<ModelId>,
+    /// Durable model identity resolved for each catalog epoch.
+    pub resolved: PerCatalogOnceCell<ModelId>,
 }
 
 /// One active field's registration metadata and resolved identity.
@@ -51,13 +51,13 @@ pub struct StructProperty {
     pub explicit_id: Option<&'static str>,
     /// Per-build correlation and fallback property lookup id
     pub build_id: [u8; 16],
-    /// Durable property identity resolved for each system epoch.
-    pub resolved: PerSystemOnceCell<PropertyId>,
+    /// Durable property identity resolved for each catalog epoch.
+    pub resolved: PerCatalogOnceCell<PropertyId>,
 }
 
 impl StructProperty {
     /// Look up this property's binding in `epoch`.
-    pub fn resolved_id(&self, epoch: SystemEpoch) -> Result<PropertyId, crate::property::PropertyError> {
+    pub fn resolved_id(&self, epoch: CatalogEpoch) -> Result<PropertyId, crate::property::PropertyError> {
         self.resolved.get(epoch).map_err(|_| crate::property::PropertyError::Unresolved { model: self.model_label, field: self.field })
     }
 }
@@ -80,16 +80,16 @@ impl RegistrantProperty for StructProperty {
 
 impl ModelStructDescriptor {
     /// Return this struct's bound model identity for `epoch`.
-    pub fn model_id(&self, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
+    pub fn model_id(&self, epoch: CatalogEpoch) -> Result<ModelId, RetrievalError> {
         self.resolved.get(epoch).map_err(|_| RetrievalError::UnboundDeclaration { label: self.label.into() })
     }
 
-    pub(crate) fn registrant(&'static self, epoch: SystemEpoch) -> DescriptorRegistrant {
+    pub(crate) fn registrant(&'static self, epoch: CatalogEpoch) -> DescriptorRegistrant {
         DescriptorRegistrant { schema: self, epoch, model: None, properties: vec![None; self.properties.len()] }
     }
 
     /// Return this struct's model identity for `epoch`, binding it from the local catalog if needed; never registers.
-    pub fn bind_local(&'static self, catalog: &CatalogManager, epoch: SystemEpoch) -> Result<ModelId, RetrievalError> {
+    pub fn bind_local(&'static self, catalog: &CatalogManager, epoch: CatalogEpoch) -> Result<ModelId, RetrievalError> {
         if self.resolved.get(epoch).is_err() {
             // Cached rows may be stale until the catalog's first durable answer, and an epoch's first binding is permanent.
             if !catalog.is_ready() {
@@ -104,7 +104,7 @@ impl ModelStructDescriptor {
     pub(crate) fn resolve_selection(
         &'static self,
         catalog: &CatalogManager,
-        epoch: SystemEpoch,
+        epoch: CatalogEpoch,
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let model = self.bind_local(catalog, epoch)?;
@@ -118,7 +118,7 @@ impl ModelStructDescriptor {
 
 pub(crate) struct DescriptorRegistrant {
     schema: &'static ModelStructDescriptor,
-    epoch: SystemEpoch,
+    epoch: CatalogEpoch,
     model: Option<EntityId>,
     properties: Vec<Option<EntityId>>,
 }
@@ -236,9 +236,9 @@ mod tests {
                 system: None,
                 explicit_id: None,
                 build_id: [0; 16],
-                resolved: PerSystemOnceCell::per_epoch(),
+                resolved: PerCatalogOnceCell::per_epoch(),
             }));
-            let epoch = SystemEpoch::allocate();
+            let epoch = CatalogEpoch::allocate();
             let error = catalog.resolve_local(&mut schema.registrant(epoch)).expect_err("an empty catalog cannot bind");
             if label == "local_resolution" {
                 assert!(

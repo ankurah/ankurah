@@ -16,14 +16,14 @@ async fn a_restarted_durable_node_keeps_its_entities_under_a_new_epoch() -> anyh
             let transaction = node.context_async(DEFAULT_CONTEXT).await?.begin();
             let id = transaction.create(&Pet { name: "Fido".into(), age: "3".into() }).await?.id();
             transaction.commit().await?;
-            (id, node.system_epoch())
+            (id, node.catalog_epoch())
         };
 
         let node = Node::new_durable(engine, PermissiveAgent::new());
         let context = node.context_async(DEFAULT_CONTEXT).await?;
         assert_eq!(context.get::<PetView>(id).await?.name()?, "Fido");
-        assert!(node.system_epoch().is_ok());
-        assert_ne!(node.system_epoch(), epoch, "each Node owns its own epoch");
+        assert!(node.catalog_epoch().is_ok());
+        assert_ne!(node.catalog_epoch(), epoch, "each Node owns its own epoch");
         Ok(())
     })
     .await?
@@ -47,7 +47,7 @@ async fn reset_halts_the_node_and_wipes_its_store_and_a_fresh_node_starts_clean(
         client.reset().await?;
         let halt_reason = NodeHaltReason::Reset;
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
-        assert_eq!(client.system_epoch(), Err(halt_reason.clone()));
+        assert_eq!(client.catalog_epoch(), Err(halt_reason.clone()));
         assert!(engine.get_state(id).await.is_err(), "the reset wiped the entity's state");
         assert!(engine.dump_entity_events(id).await?.is_empty(), "and its events");
         assert!(engine.list_materializations().await?.is_empty());

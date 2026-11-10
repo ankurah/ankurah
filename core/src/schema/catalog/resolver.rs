@@ -92,7 +92,7 @@ impl ModelResolver for CatalogManager {
 /// catalog while those bindings have not yet been populated.
 pub(crate) struct DescriptorResolver<'a> {
     pub schema: &'static ModelStructDescriptor,
-    pub epoch: SystemEpoch,
+    pub epoch: CatalogEpoch,
     pub catalog: &'a CatalogManager,
 }
 

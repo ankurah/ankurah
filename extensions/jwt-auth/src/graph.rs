@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ankql::ast::{Parsed, Predicate};
 use ankurah::core::model::{Model, View};
-use ankurah::core::schema::{catalog::CatalogManager, SystemEpoch};
+use ankurah::core::schema::{catalog::CatalogManager, CatalogEpoch};
 use ankurah::proto::{EntityId, ModelId};
 use ankurah::signals::{Get, Subscribe, SubscriptionGuard};
 use ankurah::{CachePolicy, Context, LiveQuery, MatchArgs};
@@ -144,7 +144,7 @@ fn decode<V: View>(views: Vec<V>) -> anyhow::Result<BTreeMap<EntityId, V::Model>
 }
 
 /// Bind every policy model from the local catalog without registering; fails while any cannot bind yet.
-pub(crate) fn bind_models(catalog: &CatalogManager, epoch: SystemEpoch) -> anyhow::Result<BTreeSet<ModelId>> {
+pub(crate) fn bind_models(catalog: &CatalogManager, epoch: CatalogEpoch) -> anyhow::Result<BTreeSet<ModelId>> {
     Ok([
         Role::descriptor().bind_local(catalog, epoch)?,
         Privilege::descriptor().bind_local(catalog, epoch)?,

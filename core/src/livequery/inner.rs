@@ -11,7 +11,7 @@ use std::sync::{
 };
 use tracing::{debug, warn};
 
-/// Shared query state; versions identify selection attempts, not system epochs.
+/// Shared query state; versions identify selection attempts, not catalog epochs.
 pub(super) struct LiveQueryInner {
     pub(super) query_id: proto::QueryId,
     // Must drop before context, which may hold the node's last strong reference.

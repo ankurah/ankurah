@@ -117,7 +117,7 @@ async fn local_creation_commits_after_its_events_arrive_remotely() -> anyhow::Re
 
     for echoed in [1, 2] {
         let trx = context.begin();
-        let entity = trx.add_entity(LocalTrxEntity::new(node.identity(), node.entities.system_epoch(), trx.alive.clone()));
+        let entity = trx.add_entity(LocalTrxEntity::new(node.identity(), node.entities.catalog_epoch(), trx.alive.clone()));
         entity.add_membership(a)?;
         let id = entity.id();
         entity.add_membership(b)?;
@@ -167,8 +167,8 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     let property = PropertyId::EntityId(EntityId::from_bytes([1; 32]));
     let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet(vec![set(property, "Alice")?]));
 
-    let entities = crate::entity::WeakEntitySet::new(crate::schema::SystemEpoch::allocate());
-    let fork = RemoteTrxEntity::new(&genesis, entities.system_epoch())?;
+    let entities = crate::entity::WeakEntitySet::new(crate::schema::CatalogEpoch::allocate());
+    let fork = RemoteTrxEntity::new(&genesis, entities.catalog_epoch())?;
     let before = fork.snapshot();
     fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), &AdmittedOperations::new(), |_| Ok(None))
         .await?;
@@ -228,7 +228,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
         OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([4; 32])))), set(owner, "Alice")?]),
     );
     events.stage_event(genesis.clone());
-    let candidate = RemoteTrxEntity::new(&genesis, node.entities.system_epoch())?;
+    let candidate = RemoteTrxEntity::new(&genesis, node.entities.catalog_epoch())?;
     candidate
         .apply_events(&events, std::slice::from_mut(&mut Attested::from(genesis.clone())), &AdmittedOperations::new(), |_| Ok(None))
         .await?;

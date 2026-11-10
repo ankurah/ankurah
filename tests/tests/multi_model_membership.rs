@@ -11,7 +11,7 @@ async fn local_and_remote_commits_preserve_plural_membership() -> anyhow::Result
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
     let ctx = node.context_async(DEFAULT_CONTEXT).await?;
     node.wait_ready().await?;
-    let epoch = node.system_epoch().unwrap();
+    let epoch = node.catalog_epoch().unwrap();
     assert!(matches!(Pet::descriptor().bind_local(&node.catalog, epoch), Err(RetrievalError::UnboundDeclaration { .. })));
     let album_model = ctx.resolve_model_id::<Album>().await?;
     let pet_model = ctx.resolve_model_id::<Pet>().await?;

@@ -171,7 +171,7 @@ fn sim_node_key(seed: u64, index: usize) -> NodeKey {
 
 /// Seed and bind the deterministic `SimRecord` catalog on one node. The
 /// node's system must be READY (the seeded binding resolves under its
-/// system epoch).
+/// catalog epoch).
 pub fn seed_sim_schema(node: &SimNode) -> anyhow::Result<()> {
     ankurah::core::test_helpers::seed_registered_schema(&node.node, SimRecord::descriptor(), &sim_model_definition())?;
     Ok(())

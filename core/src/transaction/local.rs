@@ -60,7 +60,7 @@ impl Transaction {
         &self.entities[index]
     }
 
-    /// Mint an entity under this node's identity after registering its model in the current system epoch.
+    /// Mint an entity under this node's identity after registering its model in the current catalog epoch.
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let (model_id, epoch) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
 
@@ -169,7 +169,7 @@ impl Transaction {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let epoch = node.system_epoch()?;
+        let epoch = node.catalog_epoch()?;
 
         if self.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(MutationError::General("Transaction already committed or rolled back".into()));
@@ -181,7 +181,7 @@ impl Transaction {
         let mut admitted = AdmittedOperations::new();
         // Prepare once, outside the retry loop: every attempt re-applies and relays these exact events.
         for entity in self.entities.iter() {
-            if entity.system_epoch() != epoch {
+            if entity.catalog_epoch() != epoch {
                 return Err(MutationError::ForeignEntity);
             }
             let events = entity.prepare_events()?;

@@ -317,7 +317,7 @@ impl WatcherChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{entity::LocalTrxEntity, property::backend::lww::LWWBackend, schema::SystemEpoch, selection::filter::evaluate_predicate};
+    use crate::{entity::LocalTrxEntity, property::backend::lww::LWWBackend, schema::CatalogEpoch, selection::filter::evaluate_predicate};
     use ankql::ast::{ComparisonOperator, Expr, Predicate};
     use ankurah_core_types::Value;
 
@@ -344,7 +344,7 @@ mod tests {
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([3; 32]));
         let pending = LocalTrxEntity::new(
             proto::Identity::Ed25519([1; 32]),
-            SystemEpoch::allocate(),
+            CatalogEpoch::allocate(),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
         pending.add_membership(model)?;

@@ -333,7 +333,7 @@ All nine models carry labels prefixed `jwtagent_` and are `no_ffi`.
 A policy may name a collection or property before its model is registered. `schema_registered` fills those bindings inside the registration transaction, so the rules are enforceable from the moment the schema exists:
 
 - Core calls the hook on the registering durable node after `check_schema_registration` passes and before the transaction commits; replicas apply the committed records and do not run it.
-- `JwtAgent` returns early when the system epoch is not available or the nine policy models do not bind locally (no policy installed yet). Otherwise it takes the authoring lock and calls `authoring::schema_registered` under a weak `Root` context.
+- `JwtAgent` returns early when the catalog epoch is not available or the nine policy models do not bind locally (no policy installed yet). Otherwise it takes the authoring lock and calls `authoring::schema_registered` under a weak `Root` context.
 - For each active `ModelPolicy` whose `model` is `Pending` and whose label matches a model the plan creates, it sets `Binding::AtRegistration(model)` and logs a warning, because the first registration with that label wins.
 - It then binds pending properties and scopes exactly as `set_policy` does, resolving names against the plan's new rows overlaid on the committed catalog (`RegistrationCatalog`), and records those bindings as `AtRegistration`.
 - A scope that cannot be bound against the new schema aborts the registration transaction; the catalog stays unchanged.

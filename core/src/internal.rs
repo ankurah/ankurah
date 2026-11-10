@@ -15,7 +15,7 @@ pub(crate) mod prelude {
     pub(crate) use crate::policy::{AccessDenied, PolicyAgent};
     pub(crate) use crate::resultset::EntityResultSet;
     pub(crate) use crate::schema::catalog::CatalogManager;
-    pub(crate) use crate::schema::{ModelStructDescriptor, SystemEpoch};
+    pub(crate) use crate::schema::{CatalogEpoch, ModelStructDescriptor};
     pub(crate) use crate::session::SessionSet;
     pub(crate) use crate::storage::StorageEngine;
     pub(crate) use crate::transaction::Transaction;

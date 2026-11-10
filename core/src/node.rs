@@ -174,10 +174,10 @@ where
     /// Initialization and terminal halt state; independent of peer connectivity.
     pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.lifecycle.node_state() }
 
-    /// This node's system epoch, or the reason it halted: a halted node, reset or not, yields no epoch.
-    pub fn system_epoch(&self) -> Result<SystemEpoch, NodeHaltReason> {
+    /// This node's catalog epoch, or the reason it halted: a halted node, reset or not, yields no epoch.
+    pub fn catalog_epoch(&self) -> Result<CatalogEpoch, NodeHaltReason> {
         self.lifecycle.check_not_halted()?;
-        Ok(self.entities.system_epoch())
+        Ok(self.entities.catalog_epoch())
     }
 
     /// Require completed catalog and policy initialization, or return why the node is unavailable.
@@ -220,7 +220,7 @@ where
     }
 
     fn start(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng, key: Option<NodeKey>, plugins: NodePlugins<SE, PA>) -> Self {
-        let entityset = WeakEntitySet::new(SystemEpoch::allocate());
+        let entityset = WeakEntitySet::new(CatalogEpoch::allocate());
         let key = key.unwrap_or_else(|| {
             let key = NodeKey::generate();
             if durable {

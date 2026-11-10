@@ -12,7 +12,7 @@ use crate::{
     node::event_admissibility::AdmittedOperations,
     property::PropertyError,
     retrieval::{GetEvents, GetState},
-    schema::SystemEpoch,
+    schema::CatalogEpoch,
 };
 use ankurah_proto::{Attested, Clock, EntityId, Event, EventId, SealedAttestation, State};
 use std::{
@@ -46,13 +46,13 @@ impl RemoteTrxEntity {
     {
         match entities.get_or_retrieve(state_getter, event_getter, &event.entity_id).await? {
             Some(entity) => Ok(Self::edit(&entity)?),
-            None => Self::new(event, entities.system_epoch()),
+            None => Self::new(event, entities.catalog_epoch()),
         }
     }
 
     /// Check that an event is a valid genesis, then start an empty creation for its entity. The caller applies the
     /// genesis next; no resident entity is registered until the creation commits.
-    pub(crate) fn new(genesis: &Event, epoch: SystemEpoch) -> Result<Self, MutationError> {
+    pub(crate) fn new(genesis: &Event, epoch: CatalogEpoch) -> Result<Self, MutationError> {
         genesis.validate_structure()?;
         if !genesis.is_entity_create() {
             return Err(MutationError::InvalidEvent);
@@ -64,7 +64,7 @@ impl RemoteTrxEntity {
     /// Fork a resident entity; committing the fork applies its events to that entity.
     pub(crate) fn edit(entity: &Entity) -> Result<Self, PropertyError> {
         let upstream = entity.resident()?;
-        let data = TrxEntityData::new(upstream.state.fork(), upstream.system_epoch());
+        let data = TrxEntityData::new(upstream.state.fork(), upstream.catalog_epoch());
         let base_head = data.state.head();
         Ok(Self(Arc::new(RemoteTrxEntityInner::Mut { upstream, base_head, data })))
     }
@@ -120,7 +120,7 @@ impl RemoteTrxEntity {
     /// A frozen policy input; it shares neither mutable backends nor pending events with this fork.
     pub(crate) fn snapshot(&self) -> Entity {
         let data = self.0.data();
-        let snapshot = TrxEntityData::new(data.state.fork(), data.system_epoch);
+        let snapshot = TrxEntityData::new(data.state.fork(), data.catalog_epoch);
 
         let inner = match &*self.0 {
             RemoteTrxEntityInner::New { id, .. } => RemoteTrxEntityInner::New { id: *id, data: snapshot },

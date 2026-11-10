@@ -38,7 +38,7 @@ async fn peer_get_preserves_denial_and_absence_even_with_a_cached_entity() -> Re
     let retained = reader.get::<PetView>(id).await?;
     agent.deny_read_states.lock().unwrap().insert(id);
 
-    let model = *Pet::descriptor().bind_local(&server.catalog, server.system_epoch().unwrap())?.as_entity_id().unwrap();
+    let model = *Pet::descriptor().bind_local(&server.catalog, server.catalog_epoch().unwrap())?.as_entity_id().unwrap();
     let missing = proto::EntityId::random();
     let response = client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id, missing, model] }).await?;
     // Exercise the actual wire shape, including a successful catalog bootstrap read in the same batch.
@@ -472,7 +472,7 @@ async fn get_events_retrieves_identities_across_model_memberships() -> Result<()
         "event-specific denial still applies"
     );
 
-    let model = *Pet::descriptor().bind_local(&server.catalog, server.system_epoch().unwrap())?.as_entity_id().unwrap();
+    let model = *Pet::descriptor().bind_local(&server.catalog, server.catalog_epoch().unwrap())?.as_entity_id().unwrap();
     let catalog_event = server.storage.dump_entity_events(model).await?.into_iter().next().unwrap();
     agent.deny_read_events.lock().unwrap().insert(catalog_event.payload.id());
     agent.deny_reads.store(true, Ordering::SeqCst);

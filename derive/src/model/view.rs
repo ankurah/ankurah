@@ -111,7 +111,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     if !entity.is_alive() {
                         return Err(#base::property::PropertyError::TransactionClosed.into());
                     }
-                    let model = __ANKURAH_MODEL_SCHEMA.model_id(entity.system_epoch())?;
+                    let model = __ANKURAH_MODEL_SCHEMA.model_id(entity.catalog_epoch())?;
                     if !entity.has_membership(&model) {
                         return Err(#base::error::RetrievalError::MissingComponent { entity_id: entity.id(), model_id: model });
                     }
@@ -186,7 +186,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     pub fn #active_field_names(&self) -> Result<#projected_field_types, #base::property::PropertyError> {
                         const PROPERTY: &#base::schema::StructProperty = &__ANKURAH_MODEL_PROPERTIES[#active_field_indices];
                         #base::signals::CurrentObserver::track(self);
-                        let property_id = PROPERTY.resolved_id(self.entity.system_epoch())?;
+                        let property_id = PROPERTY.resolved_id(self.entity.catalog_epoch())?;
                         let value = self.entity.read_property(PROPERTY.backend, &property_id)?;
                         <#projected_field_types as #base::property::Property>::from_value(value)
                     }

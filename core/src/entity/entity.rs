@@ -2,7 +2,7 @@ use super::{proxy::EntityProxy, set::Registration, state::EntityState};
 use crate::{
     error::{MutationError, StateError},
     property::PropertyError,
-    schema::SystemEpoch,
+    schema::CatalogEpoch,
     value::Value,
 };
 use ankurah_proto::{Clock, EntityId, EntityState as ProtoEntityState, ModelId, PropertyId, State};
@@ -36,15 +36,15 @@ impl Entity {
         }
     }
 
-    pub fn system_epoch(&self) -> SystemEpoch {
+    pub fn catalog_epoch(&self) -> CatalogEpoch {
         match &self.0 {
-            Handle::Resident(entity) => entity.system_epoch(),
-            Handle::Proxy(proxy) => proxy.system_epoch,
+            Handle::Resident(entity) => entity.catalog_epoch(),
+            Handle::Proxy(proxy) => proxy.catalog_epoch,
         }
     }
 
-    pub(crate) fn check_epoch(&self, expected: SystemEpoch) -> Result<(), MutationError> {
-        if self.system_epoch() != expected {
+    pub(crate) fn check_epoch(&self, expected: CatalogEpoch) -> Result<(), MutationError> {
+        if self.catalog_epoch() != expected {
             return Err(MutationError::ForeignEntity);
         }
         Ok(())
@@ -155,11 +155,15 @@ pub(crate) struct EntityInner {
 }
 
 impl EntityInner {
-    pub(super) fn system_epoch(&self) -> SystemEpoch { self.registry.system_epoch() }
+    pub(super) fn catalog_epoch(&self) -> CatalogEpoch { self.registry.catalog_epoch() }
 }
 
 impl std::fmt::Debug for EntityInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntityInner").field("id", &self.id).field("state", &self.state).field("system_epoch", &self.system_epoch()).finish()
+        f.debug_struct("EntityInner")
+            .field("id", &self.id)
+            .field("state", &self.state)
+            .field("catalog_epoch", &self.catalog_epoch())
+            .finish()
     }
 }
