@@ -709,7 +709,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         Ok(())
     }
 
-    fn attest_state<SE: ankurah::core::storage::StorageEngine>(
+    fn request_state_attestation<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _state: &proto::EntityState,

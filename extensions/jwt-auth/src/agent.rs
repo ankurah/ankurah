@@ -310,7 +310,13 @@ impl PolicyAgent for JwtAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<AttestationRequest> { None }
+    fn request_state_attestation<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<AttestationRequest> {
+        None
+    }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

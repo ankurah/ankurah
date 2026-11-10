@@ -986,7 +986,7 @@ where
     }
 
     /// The trust this node granted a connected peer.
-    pub fn peer_trust(&self, peer: &proto::NodeId) -> Option<PeerTrust> { self.peer_connections.get(peer).map(|state| state.trust) }
+    pub fn granted_trust(&self, peer: &proto::NodeId) -> Option<PeerTrust> { self.peer_connections.get(peer).map(|state| state.trust) }
 
     /// Get all durable peer node IDs, sorted by id for a stable fan-out order.
     /// The underlying set is unordered; callers that emit per peer (relay, random selection)

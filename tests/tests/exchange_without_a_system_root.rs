@@ -96,7 +96,9 @@ impl PolicyAgent for TrustListedPeers {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<AttestationRequest> { None }
+    fn request_state_attestation<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<AttestationRequest> {
+        None
+    }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

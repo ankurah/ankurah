@@ -193,7 +193,7 @@ async fn a_client_meeting_a_server_seeded_again_resets_and_refuses_and_a_fresh_n
         };
         assert_eq!(refused, expected, "{transport:?}");
         assert_eq!(returning.state().value(), NodeState::Halted(NodeHaltReason::Reset));
-        assert_eq!(reseeded.node.peer_trust(&returning.id), None, "the reseeded server never registered the client");
+        assert_eq!(reseeded.node.granted_trust(&returning.id), None, "the reseeded server never registered the client");
 
         // The host waits for the wipe the plugin began, then builds a fresh node on the store.
         returning.reset().await?;
@@ -217,7 +217,7 @@ async fn a_client_meeting_its_own_seeding_again_registers_and_keeps_its_data() -
         let _connection = connect(transport, &returning, &server).await?;
         returning.wait_ready().await?;
         assert!(engine.get_state(system).await.is_ok(), "{transport:?}");
-        assert_eq!(server.node.peer_trust(&returning.id).map(|trust| trust.durable), Some(false));
+        assert_eq!(server.node.granted_trust(&returning.id).map(|trust| trust.durable), Some(false));
     }
     Ok(())
 }
@@ -273,7 +273,7 @@ async fn a_peer_not_trusted_as_durable_speaks_for_no_seeding() -> anyhow::Result
         let dialing = client(&first_store, OnReseed::Reset)?;
         let ephemeral_peer = serve(client(&second_store, OnReseed::Reset)?).await?;
         let _connection = connect(transport, &dialing, &ephemeral_peer).await?;
-        assert_eq!(dialing.peer_trust(&ephemeral_peer.node.id).map(|trust| trust.durable), Some(false), "{transport:?}");
+        assert_eq!(dialing.granted_trust(&ephemeral_peer.node.id).map(|trust| trust.durable), Some(false), "{transport:?}");
         assert!(dialing.state().value().halt_reason().is_none());
         assert!(ephemeral_peer.node.state().value().halt_reason().is_none());
     }

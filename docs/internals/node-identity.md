@@ -136,7 +136,7 @@ one, and seals it with the node's own key:
   the check attaches a statement about the event with the request's kind and
   payload. The check runs on a local commit and on a durable node admitting
   another node's commit;
-- when `PolicyAgent::attest_state` returns one for a state a durable node
+- when `PolicyAgent::request_state_attestation` returns one for a state a durable node
   serves, in fetch responses, subscription deltas and direct gets, the node
   attaches a statement about that state. Ephemeral nodes attach none.
 

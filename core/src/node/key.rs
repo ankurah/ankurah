@@ -28,7 +28,7 @@ impl NodeKey {
     pub fn node_id(&self) -> proto::NodeId { self.identity().into() }
 
     /// Sign `message` under this key.
-    pub fn sign(&self, message: &[u8]) -> proto::Signature {
+    fn sign(&self, message: &[u8]) -> proto::Signature {
         use ed25519_dalek::Signer;
         proto::Signature::Ed25519(self.0.sign(message).to_bytes())
     }

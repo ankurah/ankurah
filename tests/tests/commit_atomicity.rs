@@ -89,7 +89,11 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &NodeInnerAlias<SE, Self>, _state: &proto::EntityState) -> Option<AttestationRequest> {
+    fn request_state_attestation<SE: StorageEngine>(
+        &self,
+        _node: &NodeInnerAlias<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<AttestationRequest> {
         None
     }
 

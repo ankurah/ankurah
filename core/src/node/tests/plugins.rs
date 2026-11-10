@@ -108,7 +108,7 @@ async fn a_refused_peer_is_in_no_peer_map_and_receives_nothing() {
     let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(peer, sent))).await;
     assert!(matches!(refused, Err(PeerConnectionError::Refused(_))));
 
-    assert_eq!(node.peer_trust(&peer), None);
+    assert_eq!(node.granted_trust(&peer), None);
     assert!(node.get_durable_peers().is_empty());
     assert!(!node.subscription_relay.as_ref().unwrap().is_connected(&peer));
     let commit = node.relay_to_required_peers(&DEFAULT_CONTEXT, proto::TransactionId::new(), &[]);
@@ -130,7 +130,7 @@ async fn an_accepted_peer_registers_as_before_and_each_plugin_sees_its_registrat
     let (sent, _) = mpsc::channel();
     register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(peer, sent))).await.unwrap();
 
-    assert_eq!(node.peer_trust(&peer), Some(PeerTrust { durable: true }));
+    assert_eq!(node.granted_trust(&peer), Some(PeerTrust { durable: true }));
     assert_eq!(node.get_durable_peers(), vec![peer]);
     assert!(node.subscription_relay.as_ref().unwrap().is_connected(&peer));
     let seen = |plugin| Asked {
@@ -191,7 +191,7 @@ async fn a_plugin_that_resets_its_node_and_refuses_returns_its_refusal() {
     let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::Refused(PeerRefusal { plugin: "resetter", reason: "the probe refuses".into() })));
     assert_eq!(node.state().value(), NodeState::Halted(NodeHaltReason::Reset));
-    assert_eq!(node.peer_trust(&key.node_id()), None);
+    assert_eq!(node.granted_trust(&key.node_id()), None);
 }
 
 /// A plugin that cannot make its announcement.

@@ -83,7 +83,7 @@ impl PolicyAgent for Witness {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<AttestationRequest> {
+    fn request_state_attestation<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<AttestationRequest> {
         self.state_request.clone()
     }
 

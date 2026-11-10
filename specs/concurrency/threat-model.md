@@ -74,10 +74,10 @@ connection can still name another registered peer in a message's `from` field (G
 `PolicyAgent` (`core/src/policy.rs`) is the single authority surface, carrying the
 hooks that make peer input trustworthy: `validate_received_event`,
 `validate_received_state`, `check_event`, `check_read_event`,
-`validate_causal_assertion`, `attest_state`, and the read/write/collection gates.
+`validate_causal_assertion`, `request_state_attestation`, and the read/write/collection gates.
 The **default agent is `PermissiveAgent`**, which trusts everything: the two
 `validate_received_*` and `validate_causal_assertion` return `Ok(())`,
-`check_event` and `attest_state` return `None`, and every read/write check returns
+`check_event` and `request_state_attestation` return `None`, and every read/write check returns
 `Ok(())`. Under PermissiveAgent, **every attestation-dependent and trusted-peer
 claim below provides no guarantee**; only the Byzantine-safe structural ones
 survive. Real PolicyAgents exist (jwt-auth ships `adversarial_tests.rs` and
@@ -159,7 +159,7 @@ Receive-side arms and the policy hook each gets (verified in
 | `StateAndRelation` | `apply_delta_inner` | unimpl | unimpl | n/a | returns `InvalidUpdate` |
 | `GetEvents` resp, mid-BFS | `CachedEventGetter::get_event` | **NO** (#244) | n/a | n/a | stored via `add_event` unvalidated |
 | `GetEvents` req, served | `node.rs` `GetEvents` arm | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` |
-| `commit_remote_transaction` | `node.rs` same | via `check_event` | via `attest_state` | n/a | creation-event fork asymmetry (#243) |
+| `commit_remote_transaction` | `node.rs` same | via `check_event` | via `request_state_attestation` | n/a | creation-event fork asymmetry (#243) |
 
 ("yes" = via `validate_and_stage`.) The key asymmetry: **every `apply_*` arm
 validates before staging, but the BFS-time remote fetch does not** (#244). Section 3
@@ -578,7 +578,7 @@ its exact bytes with the attester's signature over `ankurah.attestation.v1` and 
 bytes. `SealedAttestation::unseal` yields the statement only if the bytes decode and the
 signature verifies, and `Subject::names_event`/`names_state` check the subject against
 the payload in hand. `core/src/node/attestation.rs` seals a statement with the node key
-when `check_write_event` or `attest_state` requests one, and only then. Core checks no
+when `check_write_event` or `request_state_attestation` requests one, and only then. Core checks no
 attestation on arrival: `validate_received_event`/`validate_received_state` receive the
 attestations as they came, and the agent unseals and judges the ones it cares about.
 Falsifying attack (T2): forge authorship. A forged attestation, or one moved onto
@@ -660,7 +660,7 @@ for a real PolicyAgent.
 | `node_applier::apply_delta_inner` + `apply_update` (`validate_received_state`) | admits a state snapshot | `PolicyAgent::validate_received_state` | a forged state is adopted as the entity's state on the StrictDescends fast path, bypassing event history (C4-14) |
 | `transaction/remote.rs` `RemoteTransaction::add_event` (`check_write_event`) | authorizes a remote transaction's event; an `AttestationRequest` it returns has the node seal a statement about the event, stored on it | `PolicyAgent::check_write_event` | an unauthorized remote transaction is admitted, attested and persisted; on the creation-event path the entity is already mutated before the check (C4-19, #243) |
 | `transaction/local.rs` `Transaction::commit_with` (`check_write_event`) | authorizes a locally generated event on a fork; an `AttestationRequest` it returns has the node seal a statement about the event | `PolicyAgent::check_write_event` | a local event that policy should reject is attested and committed |
-| `node/attestation.rs` `served_state` (fetch responses, subscription deltas, direct gets) | a durable node seals the statement `attest_state` requests about a state it serves; `None` attaches none | `PolicyAgent::attest_state` (requests) / `validate_received_state` (consumes downstream) | a peer accepts a state the origin never legitimately held; state authority is only as strong as the agent's recognition of the attester |
+| `node/attestation.rs` `served_state` (fetch responses, subscription deltas, direct gets) | a durable node seals the statement `request_state_attestation` requests about a state it serves; `None` attaches none | `PolicyAgent::request_state_attestation` (requests) / `validate_received_state` (consumes downstream) | a peer accepts a state the origin never legitimately held; state authority is only as strong as the agent's recognition of the attester |
 | `node.rs GetEvents` + `collect_event_bridge` (`check_read_event`) | read-filters served events | `PolicyAgent::check_read_event` | events leak to an unauthorized reader (C4-18) |
 | `PolicyAgent::validate_causal_assertion` (`CausalAssertion`) | would validate a peer's *claim* about lineage between two heads | **no consumer today** | defined but unused: `validate_causal_assertion` has zero call sites in core; `CausalAssertion`/`CausalAssertionFragment` (`proto/src/request.rs`) carry a `CausalRelation` + `AttestationSet` that nothing in the applier or comparison path consumes. If a future path trusts an asserted relation without re-deriving it, a lying peer substitutes a false `StrictDescends`/`Disjoint` for a real divergence. Gap G-9. |
 | `#271` sealed-prefix checkpoint (future) | a durable-tier attestation that a history prefix is canonical, carrying a genesis attestation so identity survives pruning | future `PolicyAgent` seal-validation | a lying seal lets a T3 durable node rewrite or amputate history below the seal, or forge the genesis binding so Disjoint detection accepts a foreign lineage. This is why #271 must justify sealing by *authority scope*, not by "everyone has it" (lit review Finding 4). |

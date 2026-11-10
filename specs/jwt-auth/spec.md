@@ -286,7 +286,7 @@ Core first applies the retrieval predicate to the entity, or to the event's enti
 `PolicyAgent` may then impose additional restrictions in `check_reads` and
 `check_read_event`; `JwtAgent` keeps the trait defaults, which add none.
 
-#### `validate_received_event` / `validate_received_state` / `attest_state` / `validate_causal_assertion`
+#### `validate_received_event` / `validate_received_state` / `request_state_attestation` / `validate_causal_assertion`
 
 Currently permissive (return `Ok(())` or `None`).
 

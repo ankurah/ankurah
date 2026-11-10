@@ -71,7 +71,7 @@ impl PolicyAgent for OwnerOnlyAgent {
 
     fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&Event>) -> Result<(), AccessDenied> { Ok(()) }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<AttestationRequest> { None }
+    fn request_state_attestation<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<AttestationRequest> { None }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,

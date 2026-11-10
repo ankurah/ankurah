@@ -128,7 +128,7 @@ async fn a_wider_opening_settles_on_the_version_the_server_speaks() -> Result<()
     );
 
     client.present(|_| {}).await?;
-    assert!(eventually(|| server_node.peer_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
     server_task.abort();
     Ok(())
 }
@@ -165,7 +165,7 @@ async fn the_server_refuses_a_presence_that_does_not_repeat_the_offers_and_the_c
         let mut client = RawClient::open(&server_url, SPOKEN).await?;
         client.present(|claims| alter(&mut claims.negotiation)).await?;
         assert!(receive(&mut client.socket).await.is_none(), "the server closes the connection");
-        assert_eq!(server_node.peer_trust(&client.key.node_id()), None);
+        assert_eq!(server_node.granted_trust(&client.key.node_id()), None);
     }
     server_task.abort();
     Ok(())
@@ -181,7 +181,7 @@ async fn the_server_ignores_unknown_feature_numbers_and_announcement_names() -> 
             claims.announcements.insert("a plugin the server does not have".into(), vec![1, 2, 3]);
         })
         .await?;
-    assert!(eventually(|| server_node.peer_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
     server_task.abort();
     Ok(())
 }
@@ -192,7 +192,7 @@ async fn the_server_ignores_a_message_of_an_unknown_kind_and_keeps_the_connectio
     let (server_node, server_url, server_task) = start_test_server().await?;
     let mut client = RawClient::open(&server_url, SPOKEN).await?;
     client.present(|_| {}).await?;
-    assert!(eventually(|| server_node.peer_trust(&client.key.node_id()).is_some()).await);
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await);
 
     // Variant 99 of `Message`, then variant 99 of `NodeMessage` inside a peer message.
     client.socket.send(WsMessage::Binary(vec![99, 0, 0, 0].into())).await?;
@@ -209,7 +209,7 @@ async fn the_server_answers_a_request_whose_body_it_cannot_read_with_unsupported
     let (server_node, server_url, server_task) = start_test_server().await?;
     let mut client = RawClient::open(&server_url, SPOKEN).await?;
     client.present(|_| {}).await?;
-    assert!(eventually(|| server_node.peer_trust(&client.key.node_id()).is_some()).await);
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await);
 
     // Variant 99 of the request body, carried as its bytes.
     let body = bincode::deserialize(&bincode::serialize(&vec![99u8, 0, 0, 0])?)?;

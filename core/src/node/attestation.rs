@@ -18,7 +18,7 @@ pub(crate) fn on_event<SE, PA: PolicyAgent>(
 /// `state` as this node serves it: a durable node attaches the attestation its policy agent
 /// requests for the state, and an ephemeral node attaches none.
 pub(crate) fn served_state<SE: StorageEngine, PA: PolicyAgent>(node: &Node<SE, PA>, state: EntityState) -> Attested<EntityState> {
-    let request = if node.durable { node.policy_agent.attest_state(node, &state) } else { None };
+    let request = if node.durable { node.policy_agent.request_state_attestation(node, &state) } else { None };
     let attestation = request.map(|request| node.key.attest(Subject::state(&state), request.kind, request.payload));
     Attested::opt(state, attestation)
 }

@@ -179,8 +179,10 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
-    /// The attestation a durable node makes on `state` when it serves it; `None` attaches none.
-    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<AttestationRequest>;
+    /// The statement this agent asks a durable node to make about `state` when it serves it; `None`
+    /// asks for none.
+    fn request_state_attestation<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState)
+        -> Option<AttestationRequest>;
 
     /// Decide whether a received state's attestations suffice. They arrive as they came:
     /// unverified, and not necessarily naming this state.
@@ -323,7 +325,13 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<AttestationRequest> { None }
+    fn request_state_attestation<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<AttestationRequest> {
+        None
+    }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
