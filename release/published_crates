@@ -26,3 +26,4 @@ ankurah-websocket-client-wasm
 
 # Tier 6: Extensions (depends on ankurah)
 ankurah-jwt-auth
+ankurah-system-reset
