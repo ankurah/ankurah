@@ -79,6 +79,9 @@ impl OperationSet {
     }
 }
 
+/// The variant index of [`Operation::Membership`], whose [`Membership`] a later build may extend.
+const MEMBERSHIP_INDEX: u32 = 1;
+
 /// A top-level mutation carried by an entity event. An event carries each one as
 /// its encoding, a [`CarriedOperation`].
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -142,8 +145,11 @@ impl CarriedOperation {
     pub fn decode(&self) -> Result<Operation, UnreadableOperation> {
         match self {
             Self::Bytes(bytes) => encoding::decode_variant(bytes).map_err(|undecodable| match undecodable {
-                UndecodableVariant::Unknown { index } => UnreadableOperation::UnknownKind { index },
-                UndecodableVariant::Malformed(error) => UnreadableOperation::Malformed(error.to_string()),
+                UndecodableVariant::Unknown { index } => UnreadableOperation::UnknownKind { indices: vec![index] },
+                UndecodableVariant::Malformed(error) => match encoding::unknown_variant_within::<Membership>(bytes, MEMBERSHIP_INDEX) {
+                    Some(membership) => UnreadableOperation::UnknownKind { indices: vec![MEMBERSHIP_INDEX, membership] },
+                    None => UnreadableOperation::Malformed(error.to_string()),
+                },
             }),
             Self::Erased(_) => Err(UnreadableOperation::Erased),
         }
@@ -153,11 +159,13 @@ impl CarriedOperation {
 /// Why this build cannot read an operation an event carries.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UnreadableOperation {
-    /// Bytes of an operation kind a later build added: a variant of [`Operation`] this build does not have.
-    #[error("an operation of kind {index}, which this build does not know")]
-    UnknownKind { index: u32 },
-    /// Bytes that do not decode as the operation kind they name, as this build reads that kind; a
-    /// membership variant a later build adds is one of these, since its kind is one this build knows.
+    /// Bytes of an operation kind a later build added: a variant of [`Operation`], or of the
+    /// [`Membership`] it holds, that this build does not have. `indices` are the variant indices
+    /// that name the kind, the operation's first: `[2]` names an operation kind, `[1, 1]` a
+    /// membership kind.
+    #[error("an operation of kind {indices:?}, which this build does not know")]
+    UnknownKind { indices: Vec<u32> },
+    /// Bytes that do not decode as the operation kind they name, as this build reads that kind.
     #[error("an operation whose bytes do not decode: {0}")]
     Malformed(String),
     /// Only the digest of the operation's bytes remains.
@@ -232,9 +240,13 @@ mod tests {
         assert_eq!(erased.decode(), Err(UnreadableOperation::Erased));
         // Variant index 2, which no build of `Operation` defines yet.
         let unknown = CarriedOperation::Bytes(vec![2, 0, 0, 0, 7]);
-        assert_eq!(unknown.decode(), Err(UnreadableOperation::UnknownKind { index: 2 }));
+        assert_eq!(unknown.decode(), Err(UnreadableOperation::UnknownKind { indices: vec![2] }));
         let carried = CarriedOperations(vec![CarriedOperation::encode(&membership()), unknown]);
-        assert_eq!(carried.decode(), Err(UnreadableOperation::UnknownKind { index: 2 }), "one unreadable operation fails the event's");
+        assert_eq!(
+            carried.decode(),
+            Err(UnreadableOperation::UnknownKind { indices: vec![2] }),
+            "one unreadable operation fails the event's"
+        );
     }
 
     /// Bytes that name a kind this build knows, or name none, are malformed when they do not decode.
@@ -245,13 +257,14 @@ mod tests {
         }
     }
 
-    /// `Membership` index 1 is reserved for the variant that removes a membership, which no build reads yet.
+    /// `Membership` index 1 is reserved for the variant that removes a membership, a kind a later
+    /// build adds inside the membership operation this build knows.
     #[test]
-    fn a_membership_of_the_reserved_removal_index_cannot_be_read() {
+    fn a_membership_of_the_reserved_removal_index_is_of_a_kind_this_build_does_not_know() {
         let CarriedOperation::Bytes(mut bytes) = CarriedOperation::encode(&membership()) else { unreachable!("encoding yields bytes") };
         // The operation's variant index, then the membership's.
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
-        assert!(matches!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::Malformed(_))));
+        assert_eq!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::UnknownKind { indices: vec![1, 1] }));
     }
 
     #[test]
@@ -271,7 +284,7 @@ mod tests {
         assert_eq!(&backend[..4], [0, 0, 0, 0], "Operation::Backend must encode as variant 0");
 
         let membership = encode(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))));
-        assert_eq!(&membership[..4], [1, 0, 0, 0], "Operation::Membership must encode as variant 1");
+        assert_eq!(&membership[..4], MEMBERSHIP_INDEX.to_le_bytes(), "Operation::Membership must encode as variant 1");
         assert_eq!(&membership[4..8], [0, 0, 0, 0], "Membership::Add must encode as variant 0");
 
         for bytes in [backend, membership] {

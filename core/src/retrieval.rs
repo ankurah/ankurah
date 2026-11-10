@@ -378,7 +378,7 @@ mod tests {
         unreadable.validate_structure().expect("the unreadable genesis still derives the id it names");
         assert!(matches!(
             answering_event(vec![unreadable.clone().into()], &unreadable.id()),
-            Err(RetrievalError::UnreadableOperation(ankurah_proto::UnreadableOperation::UnknownKind { index: 2 }))
+            Err(RetrievalError::UnreadableOperation(ankurah_proto::UnreadableOperation::UnknownKind { indices })) if indices == [2]
         ));
         assert!(matches!(answering_event(vec![], &unreadable.id()), Err(RetrievalError::EventNotFound(_))));
     }

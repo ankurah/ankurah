@@ -36,10 +36,24 @@ pub(crate) enum UndecodableVariant {
 /// The value of enum `T` that `bytes` hold, telling bytes of a variant this build does not know
 /// from malformed bytes.
 pub(crate) fn decode_variant<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, UndecodableVariant> {
-    decode_exact(bytes).map_err(|error| match bytes.first_chunk().map(|index| u32::from_le_bytes(*index)) {
-        Some(index) if variant_count::<T>().is_some_and(|count| index >= count) => UndecodableVariant::Unknown { index },
-        _ => UndecodableVariant::Malformed(error),
+    decode_exact(bytes).map_err(|error| match unknown_variant::<T>(bytes) {
+        Some(index) => UndecodableVariant::Unknown { index },
+        None => UndecodableVariant::Malformed(error),
     })
+}
+
+/// The variant index `bytes` open with, when enum `T` has no such variant in this build.
+fn unknown_variant<T: DeserializeOwned>(bytes: &[u8]) -> Option<u32> {
+    let index = u32::from_le_bytes(*bytes.first_chunk()?);
+    variant_count::<T>().is_some_and(|count| index >= count).then_some(index)
+}
+
+/// The variant index of enum `N` that `bytes` name right after variant `holding` of the enum they
+/// open with, when `N` has no such variant in this build: a kind a later build added inside a
+/// variant this build knows.
+pub(crate) fn unknown_variant_within<N: DeserializeOwned>(bytes: &[u8], holding: u32) -> Option<u32> {
+    let (index, held) = bytes.split_first_chunk()?;
+    (u32::from_le_bytes(*index) == holding).then(|| unknown_variant::<N>(held)).flatten()
 }
 
 /// The number of variants the `Deserialize` of enum `T` knows, or `None` when `T` reads no enum.

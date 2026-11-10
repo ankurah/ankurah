@@ -87,7 +87,7 @@ mod tests {
         for event in [genesis, update] {
             for (operation, expected) in [
                 (CarriedOperation::Erased([5; 32]), UnreadableOperation::Erased),
-                (unknown.clone(), UnreadableOperation::UnknownKind { index: 2 }),
+                (unknown.clone(), UnreadableOperation::UnknownKind { indices: vec![2] }),
             ] {
                 let unreadable = carrying(event.clone(), operation);
                 unreadable.validate_structure().unwrap();
