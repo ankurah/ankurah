@@ -443,7 +443,9 @@ Once both openings are read, the frames of the handshake follow in this order:
    node so signs nothing for a dialer it has not authenticated. When it will
    not register the dialer, or cannot sign its own presence, it sends
    `Refused` in place of its presence, leaves nothing registered, and closes.
-   An accepting node that has itself halted closes without sending a frame.
+   An accepting node that has itself halted, or whose handshake deadline
+   passes before it presents, closes without sending a frame; the dialing side
+   treats a close before the accepting side's presence as a failed connection.
 3. The dialing side checks that presence and registers the accepting side, and
    only then counts the connection open. On `Refused` it registers nothing,
    reports the refusal with its reason, and closes; a dialer that dials again
