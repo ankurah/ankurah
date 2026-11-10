@@ -122,8 +122,17 @@ impl BoundPolicy {
         self.models.get(model).is_some_and(|rules| rules.scopes.iter().all(|scope| scope.predicate.is_ok()))
     }
 
+    /// Bind a configuration's scopes directly through `catalog`, refusing what authoring refuses.
     #[cfg(feature = "test-helpers")]
-    pub(crate) fn bind(config: Arc<PolicyConfig>, catalog: &dyn PolicyCatalog) -> Self {
+    pub(crate) fn bind(config: Arc<PolicyConfig>, catalog: &dyn PolicyCatalog) -> Result<Self, crate::PolicyAuthoringError> {
+        for (label, rules) in &config.collections {
+            for rule in &rules.scope {
+                // A filter that does not parse binds as a failed scope below.
+                if let Ok((parsed, _)) = crate::variables::parse_template(&rule.filter) {
+                    crate::authoring::check_scope_filter(label, &rule.filter, &parsed)?;
+                }
+            }
+        }
         let mut models = BTreeMap::new();
         let mut policy_models = BTreeSet::new();
         for (model, label) in catalog.model_labels() {
@@ -149,7 +158,7 @@ impl BoundPolicy {
                 },
             );
         }
-        Self { config, models, policy_models }
+        Ok(Self { config, models, policy_models })
     }
 
     pub(crate) fn can_access_model<C: Iterable<JwtContext>>(&self, data: &C, model: &ModelId) -> Result<(), AccessDenied> {

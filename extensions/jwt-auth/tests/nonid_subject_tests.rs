@@ -131,17 +131,19 @@ fn test_or_composed_scope_with_a_non_id_subject_is_a_type_error() {
     let agent = agent_with(OR_SCOPE_CONFIG, &keys);
     let models = common::policy_models(&agent, &["note"]);
     let model = models.id("note");
-    agent.set_catalog(Arc::new(common::FixtureCatalog {
-        labels: [(model, "note".to_owned())].into(),
-        resolve: |predicate| try_resolve_fixture(predicate).map_err(|error| error.to_string()),
-        property_type: |property| {
-            if property == common::prop("visibility") {
-                ankurah_core_types::ValueType::String
-            } else {
-                ankurah_core_types::ValueType::EntityId
-            }
-        },
-    }));
+    agent
+        .set_catalog(Arc::new(common::FixtureCatalog {
+            labels: [(model, "note".to_owned())].into(),
+            resolve: |predicate| try_resolve_fixture(predicate).map_err(|error| error.to_string()),
+            property_type: |property| {
+                if property == common::prop("visibility") {
+                    ankurah_core_types::ValueType::String
+                } else {
+                    ankurah_core_types::ValueType::EntityId
+                }
+            },
+        }))
+        .expect("the fixture policy names no component qualifier");
 
     let owner = EntityId::random();
     let reviewer = EntityId::random();

@@ -70,17 +70,19 @@ impl PolicyModels {
 /// Model identities and labels supplied by the catalog in node-backed tests.
 pub fn policy_models(agent: &ankurah_jwt_auth::JwtAgent, labels: &[&str]) -> PolicyModels {
     let by_label: std::collections::BTreeMap<_, _> = labels.iter().map(|label| ((*label).to_owned(), model(label))).collect();
-    agent.set_catalog(std::sync::Arc::new(FixtureCatalog {
-        labels: by_label.iter().map(|(label, id)| (*id, label.clone())).collect(),
-        resolve: |predicate| Ok(resolve_fixture(predicate)),
-        property_type: |property| {
-            if property == ankql::ast::PropertyId::Id {
-                ankurah_core_types::ValueType::EntityId
-            } else {
-                ankurah_core_types::ValueType::String
-            }
-        },
-    }));
+    agent
+        .set_catalog(std::sync::Arc::new(FixtureCatalog {
+            labels: by_label.iter().map(|(label, id)| (*id, label.clone())).collect(),
+            resolve: |predicate| Ok(resolve_fixture(predicate)),
+            property_type: |property| {
+                if property == ankql::ast::PropertyId::Id {
+                    ankurah_core_types::ValueType::EntityId
+                } else {
+                    ankurah_core_types::ValueType::String
+                }
+            },
+        }))
+        .expect("the fixture policy names no component qualifier");
     PolicyModels(by_label)
 }
 

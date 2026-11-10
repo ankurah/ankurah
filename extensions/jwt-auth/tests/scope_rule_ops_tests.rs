@@ -126,7 +126,7 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
 }
 
 /// A scope restricts one model's entities by that model's own properties, so a filter that names a property
-/// as `Component::name` is refused when the policy is set.
+/// as `Component::name` is refused when the policy is set, and when a fixture binds it.
 #[tokio::test]
 async fn a_scope_filter_with_a_component_qualifier_is_refused_when_the_policy_is_set() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(common::test_keys(), scope_ops_config_path())?;
@@ -141,6 +141,25 @@ async fn a_scope_filter_with_a_component_qualifier_is_refused_when_the_policy_is
     let expected =
         PolicyAuthoringError::QualifiedScopeProperty { model: "assignment".into(), filter: filter.into(), component: "Other".into() };
     assert_eq!(error.downcast_ref::<PolicyAuthoringError>(), Some(&expected), "{error:#}");
+
+    // A fixture binds a configuration only if authoring would install it, and names the qualifier as written.
+    let filter = "\"records.closure\"::closed_by = $jwt.sub";
+    agent.update_config(serde_json::from_value(serde_json::json!({
+        "roles": { "Owner": ["account:write"] },
+        "collections": { "assignment": { "read": "account:write", "scope": [{ "filter": filter, "unless_privilege": null }] } }
+    }))?);
+    let refused = agent
+        .set_catalog(Arc::new(common::FixtureCatalog {
+            labels: [(common::model("assignment"), "assignment".to_owned())].into(),
+            resolve: |predicate| Ok(common::resolve_fixture(predicate)),
+            property_type: |_| ankurah_core_types::ValueType::String,
+        }))
+        .expect_err("a fixture must refuse a scope that authoring refuses");
+    assert_eq!(
+        refused.to_string(),
+        "the scope filter '\"records.closure\"::closed_by = $jwt.sub' on 'assignment' qualifies a property with \"records.closure\"::; \
+         a scope names its own model's properties without a qualifier"
+    );
     Ok(())
 }
 

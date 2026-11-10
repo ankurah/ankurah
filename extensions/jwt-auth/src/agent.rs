@@ -119,11 +119,13 @@ impl JwtAgent {
         self.set_policy(node, &config).await
     }
 
-    /// Install a local evaluator fixture without persistence or reactive rebinding.
+    /// Install a local evaluator fixture without persistence or reactive rebinding, refusing a configuration that
+    /// authoring would refuse.
     #[cfg(feature = "test-helpers")]
-    pub fn set_catalog(&self, catalog: Arc<dyn crate::PolicyCatalog>) {
-        let policy = Arc::new(BoundPolicy::bind(self.config(), catalog.as_ref()));
+    pub fn set_catalog(&self, catalog: Arc<dyn crate::PolicyCatalog>) -> Result<(), crate::PolicyAuthoringError> {
+        let policy = Arc::new(BoundPolicy::bind(self.config(), catalog.as_ref())?);
         self.state.update(|state| state.policy = Some(policy));
+        Ok(())
     }
 
     fn policy(&self) -> Result<Arc<BoundPolicy>, AccessDenied> {

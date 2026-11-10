@@ -23,6 +23,9 @@ pub enum AuthError {
 pub enum PolicyAuthoringError {
     /// A scope filter names a property as `Component::name`. A scope restricts one model's entities by that
     /// model's own properties, so its property names take no qualifier.
-    #[error("the scope filter '{filter}' on '{model}' qualifies a property with {component}::; a scope names its own model's properties without a qualifier")]
+    #[error(
+        "the scope filter '{filter}' on '{model}' qualifies a property with {}::; a scope names its own model's properties without a qualifier",
+        ankql::parser::identifier_spelling(.component)
+    )]
     QualifiedScopeProperty { model: String, filter: String, component: String },
 }

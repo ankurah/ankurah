@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ankql::ast::{Expr, Parsed, Predicate, Resolved};
+use ankql::ast::{Expr, Parsed, PathExpr, Predicate, Resolved};
 use ankurah::proto::{ModelId, PropertyId};
 use ankurah::transaction::Transaction;
 use ankurah::{CachePolicy, Context, Ref};
@@ -86,9 +86,8 @@ pub(crate) async fn set_policy(context: &Context, catalog: &CatalogManager, conf
         let mut property_labels = BTreeSet::new();
         for scope in &rule.scope {
             let (parsed, _) = crate::variables::parse_template(&scope.filter)?;
-            collect_property_labels(&parsed, label, &mut property_labels).map_err(|component| {
-                PolicyAuthoringError::QualifiedScopeProperty { model: label.clone(), filter: scope.filter.clone(), component }
-            })?;
+            check_scope_filter(label, &scope.filter, &parsed)?;
+            collect_property_labels(&parsed, label, &mut property_labels);
             let row = PolicyScope {
                 policy: policy.into(),
                 filter: scope.filter.clone(),
@@ -302,40 +301,60 @@ impl PolicyCatalog for RegistrationCatalog<'_> {
     }
 }
 
-/// Collect the property names a scope filter reads, or the first `Component::` qualifier it writes.
-fn collect_property_labels(predicate: &Predicate<Parsed>, model: &str, labels: &mut BTreeSet<String>) -> Result<(), String> {
-    predicate.walk(Ok(()), &mut |result, predicate| {
-        result?;
-        match predicate {
-            Predicate::Comparison { left, right, .. } => {
-                collect_expr_labels(left, model, labels)?;
-                collect_expr_labels(right, model, labels)
-            }
-            Predicate::IsNull(expr) => collect_expr_labels(expr, model, labels),
-            _ => Ok(()),
-        }
-    })
+/// Refuse a scope filter that names a property as `Component::name`: a scope restricts one model's entities by
+/// that model's own properties.
+pub(crate) fn check_scope_filter(model: &str, filter: &str, predicate: &Predicate<Parsed>) -> Result<(), PolicyAuthoringError> {
+    let mut paths = Vec::new();
+    predicate_paths(predicate, &mut paths);
+    match paths.into_iter().find_map(|path| path.component.as_ref()) {
+        Some(component) => Err(PolicyAuthoringError::QualifiedScopeProperty {
+            model: model.to_owned(),
+            filter: filter.to_owned(),
+            component: component.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
-fn collect_expr_labels(expr: &Expr<Parsed>, model: &str, labels: &mut BTreeSet<String>) -> Result<(), String> {
+/// Collect the names of the model's own properties a scope filter reads.
+fn collect_property_labels(predicate: &Predicate<Parsed>, model: &str, labels: &mut BTreeSet<String>) {
+    let mut paths = Vec::new();
+    predicate_paths(predicate, &mut paths);
+    for path in paths {
+        let index = usize::from(path.steps.len() > 1 && path.steps[0] == model);
+        if let Some(name) = path.steps.get(index).filter(|name| *name != "id") {
+            labels.insert(name.clone());
+        }
+    }
+}
+
+/// Every property path a filter's comparisons and IS NULL checks read.
+fn predicate_paths<'a>(predicate: &'a Predicate<Parsed>, paths: &mut Vec<&'a PathExpr>) {
+    match predicate {
+        Predicate::Comparison { left, right, .. } => {
+            expr_paths(left, paths);
+            expr_paths(right, paths);
+        }
+        Predicate::IsNull(expr) => expr_paths(expr, paths),
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_paths(left, paths);
+            predicate_paths(right, paths);
+        }
+        Predicate::Not(inner) => predicate_paths(inner, paths),
+        Predicate::MemberOf(_) | Predicate::True | Predicate::False | Predicate::Placeholder => {}
+    }
+}
+
+fn expr_paths<'a>(expr: &'a Expr<Parsed>, paths: &mut Vec<&'a PathExpr>) {
     match expr {
-        Expr::Path(path) => {
-            if let Some(component) = &path.component {
-                return Err(component.clone());
-            }
-            let index = usize::from(path.steps.len() > 1 && path.steps[0] == model);
-            if let Some(name) = path.steps.get(index).filter(|name| *name != "id") {
-                labels.insert(name.clone());
-            }
-            Ok(())
-        }
-        Expr::ExprList(items) => items.iter().try_for_each(|item| collect_expr_labels(item, model, labels)),
+        Expr::Path(path) => paths.push(path),
+        Expr::ExprList(items) => items.iter().for_each(|item| expr_paths(item, paths)),
         Expr::InfixExpr { left, right, .. } => {
-            collect_expr_labels(left, model, labels)?;
-            collect_expr_labels(right, model, labels)
+            expr_paths(left, paths);
+            expr_paths(right, paths);
         }
-        Expr::Predicate(predicate) => collect_property_labels(predicate, model, labels),
-        _ => Ok(()),
+        Expr::Predicate(predicate) => predicate_paths(predicate, paths),
+        Expr::Literal(_) | Expr::Placeholder => {}
     }
 }
 
