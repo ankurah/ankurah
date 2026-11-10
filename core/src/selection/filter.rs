@@ -163,7 +163,13 @@ pub fn evaluate_predicate<S: Stage, I: ValueLookup<S>>(item: &I, predicate: &Pre
             },
         },
         Predicate::Not(pred) => Ok(!evaluate_predicate(item, pred)?),
-        Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr)?.is_none()),
+        // A missing property or JSON path is NULL: IS NULL holds, and a comparison with it is unknown (an error)
+        // and never true, even beneath NOT. This is SQL's NULL, which the SQL engines answer, as
+        // specs/unified-refs-edges-json/phase-1c-structured-queries.md ("Handle Missing Paths Gracefully") requires.
+        Predicate::IsNull(expr) => match &**expr {
+            Expr::Path(path) => Ok(item.value_at(path).is_none()),
+            expr => Ok(evaluate_expr(item, expr)?.is_none()),
+        },
         Predicate::MemberOf(model) => item.is_member_of(model),
         Predicate::True => Ok(true),
         Predicate::False => Ok(false),
@@ -423,6 +429,17 @@ mod tests {
         let query = format!("owner = '{}'", row.owner.to_base64());
         let selection = resolve_selection(&model(), &FixtureResolver(RECORDS), parse_selection(&query).unwrap()).unwrap();
         assert_eq!(evaluate_predicate(&row, &selection.predicate), Ok(true), "the row's own id, as a string literal, must still match");
+    }
+
+    #[test]
+    fn an_absent_property_is_null_and_compares_as_unknown() {
+        const NICKNAMED: &[(&str, ValueType)] = &[("nickname", ValueType::String)];
+        let item = TestItem::new("Alice", "30");
+        let evaluate = |query| evaluate_predicate(&item, &resolve(query, NICKNAMED).predicate);
+        assert_eq!(evaluate("nickname IS NULL"), Ok(true));
+        assert_eq!(evaluate("nickname IS NOT NULL"), Ok(false));
+        assert_eq!(evaluate("nickname = 'Al'"), Err(Error::PropertyNotFound("nickname".into())));
+        assert_eq!(evaluate("NOT nickname = 'Al'"), Err(Error::PropertyNotFound("nickname".into())));
     }
 
     #[test]
