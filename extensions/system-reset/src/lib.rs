@@ -20,7 +20,7 @@ use ankurah_core::{
     error::RetrievalError,
     livequery::EntityLiveQuery,
     model::Model,
-    node::{Node, NodePlugin, PeerRefusal, PeerRegistration},
+    node::{AnnouncementFailure, Node, NodePlugin, PeerRefusal, PeerRegistration},
     policy::PolicyAgent,
     session::ContextData,
     storage::StorageEngine,
@@ -91,16 +91,12 @@ where
 {
     fn name(&self) -> &'static str { NAME }
 
-    async fn announce(&self, node: &Node<SE, PA>) -> Option<Vec<u8>> {
-        match held::<M, _, _>(node).await {
-            Ok(held) if held.is_empty() => None,
-            Ok(held) => Some(announcement::encode(&held)),
-            // This hook returns no error. Announcing nothing claims no seeding, so no peer refuses on it.
-            Err(error) => {
-                tracing::warn!("Node {} announces no System entities, because reading them failed: {error}", node.id);
-                None
-            }
-        }
+    async fn announce(&self, node: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> {
+        let held = held::<M, _, _>(node).await.map_err(|error| AnnouncementFailure {
+            plugin: NAME,
+            reason: format!("reading this node's System entities failed: {error}"),
+        })?;
+        Ok((!held.is_empty()).then(|| announcement::encode(&held)))
     }
 
     async fn register_peer(&self, node: &Node<SE, PA>, peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> {

@@ -1,7 +1,7 @@
 use super::{register_keyed_peer, RecordingSender};
 use crate::connector::{PeerConnectionError, PeerProvenance};
 use crate::error::NodeHaltReason;
-use crate::node::{DuplicatePluginName, Node, NodeKey, NodePlugin, NodeState, PeerRefusal, PeerRegistration};
+use crate::node::{AnnouncementFailure, DuplicatePluginName, Node, NodeKey, NodePlugin, NodeState, PeerRefusal, PeerRegistration};
 use crate::policy::{PeerTrust, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT};
 use crate::storage::StorageEngine;
 use crate::test_utils::{opened_handshakes, TestStorage};
@@ -54,7 +54,7 @@ where
 {
     fn name(&self) -> &'static str { self.name }
 
-    async fn announce(&self, _node: &Node<SE, PA>) -> Option<Vec<u8>> { self.announcement.clone() }
+    async fn announce(&self, _node: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> { Ok(self.announcement.clone()) }
 
     async fn register_peer(&self, node: &Node<SE, PA>, peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> {
         self.asked.0.lock().unwrap().push(Asked {
@@ -192,6 +192,30 @@ async fn a_plugin_that_resets_its_node_and_refuses_returns_its_refusal() {
     assert_eq!(refused, Err(PeerConnectionError::Refused(PeerRefusal { plugin: "resetter", reason: "the probe refuses".into() })));
     assert_eq!(node.state().value(), NodeState::Halted(NodeHaltReason::Reset));
     assert_eq!(node.peer_trust(&key.node_id()), None);
+}
+
+/// A plugin that cannot make its announcement.
+struct FailingAnnouncer;
+
+#[async_trait]
+impl<SE, PA> NodePlugin<SE, PA> for FailingAnnouncer
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn name(&self) -> &'static str { "failing" }
+
+    async fn announce(&self, _node: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> {
+        Err(AnnouncementFailure { plugin: "failing", reason: "the probe cannot read its data".into() })
+    }
+}
+
+#[tokio::test]
+async fn a_plugin_that_cannot_announce_fails_the_presence() {
+    let node = Node::builder(Arc::new(TestStorage::default()), PermissiveAgent::new()).plug(FailingAnnouncer).build().unwrap();
+    let (handshake, _) = opened_handshakes(node.id, NodeKey::generate().node_id());
+    let failure = AnnouncementFailure { plugin: "failing", reason: "the probe cannot read its data".into() };
+    assert_eq!(node.presence(&handshake).await, Err(PeerConnectionError::AnnouncementFailed(failure)));
 }
 
 #[test]

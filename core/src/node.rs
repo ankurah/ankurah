@@ -57,7 +57,7 @@ use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
 use plugin::NodePlugins;
-pub use plugin::{DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};
+pub use plugin::{AnnouncementFailure, DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};
 use schema_registration::WireRegistrant;
 pub use state::NodeState;
 
@@ -338,11 +338,12 @@ where
     pub fn begin_handshake(&self) -> Handshake { Handshake::new(self.id) }
 
     /// Sign this node's presence answering the peer on `handshake`'s connection, carrying each
-    /// plugin's announcement; a halted node signs none, and none answers before the peer's opening arrives.
+    /// plugin's announcement; a halted node signs none, nor one whose plugin cannot announce, and
+    /// none answers before the peer's opening arrives.
     pub async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
         self.lifecycle.check_not_halted()?;
         let mut claims = handshake.presence_claims(self.id, self.durable)?;
-        claims.announcements = self.plugins.announcements(self).await;
+        claims.announcements = self.plugins.announcements(self).await.map_err(PeerConnectionError::AnnouncementFailed)?;
         Ok(self.key.sign_presence(claims))
     }
 

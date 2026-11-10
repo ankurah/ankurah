@@ -31,6 +31,8 @@ pub enum PeerConnectionError {
     OfferMismatch(proto::NodeId),
     #[error("{0}")]
     Refused(crate::node::PeerRefusal),
+    #[error("{0}")]
+    AnnouncementFailed(crate::node::AnnouncementFailure),
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
 }

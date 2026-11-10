@@ -19,8 +19,9 @@ where
     /// Names this plugin's entry in a presence.
     fn name(&self) -> &'static str;
 
-    /// Bytes this node announces to every peer under `name`, inside its signed presence.
-    async fn announce(&self, _node: &Node<SE, PA>) -> Option<Vec<u8>> { None }
+    /// Bytes this node announces to every peer under `name`, inside its signed presence. `Err`
+    /// fails the presence, and with it the connection.
+    async fn announce(&self, _node: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> { Ok(None) }
 
     /// Asked once per registration, after the presence verifies and trust is decided and
     /// before the peer is registered. `Err` refuses the peer. No message from the peer is read
@@ -42,6 +43,14 @@ pub struct PeerRegistration<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("plugin {plugin} refused the peer: {reason}")]
 pub struct PeerRefusal {
+    pub plugin: &'static str,
+    pub reason: String,
+}
+
+/// A plugin's failure to make its announcement.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("plugin {plugin} could not make its announcement: {reason}")]
+pub struct AnnouncementFailure {
     pub plugin: &'static str,
     pub reason: String,
 }
@@ -69,15 +78,16 @@ where
         }
     }
 
-    /// Each plugin's announcement, asked in the order plugged, under the plugin's name.
-    pub(crate) async fn announcements(&self, node: &Node<SE, PA>) -> BTreeMap<String, Vec<u8>> {
+    /// Each plugin's announcement, asked in the order plugged, under the plugin's name; the first
+    /// failure stops the rest.
+    pub(crate) async fn announcements(&self, node: &Node<SE, PA>) -> Result<BTreeMap<String, Vec<u8>>, AnnouncementFailure> {
         let mut announcements = BTreeMap::new();
         for plugin in &self.0 {
-            if let Some(announcement) = plugin.announce(node).await {
+            if let Some(announcement) = plugin.announce(node).await? {
                 announcements.insert(plugin.name().to_owned(), announcement);
             }
         }
-        announcements
+        Ok(announcements)
     }
 
     /// Ask each plugin, in the order plugged, about registering the peer whose presence makes

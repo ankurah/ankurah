@@ -52,6 +52,7 @@ impl ConnectionStateEnum {
                 Some(PeerConnectionError::SelfConnection(_)) => "SelfConnection",
                 Some(PeerConnectionError::OfferMismatch(_)) => "OfferMismatch",
                 Some(PeerConnectionError::Refused(_)) => "Refused",
+                Some(PeerConnectionError::AnnouncementFailed(_)) => "AnnouncementFailed",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",
                 None => "Transport",
             }
