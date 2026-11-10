@@ -76,7 +76,8 @@ where SE: StorageEngine + Send + Sync + 'static
     }
 
     /// Begin writing to storage, unless this node has halted. A reset's wipe waits until the
-    /// write ends, so none lands in a wiped store.
+    /// write's commit returns or its caller drops it; [`StorageTransaction::commit`] says what an
+    /// engine owes for a commit that runs on after the drop.
     pub(crate) fn begin_storage_write(&self) -> Result<StorageWrite<'_>, NodeHaltReason> {
         // Counted before the halt is checked: a wipe that finds no write in flight has halted the
         // node first, so a write counted after that finds the halt here.
@@ -149,7 +150,8 @@ impl WritesInFlight {
     }
 }
 
-/// A storage write counted in flight until it drops; a reset's wipe waits until none is.
+/// A storage write, counted in flight until its commit returns or its caller drops it; a reset's
+/// wipe waits until none is.
 pub(crate) struct StorageWrite<'a>(&'a WritesInFlight);
 
 impl StorageWrite<'_> {

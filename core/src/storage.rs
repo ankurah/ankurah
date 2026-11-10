@@ -49,7 +49,9 @@ pub trait StorageTransaction: Send {
 
     /// Compare every expected head, then atomically persist events, canonical
     /// states, memberships, and materializations. Any conflict publishes none
-    /// of those records and returns the observed stored states.
+    /// of those records and returns the observed stored states. A commit that
+    /// keeps running after its future is dropped must not land in a store that
+    /// [`StorageEngine::delete_all`] wiped after the drop.
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError>;
 }
 

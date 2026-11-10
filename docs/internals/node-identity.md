@@ -183,9 +183,9 @@ with its own.
 
 ## Resetting a Node
 
-`Node::reset` halts the node with `NodeHaltReason::Reset` and then wipes its
-storage through `StorageEngine::delete_all`, once the storage commits in
-flight have finished; no commit begins after the halt, and the wipe finishes
+`Node::reset` halts the node with `NodeHaltReason::Reset` and then, once no
+storage commit is still being awaited, wipes its storage through
+`StorageEngine::delete_all`; no commit begins after the halt, and the wipe finishes
 even if the caller stops waiting. The host then discards the halted node with
 its contexts and live queries, and builds a fresh node on the wiped store. A
 call during or after another reset waits for that reset's wipe rather than
