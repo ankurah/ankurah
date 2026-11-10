@@ -242,11 +242,15 @@ fn parse_qualified_steps<'i>(pairs: impl Iterator<Item = Pair<'i, grammar::Rule>
     (component, steps)
 }
 
+/// Words a predicate reads as a literal or as NOT before it would read an identifier, in any case.
+const WORDS_BEFORE_IDENTIFIERS: [&str; 4] = ["true", "false", "null", "not"];
+
 /// How AnkQL text writes `name` as an identifier: bare when the grammar reads it as one identifier,
 /// double-quoted otherwise.
 pub fn identifier_spelling(name: &str) -> String {
     let plain = name.chars().next().is_some_and(|first| !first.is_ascii_digit())
-        && name.chars().all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-');
+        && name.chars().all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-')
+        && !WORDS_BEFORE_IDENTIFIERS.iter().any(|word| name.eq_ignore_ascii_case(word));
     if plain {
         name.to_owned()
     } else {
@@ -804,6 +808,40 @@ mod tests {
             ast::Expr::Path(ast::PathExpr { component: None, steps: vec!["licensing".into(), "territory".into()] })
         );
         assert!(parse_selection("Assignment::assignee::name = 'x'").is_err(), "one qualifier per path");
+    }
+
+    #[test]
+    fn an_identifier_is_spelled_so_that_it_parses_back_as_a_qualifier() {
+        let words = [
+            "task",
+            "records.closure",
+            "2fa",
+            "say \"hi\"",
+            "true",
+            "False",
+            "NULL",
+            "not",
+            "and",
+            "or",
+            "in",
+            "is",
+            "between",
+            "memberof",
+            "order",
+            "limit",
+            "asc",
+            "desc",
+            "where",
+            "from",
+            "values",
+        ];
+        for word in words {
+            let spelled = identifier_spelling(word);
+            let parsed = parse_selection(&format!("{spelled}::x = 1")).unwrap_or_else(|error| panic!("{word} as {spelled}: {error}"));
+            let ast::Predicate::Comparison { left, .. } = parsed.predicate else { panic!("{word}: expected a comparison") };
+            assert_eq!(*left, ast::Expr::Path(qualified(word, &["x"])), "{word} as {spelled}");
+            assert_eq!(spelled == word, parse_selection(&format!("{word}::x = 1")).is_ok(), "{word} is quoted only when it must be");
+        }
     }
 
     #[test]
