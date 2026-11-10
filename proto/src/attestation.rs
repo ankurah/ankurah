@@ -49,7 +49,7 @@ pub enum Subject {
     State { entity: EntityId, head: Clock, state_digest: [u8; 32] },
 }
 
-/// Why a sealed attestation does not open.
+/// Why a sealed attestation does not unseal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttestationError {
     /// The bytes are not a sealed statement this build can decode: a malformed encoding, bytes
@@ -62,7 +62,7 @@ pub enum AttestationError {
 }
 
 impl Statement {
-    /// This statement sealed: its bytes, and `sign`'s signature over them. It opens only if `sign`
+    /// This statement sealed: its bytes, and `sign`'s signature over them. It unseals only if `sign`
     /// signs as the statement's attester.
     pub fn seal(&self, sign: impl FnOnce(&[u8]) -> Signature) -> SealedAttestation {
         let statement = encoding::encode(self);
@@ -74,7 +74,7 @@ impl Statement {
 impl SealedAttestation {
     /// The statement these bytes seal, if they decode and the signature is the statement's
     /// attester's over the statement's bytes as carried.
-    pub fn open(&self) -> Result<Statement, AttestationError> {
+    pub fn unseal(&self) -> Result<Statement, AttestationError> {
         let sealed: Sealed = decode(&self.0)?;
         let statement: Statement = decode(&sealed.statement)?;
         if !statement.attester.verify(&signed_bytes(&sealed.statement), &sealed.signature) {
@@ -272,12 +272,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_statement_opens_to_itself_under_its_attesters_signature() {
+    fn a_sealed_statement_unseals_to_itself_under_its_attesters_signature() {
         let key = attester_key();
         let statement = statement_by(&key, Subject::Event(EventId::from_bytes([1; 32])));
-        assert_eq!(statement.seal(sign_as(&key)).open(), Ok(statement.clone()));
+        assert_eq!(statement.seal(sign_as(&key)).unseal(), Ok(statement.clone()));
         assert_eq!(
-            statement.seal(sign_as(&ed25519_dalek::SigningKey::from_bytes(&[14; 32]))).open(),
+            statement.seal(sign_as(&ed25519_dalek::SigningKey::from_bytes(&[14; 32]))).unseal(),
             Err(AttestationError::InvalidSignature),
             "signed by a key other than the attester's"
         );
@@ -297,7 +297,7 @@ mod tests {
             Statement { payload: b"other payload".to_vec(), ..statement.clone() },
         ] {
             let tampered = with_statement_bytes(&sealed, encode(&changed));
-            assert_eq!(tampered.open(), Err(AttestationError::InvalidSignature), "{changed:?}");
+            assert_eq!(tampered.unseal(), Err(AttestationError::InvalidSignature), "{changed:?}");
         }
     }
 
@@ -326,7 +326,7 @@ mod tests {
         assert_ne!(carried, canonical);
 
         let sealed = SealedAttestation(encode(&Sealed { statement: carried.clone(), signature: sign_as(&key)(&signed_bytes(&carried)) }));
-        assert_eq!(sealed.open(), Ok(statement));
+        assert_eq!(sealed.unseal(), Ok(statement));
     }
 
     #[test]
@@ -356,7 +356,7 @@ mod tests {
             with_statement_bytes(&sealed, unknown_attester),
             with_statement_bytes(&sealed, unknown_subject),
         ] {
-            assert!(matches!(undecodable.open(), Err(AttestationError::Undecodable(_))), "{undecodable:?}");
+            assert!(matches!(undecodable.unseal(), Err(AttestationError::Undecodable(_))), "{undecodable:?}");
         }
     }
 

@@ -85,8 +85,8 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - deciding what a connected peer is trusted with, and which publishers it trusts
 ///
 /// Core seals an attestation only when an agent requests one, and checks none: an agent
-/// receives the attestations on an event or state exactly as they came, and opens the ones
-/// it cares about with [`proto::SealedAttestation::open`].
+/// receives the attestations on an event or state exactly as they came, and unseals the ones
+/// it cares about with [`proto::SealedAttestation::unseal`].
 ///
 /// Read checks may receive several credentials, one, or none. Implementations
 /// must decide the empty case explicitly and authorize actual entity memberships,

@@ -108,7 +108,7 @@ It does **not** buy (each on a named gap or agent responsibility):
   Attribution is partly structural, though not by the hash alone: a genesis hashes
   its minter's `Identity` into the entity id. Who committed or admitted an update is
   a signed fact only when the application's policy agent has the node attest it
-  (`proto/src/attestation.rs`); core checks no attestation, and an agent opens the ones it
+  (`proto/src/attestation.rs`); core checks no attestation, and an agent unseals the ones it
   cares about (C4-20).
 - **Equivocation resistance / DoS bound**: every forged concurrent event is a
   distinct genuine hash, so de-dup stops identical replays but not flooding of
@@ -576,21 +576,21 @@ Trust tier: attestation-dependent by construction.
 Enforcing seam: `proto/src/attestation.rs` defines the sealed attestation: a `Statement`
 (attester `Identity`, subject naming the event or the state, kind, payload) carried as
 its exact bytes with the attester's signature over `ankurah.attestation.v1` and those
-bytes. `SealedAttestation::open` yields the statement only if the bytes decode and the
+bytes. `SealedAttestation::unseal` yields the statement only if the bytes decode and the
 signature verifies, and `Subject::names_event`/`names_state` check the subject against
 the payload in hand. `core/src/node/attestation.rs` seals a statement with the node key
 when `check_write_event` or `attest_state` requests one, and only then. Core checks no
 attestation on arrival: `validate_received_event`/`validate_received_state` receive the
-attestations as they came, and the agent opens and judges the ones it cares about.
+attestations as they came, and the agent unseals and judges the ones it cares about.
 Falsifying attack (T2): forge authorship. A forged attestation, or one moved onto
-another event, fails `open` or the subject check, but only an agent that runs both and
+another event, fails `unseal` or the subject check, but only an agent that runs both and
 requires a recognised attester rejects it; a peer can always omit attestations or relay
 events that carry none. PermissiveAgent and JwtAgent request and check none.
 Test arm: `attestation::each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests`,
 `attestation::a_relaying_node_keeps_every_attestation_on_an_event_unchanged`, and in
 `ankurah-proto` `attestation::tests::{a_changed_attester_subject_kind_or_payload_fails_the_signature,
 an_event_subject_names_only_its_event}`.
-Status: enforced-by-design boundary: core seals and opens attestations, and an agent
+Status: enforced-by-design boundary: core seals and unseals attestations, and an agent
 decides which to make and which to require (Finding 6, 274-B). Frames after the
 handshake are still unsigned (G-8).
 
@@ -730,7 +730,7 @@ assertion, not a wire arm, per the claim body).
 | C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |
 | C4-18 | `bridge_policy::test_event_bridge_respects_read_policy_on_send` | existing-suite |
 | C4-19 | none here (creation-event fork asymmetry is gap G-6; the remote-transaction path with a rejecting agent is owned by #243) | design-boundary |
-| C4-20 | `attestation::{each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests, a_relaying_node_keeps_every_attestation_on_an_event_unchanged}`; `ankurah-proto` `attestation::tests` (a changed statement fails its signature, a moved one its subject check) | design-boundary: the arms pin the ability to seal, carry and open; requiring an attestation is the agent's |
+| C4-20 | `attestation::{each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests, a_relaying_node_keeps_every_attestation_on_an_event_unchanged}`; `ankurah-proto` `attestation::tests` (a changed statement fails its signature, a moved one its subject check) | design-boundary: the arms pin the ability to seal, carry and unseal; requiring an attestation is the agent's |
 | C4-21 | I-confluence boundary is a design assertion for #274 and a C3 conformance audit, not a wire arm (per the claim body) | design-boundary |
 | C4-22 | enforced by absence: `Event` carries no depth/generation field to forge; the forged-generation arm activates when #266 lands | design-boundary |
 | G-4 | `adversarial_wire::equivocation_flood_antichain_is_bounded` | gap-red-ignored (G-4, #246 / signature layer) |

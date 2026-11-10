@@ -149,7 +149,7 @@ exactly as they came, including ones it cannot read, and
 unchanged. A received state's attestations go no further than
 `validate_received_state`: a node stores every state without attestations, and
 a durable node serves a state with only the one its own agent requests. An
-agent that cares opens one with `SealedAttestation::open`, which
+agent that cares unseals one with `SealedAttestation::unseal`, which
 yields the statement only if the bytes decode and the signature verifies under
 the statement's attester, and then checks that the subject names the event or
 state in hand (`Subject::names_event`, `Subject::names_state`). Whether an

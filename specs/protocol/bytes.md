@@ -179,7 +179,7 @@ it, then `signature: Signature`. An `AttestationSet` is a sequence of sealed
 attestations, each a byte string, so a node reads a set whose attestations it
 cannot read, and keeps and relays each attestation's bytes unchanged.
 
-A sealed attestation opens only if its bytes hold that struct and nothing after
+A sealed attestation unseals only if its bytes hold that struct and nothing after
 it, the statement bytes hold one `Statement` and nothing after it, and the
 signature verifies under the statement's attester over the signed bytes of 4.6,
 taken from the statement bytes as carried. A statement whose bytes decode but
