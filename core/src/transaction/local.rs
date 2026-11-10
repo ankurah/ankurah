@@ -7,7 +7,7 @@ use ankurah_proto::{EntityId, EntityState, Event};
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::{attestation, event_admissibility::AdmittedOperations};
+use crate::node::{attestation, durable_peer, event_admissibility::AdmittedOperations};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -226,7 +226,7 @@ impl Transaction {
 
             if !relayed {
                 if let ContextAuth::Sessions(sessions) = auth {
-                    node.relay_to_required_peers(&sessions.write_credential()?, self.id.clone(), &attested_events).await?;
+                    durable_peer::relay_to_required_peers(node, &sessions.write_credential()?, self.id.clone(), &attested_events).await?;
                 }
                 relayed = true;
             }

@@ -111,7 +111,7 @@ async fn a_refused_peer_is_in_no_peer_map_and_receives_nothing() {
     assert_eq!(node.granted_trust(&peer), None);
     assert!(node.get_durable_peers().is_empty());
     assert!(!node.subscription_relay.as_ref().unwrap().is_connected(&peer));
-    let commit = node.relay_to_required_peers(&DEFAULT_CONTEXT, proto::TransactionId::new(), &[]);
+    let commit = crate::node::durable_peer::relay_to_required_peers(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), &[]);
     tokio::pin!(commit);
     assert!(matches!(futures::poll!(&mut commit), std::task::Poll::Ready(Ok(()))), "no durable peer is there to relay to");
     assert!(matches!(

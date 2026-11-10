@@ -3,6 +3,7 @@ use crate::connector::SendError;
 use crate::node::handler::commit_transaction;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
 use crate::test_utils::{opened_handshakes, TestStorage};
+use ankurah_proto::Attested;
 use ankurah_signals::Subscribe;
 
 mod commit;
@@ -272,9 +273,11 @@ async fn a_halted_node_asked_to_read_from_a_peer_reports_its_halt() {
         limit: None,
     };
     assert!(
-        matches!(node.get_from_peer(vec![proto::EntityId::random()], &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
+        matches!(durable_peer::get_from_peer(&node, vec![proto::EntityId::random()], &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
     );
-    assert!(matches!(node.fetch_from_peer(selection, &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason));
+    assert!(
+        matches!(durable_peer::fetch_from_peer(&node, selection, &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
+    );
 }
 
 #[tokio::test]
