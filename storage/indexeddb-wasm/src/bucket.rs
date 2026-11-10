@@ -157,7 +157,7 @@ impl IndexedDBBucket {
         let materialized = Object::new(js_sys::Object::new().into());
         materialized.set(&*ID_KEY, state.entity_id.to_base64())?;
         materialized.set(&*MATERIALIZATION_KEY, self.materialization_name.as_str())?;
-        self.extract_fields(&materialized, &state).await?;
+        self.extract_fields(&materialized, state).await?;
 
         Ok(PreparedIndexedDbMaterialization {
             key: materialization_entity_key(&self.materialization_name, state.entity_id),
