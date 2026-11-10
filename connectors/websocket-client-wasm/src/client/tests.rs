@@ -507,7 +507,7 @@ async fn a_refusal_is_reported_with_its_reason_and_the_client_waits_longer_befor
             while !is_closed(socket) {
                 sleep(Duration::ZERO).await;
             }
-            assert!(matches!(client.state.value(), ConnectionState::Refused { reason, .. } if reason == "not today"));
+            assert!(matches!(client.state.value(), ConnectionState::RefusedByServer { reason, .. } if reason == "not today"));
             assert_eq!(*client.reconnect_delay.borrow(), delay, "the client waits longer before each dial");
         }
         assert_eq!(connected.load(Ordering::Relaxed), 0, "the client never counted itself connected");

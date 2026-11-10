@@ -426,8 +426,8 @@ else in it:
   frame. In version 1 the rest is the challenge and nothing after it. When they
   share none, the receiver does not read the rest: it answers with
   `NoCommonVersion` carrying its own versions, and closes.
-- Index 1, a refusal of the opening: the peer speaks the versions it carries.
-  The receiver closes.
+- Index 1, `NoCommonVersion`: the peer shares no version with the receiver's
+  opening, and speaks the versions it carries. The receiver closes.
 - Any other index, or fewer than twelve bytes: the receiver closes.
 
 A build that offers version 1 sends exactly the version-1 layout of the
@@ -462,7 +462,7 @@ Vectors. The opening offering versions 1 to 3, with the challenge issued by
 8888888888888888888888888888888888888888888888888888888888888888
 ```
 
-The refusal of an opening from a node that speaks versions 1 to 1:
+`NoCommonVersion` from a node that speaks versions 1 to 1:
 
 ```text
 01000000 01000000 01000000

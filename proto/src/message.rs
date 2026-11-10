@@ -33,7 +33,8 @@ pub enum OpeningError {
     /// The sender speaks only versions the reader does not; the rest of the frame was not read.
     #[error("the peer speaks protocol versions {0}, none of which this node speaks")]
     NoCommonVersion(ProtocolVersions),
-    /// Neither an opening nor a refusal, or an opening whose challenge does not decode.
+    /// Neither an opening nor a `NoCommonVersion` answer, or an opening whose challenge does not
+    /// decode.
     #[error("not an opening frame this build can read: {0}")]
     Undecodable(String),
 }
@@ -130,7 +131,7 @@ mod tests {
     fn node(byte: u8) -> NodeId { Identity::Ed25519([byte; 32]).into() }
 
     /// The first four bytes of a message are its variant index, which every peer reads to frame it.
-    /// The opening's and the refusal's stay fixed in every protocol version.
+    /// The opening's and the `NoCommonVersion` answer's stay fixed in every protocol version.
     #[test]
     fn message_variant_order_is_pinned() {
         let challenge = HandshakeChallenge::new(node(1));
@@ -196,9 +197,10 @@ mod tests {
         Opening { versions, challenge }
     }
 
-    /// The vectors of specs/protocol/bytes.md section 6 for an opening and its refusal: each frame's bytes.
+    /// The vectors of specs/protocol/bytes.md section 6 for an opening and a `NoCommonVersion`
+    /// answer: each frame's bytes.
     #[test]
-    fn the_opening_and_refusal_frames_match_the_byte_specification_vectors() {
+    fn the_opening_and_no_common_version_frames_match_the_byte_specification_vectors() {
         let open = Message::Open(opening(versions(1, 3))).encode();
         assert_eq!(
             hex::encode(&open),
@@ -213,11 +215,11 @@ mod tests {
         );
         assert_eq!(Message::read_opening(&open, ProtocolVersions::SPOKEN), Ok(opening(versions(1, 3))));
 
-        let refusal = Message::NoCommonVersion(versions(1, 1)).encode();
-        assert_eq!(hex::encode(&refusal), "010000000100000001000000");
+        let no_common_version = Message::NoCommonVersion(versions(1, 1)).encode();
+        assert_eq!(hex::encode(&no_common_version), "010000000100000001000000");
     }
 
-    /// The refusal vector of specs/protocol/bytes.md section 6: an accepting side's answer to a
+    /// The `Refused` vector of specs/protocol/bytes.md section 6: an accepting side's answer to a
     /// presence it will not register.
     #[test]
     fn the_refused_frame_matches_the_byte_specification_vector() {
@@ -226,10 +228,10 @@ mod tests {
         assert!(matches!(Message::decode(&refused), Ok(Message::Refused(reason)) if reason == "not today"));
     }
 
-    /// A version-1 reader rejects bytes after the challenge, so reaching the refusal below shows
-    /// the rest of the frame was never read.
+    /// A version-1 reader rejects bytes after the challenge, so reaching `NoCommonVersion` below
+    /// shows the rest of the frame was never read.
     #[test]
-    fn an_opening_sharing_no_version_is_refused_before_the_rest_is_read() {
+    fn no_common_version_is_found_before_the_rest_of_an_opening_is_read() {
         let mut frame = Message::Open(opening(versions(2, 3))).encode();
         frame.extend_from_slice(b"bytes a version-1 reader rejects");
         assert_eq!(Message::read_opening(&frame, versions(1, 1)), Err(OpeningError::NoCommonVersion(versions(2, 3))));
@@ -243,13 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_in_place_of_an_opening_names_the_versions_its_sender_speaks() {
-        let refusal = Message::NoCommonVersion(versions(4, 6)).encode();
-        assert_eq!(Message::read_opening(&refusal, versions(1, 1)), Err(OpeningError::NoCommonVersion(versions(4, 6))));
+    fn a_no_common_version_answer_in_place_of_an_opening_names_the_versions_its_sender_speaks() {
+        let no_common_version = Message::NoCommonVersion(versions(4, 6)).encode();
+        assert_eq!(Message::read_opening(&no_common_version, versions(1, 1)), Err(OpeningError::NoCommonVersion(versions(4, 6))));
     }
 
     #[test]
-    fn a_frame_that_opens_with_neither_an_opening_nor_a_refusal_is_undecodable() {
+    fn a_frame_that_opens_with_neither_an_opening_nor_a_no_common_version_answer_is_undecodable() {
         let open = Message::Open(opening(versions(1, 1))).encode();
         let mut other_kind = open.clone();
         other_kind[0] = 2;

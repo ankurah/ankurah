@@ -91,8 +91,8 @@ pub enum ConnectionState {
         server_presence: proto::Presence,
     },
     /// The server refused this node, for the reason it gave; the client dials again after its backoff.
-    #[strum(serialize = "Refused")]
-    Refused {
+    #[strum(serialize = "RefusedByServer")]
+    RefusedByServer {
         url: String,
         reason: String,
     },
@@ -106,7 +106,7 @@ pub enum ConnectionError {
     Peer(#[from] PeerConnectionError),
     /// The server refused this node, for the reason it gave.
     #[error("the server refused this node: {0}")]
-    Refused(String),
+    RefusedByServer(String),
     #[error("General connection error: {0}")]
     General(String),
 }
@@ -217,12 +217,12 @@ where
     }
 
     /// Wait for the client to establish a connection to the server (signal-based), or to fail
-    /// to: a refusal by the server is [`ConnectionError::Refused`] with its reason.
+    /// to: a refusal by the server is [`ConnectionError::RefusedByServer`] with its reason.
     pub async fn wait_connected(&self) -> Result<(), ConnectionError> {
         self.state()
             .wait_for(|state| match state {
                 ConnectionState::Connected { .. } => Some(Ok(())),
-                ConnectionState::Refused { reason, .. } => Some(Err(ConnectionError::Refused(reason.clone()))),
+                ConnectionState::RefusedByServer { reason, .. } => Some(Err(ConnectionError::RefusedByServer(reason.clone()))),
                 ConnectionState::Error(e) => Some(Err(e.clone())),
                 _ => None, // Continue waiting for Connecting/Disconnected states
             })
@@ -254,7 +254,9 @@ where
                     ConnectionState::Error(ConnectionError::General("Connection closed".into()))
                 }
                 Err(error) => match error.downcast::<ConnectionError>() {
-                    Ok(ConnectionError::Refused(reason)) => ConnectionState::Refused { url: inner.server_url.clone(), reason },
+                    Ok(ConnectionError::RefusedByServer(reason)) => {
+                        ConnectionState::RefusedByServer { url: inner.server_url.clone(), reason }
+                    }
                     Ok(error) => ConnectionState::Error(error),
                     Err(error) => ConnectionState::Error(
                         error
@@ -287,7 +289,7 @@ where
     async fn connect_once(inner: &Arc<Inner<SE, PA>>) -> Result<()> {
         info!("Attempting to connect to {}", inner.server_url);
         // Retain the last connection error or refusal throughout retries, until admission succeeds.
-        if !matches!(inner.connection_state.value(), ConnectionState::Error(_) | ConnectionState::Refused { .. }) {
+        if !matches!(inner.connection_state.value(), ConnectionState::Error(_) | ConnectionState::RefusedByServer { .. }) {
             inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
         }
 
@@ -448,7 +450,7 @@ where
             }
             Ok(proto::Message::Refused(reason)) => {
                 error!("Server {} refused this node: {}", inner.server_url, reason);
-                Err(ConnectionError::Refused(reason).into())
+                Err(ConnectionError::RefusedByServer(reason).into())
             }
             Ok(proto::Message::Presence(server_presence)) => {
                 match Self::handle_server_presence(inner, server_presence, handshake, registration, outgoing_rx).await {

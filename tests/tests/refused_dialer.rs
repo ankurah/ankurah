@@ -64,8 +64,8 @@ async fn a_client_the_server_refuses_reports_why_never_connects_and_waits_longer
 
     let reason = PeerConnectionError::Refused(PeerRefusal { plugin: PLUGIN, reason: REASON.into() }).to_string();
     let outcome = tokio::time::timeout(Duration::from_secs(5), client.wait_connected()).await?;
-    assert_eq!(outcome, Err(ConnectionError::Refused(reason.clone())));
-    assert!(matches!(client.state().value(), ConnectionState::Refused { reason: refused, .. } if refused == reason));
+    assert_eq!(outcome, Err(ConnectionError::RefusedByServer(reason.clone())));
+    assert!(matches!(client.state().value(), ConnectionState::RefusedByServer { reason: refused, .. } if refused == reason));
 
     tokio::time::timeout(Duration::from_secs(10), async {
         while asked.lock().unwrap().len() < 3 {
@@ -78,7 +78,7 @@ async fn a_client_the_server_refuses_reports_why_never_connects_and_waits_longer
     assert!(first >= Duration::from_millis(900), "the client dialed again after {first:?}");
     assert!(second >= first + Duration::from_millis(500), "the wait did not grow: {first:?}, then {second:?}");
 
-    assert!(matches!(client.state().value(), ConnectionState::Refused { .. }), "a refusal stays visible while the client retries");
+    assert!(matches!(client.state().value(), ConnectionState::RefusedByServer { .. }), "a refusal stays visible while the client retries");
     assert_eq!(connected.load(Ordering::Relaxed), 0, "the client never counted itself connected");
     assert!(!client.is_connected());
     assert_eq!(node.granted_trust(&server.id), None, "the client registered nothing");
