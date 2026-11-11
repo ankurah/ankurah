@@ -6,7 +6,6 @@ use crate::{
     encoding::{self, UndecodableBytes},
     event_id::EventId,
     id::EntityId,
-    identity::Identity,
     operation::{CarriedOperations, OperationSet},
 };
 
@@ -28,7 +27,8 @@ impl AsRef<Event> for Event {
 
 /// The two event shapes. A genesis is an entity's single creation event and
 /// carries its initial operations, frozen when `create()` returns; every
-/// later event is an update.
+/// later event is an update. The variant names which id derivation applies,
+/// and a later derivation would be appended as a new variant.
 ///
 /// Both shapes carry a nonce and a timestamp, and both are inside the
 /// event's id hash. They sit in the variants rather than on [`Event`] so one
@@ -36,9 +36,6 @@ impl AsRef<Event> for Event {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum EventBody {
     Genesis {
-        /// The identity that minted the entity, a node's key by default. It
-        /// is inside the entity's id, so no relay can drop or re-attribute it.
-        minter: Identity,
         /// Creator-random, drawn once when the event is minted. Two
         /// `create()` calls with identical payloads draw different nonces and
         /// are therefore different entities; a retry that re-sends the
@@ -84,19 +81,19 @@ pub enum EventStructureError {
 }
 
 impl Event {
-    /// Mint an entity under `minter`: freeze `operations` into a genesis,
-    /// draw its nonce, its timestamp and each operation's salt, and derive the
-    /// entity id from the whole of it. The id is the return value's `entity_id`.
-    pub fn genesis(minter: Identity, operations: OperationSet) -> Self {
-        Self::genesis_from_parts(minter, draw_nonce(), crate::time::unix_ms_now(), CarriedOperations::encode(&operations))
+    /// Mint an entity: freeze `operations` into a genesis, draw its nonce, its
+    /// timestamp and each operation's salt, and derive the entity id from the
+    /// whole of it. The id is the return value's `entity_id`.
+    pub fn genesis(operations: OperationSet) -> Self {
+        Self::genesis_from_parts(draw_nonce(), crate::time::unix_ms_now(), CarriedOperations::encode(&operations))
     }
 
-    /// The genesis made of `minter`, `nonce`, `timestamp` and `operations`, already carried under
-    /// salts the caller chose, for a tool that rebuilds an entity or publishes one under an id
-    /// fixed in advance.
-    pub fn genesis_from_parts(minter: Identity, nonce: [u8; 32], timestamp: u64, operations: CarriedOperations) -> Self {
-        let entity_id: EntityId = EventId::from_genesis_parts(&minter, &nonce, timestamp, &operations).into();
-        Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { minter, nonce, timestamp, operations } }
+    /// The genesis made of `nonce`, `timestamp` and `operations`, already carried under salts the
+    /// caller chose, for a tool that rebuilds an entity or publishes one under an id fixed in
+    /// advance.
+    pub fn genesis_from_parts(nonce: [u8; 32], timestamp: u64, operations: CarriedOperations) -> Self {
+        let entity_id: EntityId = EventId::from_genesis_parts(&nonce, timestamp, &operations).into();
+        Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { nonce, timestamp, operations } }
     }
 
     /// Mint an update extending `parent`, drawing its nonce, its timestamp and each operation's salt.
@@ -134,14 +131,6 @@ impl Event {
         }
     }
 
-    /// The identity that minted the entity, for a genesis; an update names no minter.
-    pub fn minter(&self) -> Option<Identity> {
-        match &self.body {
-            EventBody::Genesis { minter, .. } => Some(*minter),
-            EventBody::Update { .. } => None,
-        }
-    }
-
     /// One above the greatest parent generation, saturating at `u32::MAX`; genesis is 1.
     pub fn generation(&self) -> u32 {
         if self.is_entity_create() {
@@ -153,9 +142,7 @@ impl Event {
 
     pub fn id(&self) -> EventId {
         match &self.body {
-            EventBody::Genesis { minter, nonce, timestamp, operations } => {
-                EventId::from_genesis_parts(minter, nonce, *timestamp, operations)
-            }
+            EventBody::Genesis { nonce, timestamp, operations } => EventId::from_genesis_parts(nonce, *timestamp, operations),
             EventBody::Update { nonce, timestamp, operations } => {
                 EventId::from_update_parts(&self.entity_id, nonce, *timestamp, operations, &self.parent)
             }
@@ -255,15 +242,11 @@ mod tests {
         OperationSet::from_backends(BTreeMap::from([("lww".to_string(), vec![BackendOperation { diff: vec![1, 2, 3] }])]))
     }
 
-    fn carried() -> CarriedOperations { CarriedOperations::encode(&operations()) }
-
-    fn minter() -> Identity { Identity::Ed25519([9u8; 32]) }
-
     /// An event's id covers each operation's digest and not its bytes, so an
     /// operation whose bytes are replaced by their digest leaves the id unchanged.
     #[test]
     fn erasing_an_operation_leaves_the_event_id_unchanged() {
-        let genesis = Event::genesis(minter(), operations());
+        let genesis = Event::genesis(operations());
         let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), operations());
         for event in [genesis, update] {
             let mut erased = event.clone();
@@ -282,42 +265,15 @@ mod tests {
         // Variant index 2, which no build of `Operation` defines yet.
         let operations = CarriedOperations(vec![CarriedOperation::Bytes { salt: [5; 16], bytes: vec![2, 0, 0, 0, 7] }]);
         let nonce = [6u8; 32];
-        let entity_id = EventId::from_genesis_parts(&minter(), &nonce, 0, &operations).into();
-        let genesis =
-            Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { minter: minter(), nonce, timestamp: 0, operations } };
+        let entity_id = EventId::from_genesis_parts(&nonce, 0, &operations).into();
+        let genesis = Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { nonce, timestamp: 0, operations } };
         genesis.validate_structure().expect("the genesis derives the id it names");
         assert!(genesis.operations().decode().is_err());
     }
 
-    /// The minter is inside the genesis id: the same content minted under two
-    /// identities is two entities, so no relay can re-attribute an entity
-    /// without changing what it is.
-    #[test]
-    fn the_minter_is_inside_the_genesis_id() {
-        let nonce = [4u8; 32];
-        let timestamp = 7u64;
-        let carried = carried();
-        assert_ne!(
-            EventId::from_genesis_parts(&Identity::Ed25519([1u8; 32]), &nonce, timestamp, &carried),
-            EventId::from_genesis_parts(&Identity::Ed25519([2u8; 32]), &nonce, timestamp, &carried)
-        );
-
-        let operations = operations();
-        let event = Event::genesis(minter(), operations.clone());
-        assert_eq!(event.minter(), Some(minter()));
-        let mut reattributed = event.clone();
-        let EventBody::Genesis { minter: named, .. } = &mut reattributed.body else { unreachable!("Event::genesis mints a genesis") };
-        *named = Identity::Ed25519([8u8; 32]);
-        assert!(
-            matches!(reattributed.validate_structure(), Err(EventStructureError::GenesisIdMismatch { .. })),
-            "a genesis whose minter was swapped no longer derives the entity it names"
-        );
-        assert_eq!(Event::update(event.entity_id, Clock::singleton(&event), operations).minter(), None, "an update names no minter");
-    }
-
     #[test]
     fn a_minted_genesis_names_the_entity_its_content_derives() {
-        let event = Event::genesis(minter(), operations());
+        let event = Event::genesis(operations());
         assert!(event.is_entity_create());
         assert!(event.parent.is_empty());
         assert_eq!(EntityId::from(event.id()), event.entity_id);
@@ -325,7 +281,7 @@ mod tests {
 
         // Two create calls draw two nonces: identical payloads are still two
         // distinct entities.
-        let again = Event::genesis(minter(), operations());
+        let again = Event::genesis(operations());
         assert_ne!(event.entity_id, again.entity_id);
         assert_ne!(event.nonce(), again.nonce());
     }
@@ -333,12 +289,12 @@ mod tests {
     #[test]
     fn structural_validation_refuses_contradictory_shapes() {
         // A genesis that claims some other entity's id.
-        let mut genesis = Event::genesis(minter(), operations());
+        let mut genesis = Event::genesis(operations());
         genesis.entity_id = EntityId::from_bytes([0xABu8; 32]);
         assert!(matches!(genesis.validate_structure(), Err(EventStructureError::GenesisIdMismatch { .. })));
 
         // A genesis with a parent clock.
-        let mut genesis = Event::genesis(minter(), operations());
+        let mut genesis = Event::genesis(operations());
         genesis.parent = Clock::genesis(EventId::from_bytes([1u8; 32]));
         assert_eq!(genesis.validate_structure(), Err(EventStructureError::GenesisWithParent));
 
@@ -353,7 +309,7 @@ mod tests {
     /// An event body's first four bytes are its variant index, and every stored and carried event begins with it.
     #[test]
     fn event_body_variant_order_is_pinned() {
-        let genesis = Event::genesis(minter(), operations());
+        let genesis = Event::genesis(operations());
         let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), operations());
         assert_eq!(encode(&genesis.body)[..4], [0, 0, 0, 0], "EventBody::Genesis");
         assert_eq!(encode(&update.body)[..4], [1, 0, 0, 0], "EventBody::Update");
@@ -363,18 +319,18 @@ mod tests {
     /// parts, each operation's salt among them, make the same event, and so the same id.
     #[test]
     fn the_same_parts_make_the_same_genesis_and_update() {
-        let (minter, nonce, timestamp) = (Identity::Ed25519([0x11; 32]), [0x22; 32], 1_720_000_000_000);
+        let (nonce, timestamp) = ([0x22; 32], 1_720_000_000_000);
         let membership = |salt| {
             let operation = Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)));
             CarriedOperations(vec![CarriedOperation::encode_with_salt(&operation, salt)])
         };
         let salt = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        let genesis = Event::genesis_from_parts(minter, nonce, timestamp, membership(salt));
-        assert_eq!(genesis, Event::genesis_from_parts(minter, nonce, timestamp, membership(salt)));
-        assert_eq!(hex::encode(genesis.id().as_bytes()), "6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821");
+        let genesis = Event::genesis_from_parts(nonce, timestamp, membership(salt));
+        assert_eq!(genesis, Event::genesis_from_parts(nonce, timestamp, membership(salt)));
+        assert_eq!(hex::encode(genesis.id().as_bytes()), "847e97d2ea2977d148a604d1b5f309be86e9209a0a9ef386ea3b80eb37c7a5ca");
         genesis.validate_structure().expect("a genesis built from its parts names the entity its content derives");
-        assert_ne!(Event::genesis_from_parts(minter, [0x23; 32], timestamp, membership(salt)).id(), genesis.id(), "another nonce");
-        assert_ne!(Event::genesis_from_parts(minter, nonce, timestamp, membership([0x23; 16])).id(), genesis.id(), "another salt");
+        assert_ne!(Event::genesis_from_parts([0x23; 32], timestamp, membership(salt)).id(), genesis.id(), "another nonce");
+        assert_ne!(Event::genesis_from_parts(nonce, timestamp, membership([0x23; 16])).id(), genesis.id(), "another salt");
 
         let (entity_id, parent) = (EntityId::from_bytes([0x33; 32]), Clock::new(vec![(1, EventId::from_bytes([0x44; 32]))]).unwrap());
         let update = Event::update_from_parts(entity_id, parent.clone(), nonce, timestamp, membership(salt));
@@ -390,7 +346,7 @@ mod tests {
 
     #[test]
     fn a_genesis_is_generation_one() {
-        let genesis = Event::genesis(minter(), operations());
+        let genesis = Event::genesis(operations());
         assert_eq!(genesis.generation(), 1);
     }
 

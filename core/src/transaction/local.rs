@@ -60,11 +60,11 @@ impl Transaction {
         &self.entities[index]
     }
 
-    /// Mint an entity under this node's identity after registering its model in the current catalog epoch.
+    /// Create an entity after registering its model in the current catalog epoch.
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let (model_id, epoch) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
 
-        let entity = LocalTrxEntity::new(self.dyncontext.node_id().identity(), epoch, self.alive.clone());
+        let entity = LocalTrxEntity::new(epoch, self.alive.clone());
         model.initialize_new_entity(&entity, model_id, epoch)?;
         self.dyncontext.check_write(&entity.read())?;
 

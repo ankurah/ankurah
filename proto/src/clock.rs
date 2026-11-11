@@ -141,7 +141,7 @@ impl std::fmt::Display for Clock {
 mod tests {
     use super::*;
     use crate::encoding::{decode_exact, encode};
-    use crate::{Identity, OperationSet};
+    use crate::OperationSet;
 
     fn id(b: u8) -> EventId { EventId::from_bytes([b; 32]) }
 
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn event_constructors_preserve_generations() {
-        let a = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+        let a = Event::genesis(OperationSet::default());
         let b = Event::update(a.entity_id, Clock::singleton(&a), OperationSet::default());
         let c = Event::update(a.entity_id, Clock::singleton(&b), OperationSet::default());
         let d = Event::update(a.entity_id, Clock::singleton(&a), OperationSet::default());

@@ -84,10 +84,8 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
     // Overwrite the derived id with the existing entity's, so the event's own
     // content no longer derives the id it names.
     let album_model = server.catalog.model_id_for("album")?.expect("Album registered by the create above");
-    let mut fake_create = proto::Event::genesis(
-        server.identity(),
-        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(album_model))]),
-    );
+    let mut fake_create =
+        proto::Event::genesis(proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(album_model))]));
     fake_create.entity_id = existing_id;
 
     let resp = client

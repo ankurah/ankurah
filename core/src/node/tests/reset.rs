@@ -89,8 +89,7 @@ async fn a_commit_reaching_storage_after_a_reset_is_refused() {
         let (release, release_rx) = oneshot::channel();
         *storage.hold_set_state.lock().unwrap() = Some((entered, release_rx));
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]));
-        let genesis =
-            proto::Event::genesis(node.identity(), proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]));
+        let genesis = proto::Event::genesis(proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]));
         let commit = tokio::spawn({
             let node = node.clone();
             async move {
@@ -121,10 +120,7 @@ async fn an_event_fetched_from_a_peer_after_a_reset_is_not_stored() {
     let (sent, messages) = mpsc::channel();
     let registration = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await.unwrap();
     let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]));
-    let event = proto::Event::genesis(
-        key.node_id().identity(),
-        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
-    );
+    let event = proto::Event::genesis(proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]));
 
     let getter = CachedEventGetter::new(&node, &DEFAULT_CONTEXT);
     let id = event.id();

@@ -9,7 +9,7 @@ use crate::{
     value::Value,
 };
 use proto::{
-    Clock, EntityId, Event, EventId, EventStructureError, Identity, Membership, ModelId, NodeId, Operation, OperationSet, PropertyId, State,
+    Clock, EntityId, Event, EventId, EventStructureError, Membership, ModelId, NodeId, Operation, OperationSet, PropertyId, State,
 };
 use std::sync::{mpsc, Arc};
 
@@ -39,10 +39,7 @@ impl Fixture {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new(storage.clone(), PermissiveAgent::new());
         let events = LocalEventGetter::new(storage.clone(), false);
-        let genesis = Event::genesis(
-            Identity::Ed25519([4; 32]),
-            OperationSet(vec![Operation::Membership(Membership::Add(model_a())), value_operation("initial")?]),
-        );
+        let genesis = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(model_a())), value_operation("initial")?]));
         events.stage_event(genesis.clone());
         let (entity, _) =
             NodeApplier::apply_and_commit_events(&node, &[Attested::opt(genesis.clone(), None)], &AdmittedOperations::new(), &events)
@@ -580,7 +577,7 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
 async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyhow::Result<()> {
     for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
         let fixture = Fixture::new().await?;
-        let foreign = Event::genesis(Identity::Ed25519([1; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
+        let foreign = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
         cache(&fixture.storage, &[&foreign]).await?;
         let valid = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("valid")?]));
         let disjoint = Event::update(fixture.entity.id(), Clock::singleton(&foreign), OperationSet::default());
@@ -797,7 +794,7 @@ async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_
 async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_payload() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    let genesis = Event::genesis(Identity::Ed25519([4; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
+    let genesis = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
     let over = |parent: &Event| Event::update(genesis.entity_id, Clock::singleton(parent), OperationSet::default());
     let mut newer = genesis.clone();
     let mut newer_history = Vec::new();
@@ -931,7 +928,7 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
 async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    let genesis = Event::genesis(Identity::Ed25519([4; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
+    let genesis = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
     let over = |parent: &Event, parent_generation| {
         Event::update(genesis.entity_id, Clock::new(vec![(parent_generation, parent.id())]).unwrap(), OperationSet::default())
     };
@@ -976,7 +973,7 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
     for reader_loads_snapshot in [false, true] {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new(storage.clone(), PermissiveAgent::new());
-        let genesis = Event::genesis(Identity::Ed25519([4; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
+        let genesis = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
         let over = |parent: &Event, parent_generation| {
             Event::update(genesis.entity_id, Clock::new(vec![(parent_generation, parent.id())]).unwrap(), OperationSet::default())
         };

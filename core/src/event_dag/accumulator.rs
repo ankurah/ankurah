@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn dag_metadata_survives_payload_eviction() {
-        let genesis = Event::genesis(ankurah_proto::Identity::Ed25519([1; 32]), Default::default());
+        let genesis = Event::genesis(Default::default());
         let child = Event::update(genesis.entity_id, Clock::singleton(&genesis), Default::default());
         let mut accumulator = EventAccumulator::new(NoReads);
         accumulator.cache.resize(NonZeroUsize::new(1).unwrap());

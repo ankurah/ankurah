@@ -342,11 +342,7 @@ mod tests {
         let property = proto::EntityId::from_bytes([2; 32]);
         let path = PropertyPath::registered(property, "data", vec!["nested".into(), "key".into()]);
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([3; 32]));
-        let pending = LocalTrxEntity::new(
-            proto::Identity::Ed25519([1; 32]),
-            CatalogEpoch::allocate(),
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        );
+        let pending = LocalTrxEntity::new(CatalogEpoch::allocate(), Arc::new(std::sync::atomic::AtomicBool::new(true)));
         pending.add_membership(model)?;
         let backend = pending.get_backend::<LWWBackend>()?;
         let entity = pending.read();

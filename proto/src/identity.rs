@@ -4,8 +4,8 @@ use std::{fmt, str::FromStr};
 
 use crate::DecodeError;
 
-/// A public verifying key, of the signature scheme its variant names: who minted a genesis, or
-/// signed a presence or an attestation. specs/protocol/bytes.md section 3.1 gives its encoding.
+/// A public verifying key, of the signature scheme its variant names: who signed a presence or
+/// an attestation. specs/protocol/bytes.md section 3.1 gives its encoding.
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 pub enum Identity {
     /// An ed25519 verifying key in its 32-byte compressed encoding.
@@ -229,9 +229,10 @@ mod tests {
 
     fn identity_of(key: &ed25519_dalek::SigningKey) -> Identity { Identity::Ed25519(key.verifying_key().to_bytes()) }
 
-    /// Every genesis hashes its minter's binary encoding, so the variant index
-    /// and the byte layout are pinned here: a change fails this test rather
-    /// than silently re-deriving every entity id.
+    /// Every presence and every statement's attester carries an identity's
+    /// binary encoding inside the bytes it signs, so the variant index and the
+    /// byte layout are pinned here: a change fails this test rather than
+    /// silently changing what those signatures cover.
     #[test]
     fn identity_encodings_are_pinned() {
         let identity = Identity::Ed25519([7; 32]);

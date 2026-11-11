@@ -111,11 +111,10 @@ It does **not** buy (each on a named gap or agent responsibility):
 
 - **Authorization**: the hash says nothing about whether an author was allowed;
   that needs policy layered above the DAG (Finding 6; 274-B; OrbitDB `canAppend`).
-  Attribution is partly structural, though not by the hash alone: a genesis hashes
-  its minter's `Identity` into the entity id. Who committed or admitted an update is
-  a signed fact only when the application's policy agent has the node attest it
-  (`proto/src/attestation.rs`); core checks no attestation, and an agent unseals the ones it
-  cares about (C4-20).
+  Attribution is not structural: no entity or event id names a key. Who created an
+  entity, or committed or admitted an update, is a signed fact only when the
+  application's policy agent has the node attest it (`proto/src/attestation.rs`); core
+  checks no attestation, and an agent unseals the ones it cares about (C4-20).
 - **Equivocation resistance / DoS bound**: every forged concurrent event is a
   distinct genuine hash, so de-dup stops identical replays but not flooding of
   distinct ones; unsigned hash-DAG CRDTs permit unbounded distinct valid
@@ -186,9 +185,9 @@ arm** (the C4 part-2 test that pins it), and **Status** (enforced | open gap (ow
 **C4-01. Event identity is a verifiable content hash.**
 Invariant: an update's id equals `SHA-256(tag(update) || entity_id || nonce ||
 timestamp || count || digest_1 .. digest_n || parent)` and a genesis's id equals
-`SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 ..
-digest_n)`, where each digest is `SHA-256(tag(operation) || salt || the
-operation's bytes)` (byte for byte in specs/protocol/bytes.md section 4);
+`SHA-256(tag(genesis) || nonce || timestamp || count || digest_1 .. digest_n)`,
+where each digest is `SHA-256(tag(operation) || salt || the operation's bytes)`
+(byte for byte in specs/protocol/bytes.md section 4);
 recomputed from contents on every use, never read from the wire; a peer cannot
 present an event under an id its contents do not hash to.
 Trust tier: Byzantine-safe.
@@ -575,9 +574,9 @@ Status: **enforced.** Nil impact under PermissiveAgent.
 
 **C4-20. Authorship is attested when policy asks; authorization is not structural.**
 Invariant: the DAG proves *what* an event contains and *that* it happened-before its
-named ancestors; it does not prove *who* committed it or *whether they were allowed*. A
-genesis names its minter inside its id; any other fact about who committed, admitted
-or served something is a statement a node signs when its policy agent requests one.
+named ancestors; it does not prove *who* committed it or *whether they were allowed*. No
+id names who created an entity; that fact, like who committed, admitted or served
+something, is a statement a node signs when its policy agent requests one.
 Trust tier: attestation-dependent by construction.
 Enforcing seam: `proto/src/attestation.rs` defines the sealed attestation: a `Statement`
 (attester `Identity`, subject naming the event or the state, kind, payload) carried as

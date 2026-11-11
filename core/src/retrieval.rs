@@ -271,10 +271,9 @@ mod tests {
         let mut nonce = [0u8; 32];
         nonce[0] = seed;
 
-        let minter = ankurah_proto::Identity::Ed25519([seed; 32]);
         let operations = CarriedOperations::encode(&OperationSet::default());
-        let entity_id = EntityId::from(EventId::from_genesis_parts(&minter, &nonce, 0, &operations));
-        let body = ankurah_proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations };
+        let entity_id = EntityId::from(EventId::from_genesis_parts(&nonce, 0, &operations));
+        let body = ankurah_proto::EventBody::Genesis { nonce, timestamp: 0, operations };
         Event { entity_id, body, parent: Clock::default() }
     }
 
@@ -390,7 +389,7 @@ mod tests {
         let membership = ankurah_proto::Operation::Membership(ankurah_proto::Membership::Add(ankurah_proto::ModelId::EntityId(
             EntityId::from_bytes([6; 32]),
         )));
-        let readable = Event::genesis(ankurah_proto::Identity::Ed25519([6; 32]), OperationSet(vec![membership]));
+        let readable = Event::genesis(OperationSet(vec![membership]));
         let mut erased = readable.clone();
         let ankurah_proto::EventBody::Genesis { operations, .. } = &mut erased.body else { unreachable!("a genesis") };
         operations.0[0] = ankurah_proto::CarriedOperation::Erased(operations.0[0].digest());

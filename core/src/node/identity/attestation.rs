@@ -31,10 +31,8 @@ mod tests {
     use crate::test_utils::TestStorage;
     use crate::util::Iterable;
     use ankql::ast::{Predicate, Resolved};
-    use proto::{Clock, EntityId, Identity, OperationSet, State};
+    use proto::{Clock, EntityId, OperationSet, State};
     use std::sync::Arc;
-
-    fn genesis(minter: u8) -> Event { Event::genesis(Identity::Ed25519([minter; 32]), OperationSet::default()) }
 
     /// The statement kind and payload `StateAttester` asks for.
     fn kind() -> EntityId { EntityId::from_bytes([9; 32]) }
@@ -119,7 +117,7 @@ mod tests {
     /// own key; an ephemeral node serves the state with none.
     #[tokio::test]
     async fn a_durable_node_serves_a_state_with_the_statement_its_agent_requests_and_an_ephemeral_node_with_none() {
-        let event = genesis(2);
+        let event = Event::genesis(OperationSet::default());
         let state = EntityState { entity_id: event.entity_id, state: State { head: Clock::singleton(&event), ..State::default() } };
 
         let durable = Node::new_durable(Arc::new(TestStorage::default()), StateAttester);
@@ -137,7 +135,7 @@ mod tests {
     /// `PermissiveAgent` requests no attestation, so neither a durable nor an ephemeral node signs the states it serves.
     #[tokio::test]
     async fn a_state_served_under_an_agent_that_requests_nothing_carries_no_attestation() {
-        let event = genesis(1);
+        let event = Event::genesis(OperationSet::default());
         let state = EntityState { entity_id: event.entity_id, state: State { head: Clock::singleton(&event), ..State::default() } };
 
         let durable = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());

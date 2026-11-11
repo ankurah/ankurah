@@ -9,8 +9,7 @@
 //!
 //! Nodes are addressed by a stable logical index (0, 1, 2, ...) assigned at
 //! construction. Scheduling, faults, and the trace key on that index. Each
-//! node's key, and so its id and every identity it mints under, derives from
-//! the simulation seed and that index.
+//! node's key, and so its id, derives from the simulation seed and that index.
 
 use ankurah::core::node::{ConnectionRegistration, NodeKey};
 use ankurah::core::test_helpers::commit_transaction;

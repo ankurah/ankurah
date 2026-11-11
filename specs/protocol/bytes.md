@@ -221,13 +221,13 @@ the 32 bytes it carries.
 ### 4.2 Genesis id
 
 ```text
-genesis id = SHA-256( tag(genesis) || minter || nonce || timestamp || count || digest_1 || ... || digest_n )
+genesis id = SHA-256( tag(genesis) || nonce || timestamp || count || digest_1 || ... || digest_n )
 ```
 
-`minter` is an `Identity`, `nonce` 32 bytes, `timestamp` a `u64` (unix
-milliseconds, advisory), `count` the number of operations as a `u64`, and
-`digest_i` the digest of the i-th operation in the order the event carries
-them. An entity's id is the id of its genesis.
+`nonce` is 32 bytes, `timestamp` a `u64` (unix milliseconds, advisory),
+`count` the number of operations as a `u64`, and `digest_i` the digest of the
+i-th operation in the order the event carries them. An entity's id is the id
+of its genesis.
 
 ### 4.3 Update id
 
@@ -309,18 +309,18 @@ The membership operation carried under that salt:
 1000000000000000 01000000000000000100000000000000
 ```
 
-Event ids, with minter `Ed25519([0x11; 32])`, nonce `[0x22; 32]`, timestamp
-`1720000000000`, and for the update the entity id `[0x33; 32]` and the parent
-clock with one entry, generation 1 and event id `[0x44; 32]`. "Membership" and
-"backend" are the operations above, carried under that salt; "erased
-membership" is the membership operation carried as `Erased` with its digest.
+Event ids, with nonce `[0x22; 32]`, timestamp `1720000000000`, and for the
+update the entity id `[0x33; 32]` and the parent clock with one entry,
+generation 1 and event id `[0x44; 32]`. "Membership" and "backend" are the
+operations above, carried under that salt; "erased membership" is the
+membership operation carried as `Erased` with its digest.
 
 | Operations | Genesis id | Update id |
 |---|---|---|
-| none | `133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649` | `036ff81f4ba2285f3ccd38e0ad3232855a466bb6c0b9d6f0fd254a202180364e` |
-| membership | `6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821` | `760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f` |
-| membership, backend | `9fcc73ceeb855f5a66085b2c5efa3fb367cb6c078e55da1c89d9aae6e5fc4b83` | `f6068afad6389a9d0c6ee253f24965dd9f9a481fa0648a1a08007c171d24ac72` |
-| erased membership | `6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821` | `760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f` |
+| none | `7142250172e85b3d6ea61e537ad3980c29e3f2ac3854f8c0f5d788124e3141ac` | `036ff81f4ba2285f3ccd38e0ad3232855a466bb6c0b9d6f0fd254a202180364e` |
+| membership | `847e97d2ea2977d148a604d1b5f309be86e9209a0a9ef386ea3b80eb37c7a5ca` | `760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f` |
+| membership, backend | `333012998d0558ffb741500c36420083fcf3a41b4a0f51c1c8629cd554bcc640` | `f6068afad6389a9d0c6ee253f24965dd9f9a481fa0648a1a08007c171d24ac72` |
+| erased membership | `847e97d2ea2977d148a604d1b5f309be86e9209a0a9ef386ea3b80eb37c7a5ca` | `760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f` |
 
 State digest of the entity `[0x55; 32]` whose state buffers map `"lww"` to
 `010203` and `"yrs"` to `0405`, whose memberships are `{ EntityId([0x77; 32]),

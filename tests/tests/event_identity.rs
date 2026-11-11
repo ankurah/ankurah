@@ -187,16 +187,13 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
     let stored_genesis = entity_events(&server, id).await?.into_iter().find(|e| e.is_entity_create()).expect("the peer stored it");
     assert_eq!(stored_genesis.id(), relayed_genesis.id(), "the peer stored the relayed genesis rather than deriving its own");
     assert_eq!(stored_genesis.nonce(), relayed_genesis.nonce(), "same nonce: the mint happened once, at create()");
-    assert_eq!(stored_genesis.minter(), Some(client.identity()), "the peer keeps the client as the entity's minter");
     Ok(())
 }
 
-/// Minting needs nothing but the node's key: a node that has never connected
-/// to any peer creates an entity, and the genesis names that node as its
-/// minter. The minter is inside the genesis id, so the id a caller holds
-/// commits to the node that created the entity.
+/// Creating an entity needs nothing from any peer: a node that has never
+/// connected to one creates an entity whose id derives from its genesis.
 #[tokio::test]
-async fn a_node_that_has_never_connected_mints_under_its_own_identity() -> Result<()> {
+async fn a_node_that_has_never_connected_creates_an_entity() -> Result<()> {
     let node = durable_node().await?;
     let ctx = node.context_async(c).await?;
     assert!(node.get_durable_peers().is_empty(), "this node has never connected");
@@ -206,7 +203,6 @@ async fn a_node_that_has_never_connected_mints_under_its_own_identity() -> Resul
     trx.commit().await?;
 
     let genesis = entity_events(&node, id).await?.into_iter().find(|e| e.is_entity_create()).expect("genesis");
-    assert_eq!(genesis.minter(), Some(node.identity()), "the genesis names the node whose transaction minted it");
-    assert_eq!(proto::EntityId::from(genesis.id()), id, "and its id derives from that minter with the rest of its content");
+    assert_eq!(proto::EntityId::from(genesis.id()), id, "the entity's id derives from its genesis");
     Ok(())
 }

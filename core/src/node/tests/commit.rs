@@ -15,9 +15,7 @@ use crate::{
     value::Value,
 };
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{
-    self as proto, Attested, EntityId, EntityState, Event, Identity, Membership, ModelId, Operation, OperationSet, PropertyId,
-};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState, Event, Membership, ModelId, Operation, OperationSet, PropertyId};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -117,7 +115,7 @@ async fn local_creation_commits_after_its_events_arrive_remotely() -> anyhow::Re
 
     for echoed in [1, 2] {
         let trx = context.begin();
-        let entity = trx.add_entity(LocalTrxEntity::new(node.identity(), node.entities.catalog_epoch(), trx.alive.clone()));
+        let entity = trx.add_entity(LocalTrxEntity::new(node.entities.catalog_epoch(), trx.alive.clone()));
         entity.add_membership(a)?;
         let id = entity.id();
         entity.add_membership(b)?;
@@ -141,12 +139,9 @@ async fn failed_add_event_poisons_the_transaction_even_if_the_error_is_caught() 
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
     node.wait_ready().await?;
     let policy = crate::policy::ContextPolicy::from_credentials(&node.policy_agent, &DEFAULT_CONTEXT);
-    let valid: Attested<Event> = Event::genesis(
-        node.identity(),
-        OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))))]),
-    )
-    .into();
-    let invalid: Attested<Event> = Event::genesis(node.identity(), OperationSet::default()).into();
+    let valid: Attested<Event> =
+        Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))))])).into();
+    let invalid: Attested<Event> = Event::genesis(OperationSet::default()).into();
     let mut trx = crate::transaction::remote::RemoteTransaction::new(&node, &policy);
     trx.add_event(&valid).await?;
     let id = valid.payload.entity_id;
@@ -165,7 +160,7 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     let storage = Arc::new(TestStorage::default());
     let getter = LocalEventGetter::new(storage.clone(), false);
     let property = PropertyId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet(vec![set(property, "Alice")?]));
+    let genesis = Event::genesis(OperationSet(vec![set(property, "Alice")?]));
 
     let entities = crate::entity::WeakEntitySet::new(crate::schema::CatalogEpoch::allocate());
     let fork = RemoteTrxEntity::new(&genesis, entities.catalog_epoch())?;
@@ -223,10 +218,10 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     let node = Node::new_durable(storage.clone(), agent.clone());
     node.wait_ready().await?;
     let events = LocalEventGetter::new(storage.clone(), false);
-    let genesis = Event::genesis(
-        Identity::Ed25519([3; 32]),
-        OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([4; 32])))), set(owner, "Alice")?]),
-    );
+    let genesis = Event::genesis(OperationSet(vec![
+        Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([4; 32])))),
+        set(owner, "Alice")?,
+    ]));
     events.stage_event(genesis.clone());
     let candidate = RemoteTrxEntity::new(&genesis, node.entities.catalog_epoch())?;
     candidate
@@ -282,7 +277,7 @@ async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_requi
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
     node.wait_ready().await?;
     let model = ModelId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis = Event::genesis(node.identity(), OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+    let genesis = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(model))]));
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into()]).await?;
     let update = |parent: &Event, claimed| {
         Event::update(genesis.entity_id, proto::Clock::new(vec![(claimed, parent.id())]).unwrap(), OperationSet::default())
@@ -318,7 +313,7 @@ async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> any
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
     node.wait_ready().await?;
     let model = ModelId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis = Event::genesis(node.identity(), OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+    let genesis = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(model))]));
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into()]).await?;
     let unheld = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet::default());
     let child = Event::update(genesis.entity_id, proto::Clock::singleton(&unheld), OperationSet::default());
@@ -346,7 +341,7 @@ async fn a_durable_node_refuses_a_remote_commit_holding_an_operation_it_cannot_r
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
     node.wait_ready().await?;
     let membership = Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))));
-    let genesis = Event::genesis(node.identity(), OperationSet(vec![membership.clone()]));
+    let genesis = Event::genesis(OperationSet(vec![membership.clone()]));
     let committed = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![membership]));
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into(), committed.clone().into()])
         .await?;

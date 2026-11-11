@@ -3,8 +3,7 @@ use ankurah_core::{
     storage::{StorageEngine, StorageTransaction},
 };
 use ankurah_proto::{
-    AttestationSet, Attested, EntityId, Event, Identity, Membership, ModelId, Operation, OperationSet, SealedAttestation, Subject,
-    SystemModel,
+    AttestationSet, Attested, EntityId, Event, Membership, ModelId, Operation, OperationSet, SealedAttestation, Subject, SystemModel,
 };
 
 /// Attestations about `subject`: bytes that do not parse, no bytes at all, and a genuine
@@ -18,10 +17,7 @@ fn attestations(subject: Subject) -> AttestationSet {
 /// read path returns the event, each operation's salt and bytes and each of its attestations
 /// exactly as they were stored.
 pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
-    let genesis = Event::genesis(
-        Identity::Ed25519([1; 32]),
-        OperationSet(vec![Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))]),
-    );
+    let genesis = Event::genesis(OperationSet(vec![Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))]));
     let event = Attested { attestations: attestations(Subject::event(&genesis)), payload: genesis };
     let mut transaction = engine.transaction();
     transaction.add_events(std::slice::from_ref(&event)).await?;

@@ -1,12 +1,11 @@
 # Node Identity, Peer Trust and Attestation
 
 Every node has a key that other nodes verify. That key is how a node proves
-who it is when it connects, how the entities it creates name their minter,
-and how a statement an application has a node make about an event or a state,
-such as "I committed this event" or "I held this state", stays checkable after
-the connection that carried it is gone. Core records keys and nothing about
-what a key denotes: an application, a tenant or an owner is a component the
-application declares.
+who it is when it connects, and how a statement an application has a node
+make about an event or a state, such as "I committed this event" or "I held
+this state", stays checkable after the connection that carried it is gone.
+Core records keys and nothing about what a key denotes: an application, a
+tenant or an owner is a component the application declares.
 
 ## Identities and Node Keys
 
@@ -110,14 +109,14 @@ sent, that the peer's current connection is trusted as durable; a request that
 fails the check is refused, so neither its credentials nor its reply cross the
 new connection.
 
-## Who Minted an Entity
+## Event Ids
 
-A genesis names the `Identity` that minted it, and the minter is inside the
-entity's id:
+An entity's id is the id of its genesis, and every event's id is a hash of the
+event's own content:
 
 ```text
 operation digest = SHA-256(tag(operation) || salt || the operation's bytes)
-genesis id = SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n)
+genesis id = SHA-256(tag(genesis) || nonce || timestamp || count || digest_1 .. digest_n)
 update id  = SHA-256(tag(update) || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent)
 ```
 
@@ -134,12 +133,15 @@ that a string made for one purpose can never be read as another's. The
 repository's `specs/protocol/bytes.md` writes out every such string, and the
 encoding of each value inside it, byte by byte, with test vectors.
 
-`Transaction::create` mints under the node's own identity, so creating an
-entity needs nothing but the node's key: a node that has never connected to
-anyone can mint. Because the minter is hashed into the id, no relay can drop
-or re-attribute it; the same content minted under another identity is a
-different entity. An update names no minter; an application that wants to
-record who committed an update has the committing node attest it.
+## Who Created an Entity
+
+Core records no creator: a genesis holds a nonce, a timestamp and its
+operations, and no id names a key. Creating an entity needs nothing from any
+peer, so a node that has never connected to anyone can create one. An
+application that wants to record who created an entity sets a component in the
+creating event, which the entity's id covers through that operation's digest,
+and proves it with an [attestation](#attestations) by the creator's key; who
+committed a later update is attested the same way.
 
 ## Attestations
 

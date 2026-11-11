@@ -73,14 +73,10 @@ pub fn commit_backend<B: crate::property::backend::PropertyBackend>(backend: &B,
         )])),
         [seed; 16],
     );
-    let minter = proto::Identity::Ed25519([seed; 32]);
     let nonce = [seed; 32];
-    let entity_id = proto::EventId::from_genesis_parts(&minter, &nonce, 0, &operations).into();
-    let event = proto::Event {
-        entity_id,
-        parent: proto::Clock::default(),
-        body: proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations },
-    };
+    let entity_id = proto::EventId::from_genesis_parts(&nonce, 0, &operations).into();
+    let event =
+        proto::Event { entity_id, parent: proto::Clock::default(), body: proto::EventBody::Genesis { nonce, timestamp: 0, operations } };
     apply_backend_event(backend, &event)?;
     Ok(event)
 }

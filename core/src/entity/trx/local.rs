@@ -10,7 +10,7 @@ use crate::{
     property::{backend::PropertyBackend, PropertyError},
     schema::CatalogEpoch,
 };
-use ankurah_proto::{Attested, Clock, EntityId, Event, Identity, Membership, ModelId, Operation, OperationSet, State};
+use ankurah_proto::{Attested, Clock, EntityId, Event, Membership, ModelId, Operation, OperationSet, State};
 use std::{
     collections::BTreeSet,
     sync::{
@@ -38,8 +38,6 @@ enum Origin {
     Pending {
         /// First id demand or commit preparation freezes the genesis that determines identity.
         genesis: OnceLock<Event>,
-        /// The identity the genesis is minted under.
-        minter: Identity,
     },
     Mut {
         upstream: Arc<EntityInner>,
@@ -47,9 +45,9 @@ enum Origin {
 }
 
 impl LocalTrxEntity {
-    pub(crate) fn new(minter: Identity, epoch: CatalogEpoch, alive: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(epoch: CatalogEpoch, alive: Arc<AtomicBool>) -> Self {
         Self(Arc::new(LocalTrxEntityInner {
-            origin: Origin::Pending { genesis: OnceLock::new(), minter },
+            origin: Origin::Pending { genesis: OnceLock::new() },
             data: TrxEntityData::new(EntityState::empty(), epoch),
             alive,
             staged_memberships: Mutex::default(),
@@ -145,11 +143,11 @@ impl LocalTrxEntityInner {
     pub(in crate::entity) fn id(&self) -> EntityId {
         match &self.origin {
             Origin::Mut { upstream } => upstream.id,
-            Origin::Pending { genesis, minter } => {
+            Origin::Pending { genesis } => {
                 genesis
                     .get_or_init(|| {
                         // Cannot fail: Yrs encoding has no error path, and LWW's bincode encoding of `Value`s cannot fail.
-                        let event = Event::genesis(*minter, self.take_operations().unwrap());
+                        let event = Event::genesis(self.take_operations().unwrap());
                         self.data.state.set_head(Clock::singleton(&event));
                         self.data.events.lock().unwrap().push(event.clone().into());
                         event

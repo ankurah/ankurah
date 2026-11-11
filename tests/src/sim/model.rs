@@ -156,21 +156,21 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]))
 }
 
-/// Forge an entity's genesis event minted under `minter`, deriving its entity
-/// id from the event's own content exactly as the production mint does.
+/// Forge an entity's genesis event, deriving its entity id from the event's
+/// own content exactly as the production mint does.
 /// `counter` is the caller's mint sequence number, which distinguishes two
 /// entities that would otherwise be created with identical content;
 /// `field`/`value` seed the initial state.
-pub fn genesis_event(minter: proto::Identity, counter: u64, field: Field, value: &str) -> proto::Event {
+pub fn genesis_event(counter: u64, field: Field, value: &str) -> proto::Event {
     let mut operations = lww_ops(field, value);
     operations.push(proto::Operation::Membership(proto::Membership::Add(ankurah::ModelId::EntityId(sim_model_id()))));
     let nonce = content_nonce(counter, &[field.name().as_bytes(), value.as_bytes()]);
     let operations = carried(&operations, &nonce);
-    let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&minter, &nonce, SIM_TIMESTAMP, &operations).into();
+    let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&nonce, SIM_TIMESTAMP, &operations).into();
     proto::Event {
         entity_id,
         parent: proto::Clock::default(),
-        body: proto::EventBody::Genesis { minter, nonce, timestamp: SIM_TIMESTAMP, operations },
+        body: proto::EventBody::Genesis { nonce, timestamp: SIM_TIMESTAMP, operations },
     }
 }
 

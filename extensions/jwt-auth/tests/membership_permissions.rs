@@ -70,10 +70,7 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
         Ok(proto::Operation::Backend { backend: "lww".into(), operations: backend.to_operations()?.unwrap() })
     };
     let create = |value: &str| -> anyhow::Result<proto::Event> {
-        Ok(proto::Event::genesis(
-            node.identity(),
-            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model)), set_owner(value)?]),
-        ))
+        Ok(proto::Event::genesis(proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model)), set_owner(value)?])))
     };
     let genesis = create("alice")?;
     let remote_id = genesis.entity_id;

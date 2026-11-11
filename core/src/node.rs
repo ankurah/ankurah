@@ -298,7 +298,7 @@ where
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
 
-    /// The identity this node mints and signs under.
+    /// The identity this node signs under.
     pub fn identity(&self) -> proto::Identity { self.id.identity() }
 
     /// Begin this node's side of one new connection's handshake, reached as `provenance` says.

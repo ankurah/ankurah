@@ -47,7 +47,7 @@ impl AdmittedOperations {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_proto::{CarriedOperation, Clock, EntityId, Event, EventBody, Identity, Membership, Operation};
+    use ankurah_proto::{CarriedOperation, Clock, EntityId, Event, EventBody, Membership, Operation};
 
     fn membership() -> OperationSet {
         OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))))])
@@ -66,11 +66,10 @@ mod tests {
 
     #[test]
     fn a_genesis_without_a_membership_is_inadmissible_and_an_update_without_one_is_admitted() {
-        let minter = Identity::Ed25519([3; 32]);
-        let refused = AdmittedOperations::new().admit(&Event::genesis(minter, OperationSet::default()));
+        let refused = AdmittedOperations::new().admit(&Event::genesis(OperationSet::default()));
         assert!(matches!(refused, Err(MutationError::InadmissibleEvent(InadmissibleEvent::MissingGenesisMembership))), "{refused:?}");
 
-        let genesis = Event::genesis(minter, membership());
+        let genesis = Event::genesis(membership());
         let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
         let mut admitted = AdmittedOperations::new();
         admitted.admit(&genesis).unwrap();
@@ -80,7 +79,7 @@ mod tests {
 
     #[test]
     fn an_event_holding_an_erased_operation_or_one_of_an_unknown_kind_is_unreadable() {
-        let genesis = Event::genesis(Identity::Ed25519([4; 32]), membership());
+        let genesis = Event::genesis(membership());
         let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), membership());
         // Variant index 2, which no build of `Operation` defines yet.
         let unknown = CarriedOperation::Bytes { salt: [6; 16], bytes: vec![2, 0, 0, 0] };

@@ -14,14 +14,14 @@ use std::sync::Arc;
 
 /// The `project` property Task and Assignment share. An explicit id must name a property the catalog
 /// already holds, so each node is started on storage where a forged Task catalog minted it.
-pub const PROJECT: &str = "npANjuTyQqf09e8OUrVTKTOHMUS5Wy-nXuxJ-T2gU1Y";
+pub const PROJECT: &str = "dp5dInKrJI0D2di4EFO6I_TXxccBxv0HnyrftWSFRV8";
 
 #[derive(Model, Debug, Clone)]
 pub struct Task {
     pub status: String,
     pub title: String,
     #[active_type(LWW)]
-    #[property(id = "npANjuTyQqf09e8OUrVTKTOHMUS5Wy-nXuxJ-T2gU1Y")]
+    #[property(id = "dp5dInKrJI0D2di4EFO6I_TXxccBxv0HnyrftWSFRV8")]
     pub project: String,
     /// The same name as `Assignment::note`, but a different property.
     pub note: String,
@@ -31,7 +31,7 @@ pub struct Task {
 pub struct Assignment {
     pub assignee: String,
     #[active_type(LWW)]
-    #[property(id = "npANjuTyQqf09e8OUrVTKTOHMUS5Wy-nXuxJ-T2gU1Y")]
+    #[property(id = "dp5dInKrJI0D2di4EFO6I_TXxccBxv0HnyrftWSFRV8")]
     pub project: String,
     pub note: String,
 }

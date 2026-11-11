@@ -19,10 +19,9 @@ Every choice below is checked against all eight together.
    claims.** Every node has a key that others verify. Durable standing and the relay of
    commits follow from how a peer was reached and what policy allows, not from a flag.
 4. **Facts about where data came from can outlive the connection that carried them.** Who
-   committed an event, which durable node admitted it or served a state: an application that
-   wants these has a node sign them with its key, and anyone can check them later. The minter
-   sits inside the entity's id so no relay can drop or re-attribute it; whether that claim
-   must be proven by a signature is the application's choice.
+   created an entity, who committed an event, which durable node admitted it or served a state:
+   an application that wants these has a node sign them with its key, and anyone can check them
+   later. Core records none of them on its own, and no entity or event id names a key.
 5. **Core knows nodes and nothing else about who.** Application, tenant, system, author and
    owner are components that applications declare or adopt from the Ankurah Commons. Core
    records a key and knows nothing of what a key denotes.
@@ -71,8 +70,8 @@ pub enum Signature { Ed25519([u8; 64]) }
 pub struct NodeId(Identity);              // the peer layer's name for an identity that is a node
 ```
 
-- The variant index of an `Identity` is part of every genesis id, so variants append and never
-  reorder. A test pins the encoded form of each variant.
+- The variant index of an `Identity` is inside every signed presence and every statement's
+  attester, so variants append and never reorder. A test pins the encoded form of each variant.
 - Verification is strict. `specs/protocol/bytes.md` states the exact acceptance rule (canonical
   encodings only, a small-order key or `R` refused, the equation without the cofactor) with
   vectors of signatures a reader must refuse.
@@ -222,7 +221,7 @@ without changing any id, and no id depends on what a serializer crate happens to
 ```rust
 // proto/src/event.rs, proto/src/operation.rs
 pub enum EventBody {
-    Genesis { minter: Identity, nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
+    Genesis { nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
     Update  { nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
 }
 pub enum CarriedOperation { Bytes { salt: [u8; 16], bytes: Vec<u8> }, Erased([u8; 32]) }
@@ -230,7 +229,7 @@ pub enum UnreadableOperation { UnknownKind { indices: Vec<u32> }, Malformed(Stri
 
 // operation digest = SHA-256( tag(operation) || salt || bytes )   for Bytes
 //                  = the 32 bytes carried                         for Erased
-// genesis id = SHA-256( tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n )
+// genesis id = SHA-256( tag(genesis) || nonce || timestamp || count || digest_1 .. digest_n )
 // update id  = SHA-256( tag(update)  || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent )
 // entity id  = genesis id
 ```
@@ -240,11 +239,12 @@ pub enum UnreadableOperation { UnknownKind { indices: Vec<u32> }, Malformed(Stri
   `state`. A tag enters a hashed or signed string as one length byte followed by its bytes.
   Tests pin each tag's bytes and that no tag's encoded form is a prefix of another's. A new
   derivation is a new tag, never a new meaning for an existing one.
-- **The minter.** A genesis names its minter as an `Identity`: the creating node's key by
-  default, a publisher's key for a published definition. The minter is inside the id, so the
-  same content under another minter is another entity. An update carries no minter. Core does
-  not check that a genesis carries a signature by its minter; whether the claim must be proven
-  is the application's choice, made with attestations.
+- **No creator in the id.** A genesis holds a nonce, a timestamp and its operations, and names no
+  key. Who created an entity is for the application to say and to prove: with a component set in
+  the creating event, which the id covers through that operation's digest, and an attestation by
+  the creator's key (section 7). A creator named in the id itself would be a claim core never
+  checks, would tie the entity to one key for good, and would stop a node that cannot read a later
+  key type from decoding the entity at all.
 - **Carried operations.** An event carries each operation as the bytes its author produced, or
   as only their digest once the bytes have been erased. Building an event encodes each
   operation once. Reading one yields a typed `UnreadableOperation` for bytes of a kind this
@@ -311,8 +311,8 @@ pub enum Subject { Event(EventId), State { entity: EntityId, head: Clock, state_
   node that ran the hook signs a statement about that event or state with its own key and
   attaches it. Core attaches nothing otherwise. An event that core commits on its own
   authority never reaches the agent's hook: the catalog definitions that registration writes
-  are such events, so they carry no attestation, and a definition is tied to its minter only
-  through its id.
+  are such events, so they carry no attestation, and nothing records who registered a
+  definition.
 - **Reading one.** Core does not verify or strip on arrival. `validate_received_event` and
   `validate_received_state` receive the set as it came. An agent unseals the attestations it
   cares about (`SealedAttestation::unseal` yields the statement only if the bytes parse and
@@ -342,7 +342,7 @@ add a request or an update without breaking a connection to an older peer.
 
 Core has no system root, no built-in model for one, and no readiness that waits on one. A
 node is ready to create an entity as soon as its model is registered in the catalog;
-`Transaction::create` mints under the node's identity and needs nothing from any peer.
+`Transaction::create` needs nothing from any peer.
 
 `NodeLifecycle` (`core/src/node/lifecycle.rs`) owns what is left: the node's run state, halt,
 and reset. `Node` exposes it through its own methods (`state`, `check_ready`, `wait_ready`,
@@ -449,7 +449,7 @@ server holds one `M` entity per seeding.
 | Membership removal | A free `Membership` index. Its design must settle the shape of stored state before the freeze |
 | A signed tree root in place of a signature per served state | A new statement kind |
 | Key rotation, delegation, threshold identities | New statement kinds, and `Identity` or `Signature` variants announced as features |
-| Checking that a published definition comes from its publisher: a list of trusted publishers, and a publisher's statement about what it minted | The minter's identity inside every creation id (section 6) and the attestation of section 7. Nothing in a stored or exchanged byte changes |
+| Checking that a published definition comes from its publisher: a list of trusted publishers, and a publisher's statement about what it published | The attestation of section 7: the publisher's statement names the definition's creation event. Nothing in a stored or exchanged byte changes |
 | Signed frames after the handshake; new requests | Features and carried bodies |
 | Replacing the serializer crate | The byte specification |
 | Merging an attestation that arrives after its event was stored | Attestations stored as separate elements |
@@ -487,11 +487,11 @@ Beyond the suites staying green, these exist and each states its scenario:
   and the connection stays up; a subscription whose peer registers again while its request is
   checked stands on the connection it arrived on.
 - **Events.** Each hashed string against literal hex; the tags' bytes and that none prefixes
-  another; the minter inside the genesis id; the same parts give the same id; two carryings of
-  one operation have different digests and one salt gives one digest; an operation's digest is
-  not the hash of its tag and bytes alone; an erased operation leaves the id unchanged and makes
-  the event refused on arrival; an operation of an unknown kind is refused with its typed error
-  and nothing is stored; a clock out of order is refused at decode.
+  another; the same parts give the same id; two carryings of one operation have different
+  digests and one salt gives one digest; an operation's digest is not the hash of its tag and
+  bytes alone; an erased operation leaves the id unchanged and makes the event refused on
+  arrival; an operation of an unknown kind is refused with its typed error and nothing is
+  stored; a clock out of order is refused at decode.
 - **Attestation.** An agent that requests one gets a statement signed by the node, on an event
   and on a served state, and an agent that requests none gets none; an attestation of a kind
   nobody knows, and one whose bytes do not parse, are stored and relayed unchanged by a node

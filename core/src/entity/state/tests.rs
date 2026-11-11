@@ -1,5 +1,5 @@
 use super::*;
-use ankurah_proto::{EventId, EventStructureError, Identity};
+use ankurah_proto::{EventId, EventStructureError};
 use std::sync::Mutex;
 
 /// Serves the staged event and records attempts to read any other history.
@@ -31,7 +31,7 @@ impl GetEvents for IncomingOnlyGetter {
 /// A direct extension checks every parent's generation without reading their payloads.
 #[tokio::test]
 async fn an_update_checks_each_parent_without_reading_its_event() -> anyhow::Result<()> {
-    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let genesis = Event::genesis(OperationSet::default());
     let older = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
     let sibling = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
     let newer = Event::update(genesis.entity_id, Clock::singleton(&sibling), OperationSet::default());
@@ -69,7 +69,7 @@ async fn an_update_checks_each_parent_without_reading_its_event() -> anyhow::Res
 
 #[tokio::test]
 async fn equal_snapshot_rejects_conflicting_generations_without_changing_state() -> anyhow::Result<()> {
-    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let genesis = Event::genesis(OperationSet::default());
     let state = EntityState::empty();
     state.set_head(Clock::singleton(&genesis));
     let before = state.to_state()?;
@@ -140,7 +140,7 @@ impl GetEvents for ServedGetter {
 /// concurrent update within the bound still applies.
 #[tokio::test]
 async fn an_update_claiming_more_than_one_above_the_head_is_refused_before_any_read() -> anyhow::Result<()> {
-    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let genesis = Event::genesis(OperationSet::default());
     let tip = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
     let forged =
         Event::update(genesis.entity_id, Clock::new(vec![(tip.generation(), tip.id()), (1000, genesis.id())])?, OperationSet::default());
@@ -175,7 +175,7 @@ async fn an_update_claiming_more_than_one_above_the_head_is_refused_before_any_r
 /// the chain is applied link by link, which then brings the head to it.
 #[tokio::test]
 async fn an_update_above_a_lagging_head_is_refused_until_its_chain_is_applied() -> anyhow::Result<()> {
-    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let genesis = Event::genesis(OperationSet::default());
     let first = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
     let second = Event::update(genesis.entity_id, Clock::singleton(&first), OperationSet::default());
     let third = Event::update(genesis.entity_id, Clock::singleton(&second), OperationSet::default());
@@ -198,7 +198,7 @@ async fn an_update_above_a_lagging_head_is_refused_until_its_chain_is_applied() 
 #[tokio::test]
 async fn multi_layer_application_advances_head_only_after_success() -> anyhow::Result<()> {
     // G -> A -> B -> C; G -> X -> Y. Start at [A, Y], then apply B and C together.
-    let g = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let g = Event::genesis(OperationSet::default());
     let a = Event::update(g.entity_id, Clock::singleton(&g), OperationSet::default());
     let b = Event::update(g.entity_id, Clock::singleton(&a), OperationSet::default());
     let c = Event::update(g.entity_id, Clock::singleton(&b), OperationSet::default());

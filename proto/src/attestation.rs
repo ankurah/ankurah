@@ -356,8 +356,8 @@ mod tests {
 
     #[test]
     fn an_event_subject_names_only_its_event() {
-        let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
-        let moved = Event::genesis(Identity::Ed25519([2; 32]), OperationSet::default());
+        let genesis = Event::genesis(OperationSet::default());
+        let moved = Event::genesis(OperationSet::default());
         let subject = Subject::event(&genesis);
         assert!(subject.names_event(&genesis));
         assert!(!subject.names_event(&moved), "a statement moved onto another event");
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn a_state_subject_names_only_that_entity_head_and_content() {
-        let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+        let genesis = Event::genesis(OperationSet::default());
         let state = state(&genesis);
         let subject = Subject::state(&state);
         assert!(subject.names_state(&state));
@@ -386,7 +386,7 @@ mod tests {
     /// Subjects are inside every signed statement, so their variant order is pinned.
     #[test]
     fn subject_variant_order_is_pinned() {
-        let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+        let genesis = Event::genesis(OperationSet::default());
         assert_eq!(encode(&Subject::event(&genesis))[..4], [0, 0, 0, 0], "Subject::Event");
         assert_eq!(encode(&Subject::state(&state(&genesis)))[..4], [1, 0, 0, 0], "Subject::State");
     }

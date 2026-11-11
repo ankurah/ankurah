@@ -68,7 +68,7 @@ fn fixture_body(nonce_seed: &[u8], parent: &Clock, operations: OperationSet) -> 
     let mut nonce = [0u8; 32];
     nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
     if parent.is_empty() {
-        ankurah_proto::EventBody::Genesis { minter: ankurah_proto::Identity::Ed25519([0; 32]), nonce, timestamp: 0, operations }
+        ankurah_proto::EventBody::Genesis { nonce, timestamp: 0, operations }
     } else {
         ankurah_proto::EventBody::Update { nonce, timestamp: 0, operations }
     }

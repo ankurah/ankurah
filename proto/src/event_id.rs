@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{clock::Clock, domain_tag::DomainTag, encoding, id::EntityId, identity::Identity, operation::CarriedOperations, DecodeError};
+use crate::{clock::Clock, domain_tag::DomainTag, encoding, id::EntityId, operation::CarriedOperations, DecodeError};
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -11,10 +11,10 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// The id of a genesis event (specs/protocol/bytes.md section 4.2). The minter and the
-    /// memberships its operations carry are part of the entity's identity.
-    pub fn from_genesis_parts(minter: &Identity, nonce: &[u8; 32], timestamp: u64, operations: &CarriedOperations) -> Self {
-        Self::from_preimage(DomainTag::Genesis, &(minter, nonce, timestamp, operations.digests()))
+    /// The id of a genesis event (specs/protocol/bytes.md section 4.2). The memberships its
+    /// operations carry are part of the entity's identity.
+    pub fn from_genesis_parts(nonce: &[u8; 32], timestamp: u64, operations: &CarriedOperations) -> Self {
+        Self::from_preimage(DomainTag::Genesis, &(nonce, timestamp, operations.digests()))
     }
 
     /// The id of an update event (specs/protocol/bytes.md section 4.3). Its nonce makes the id
@@ -162,7 +162,6 @@ mod tests {
             salt,
         );
         let erased = CarriedOperation::Erased(membership.digest());
-        let minter = Identity::Ed25519([0x11; 32]);
         let (nonce, timestamp) = ([0x22; 32], 1_720_000_000_000);
         let entity_id = EntityId::from_bytes([0x33; 32]);
         let parent = Clock::new(vec![(1, EventId::from_bytes([0x44; 32]))]).unwrap();
@@ -170,27 +169,27 @@ mod tests {
         for (operations, genesis, update) in [
             (
                 vec![],
-                "133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649",
+                "7142250172e85b3d6ea61e537ad3980c29e3f2ac3854f8c0f5d788124e3141ac",
                 "036ff81f4ba2285f3ccd38e0ad3232855a466bb6c0b9d6f0fd254a202180364e",
             ),
             (
                 vec![membership.clone()],
-                "6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821",
+                "847e97d2ea2977d148a604d1b5f309be86e9209a0a9ef386ea3b80eb37c7a5ca",
                 "760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f",
             ),
             (
                 vec![membership, backend],
-                "9fcc73ceeb855f5a66085b2c5efa3fb367cb6c078e55da1c89d9aae6e5fc4b83",
+                "333012998d0558ffb741500c36420083fcf3a41b4a0f51c1c8629cd554bcc640",
                 "f6068afad6389a9d0c6ee253f24965dd9f9a481fa0648a1a08007c171d24ac72",
             ),
             (
                 vec![erased],
-                "6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821",
+                "847e97d2ea2977d148a604d1b5f309be86e9209a0a9ef386ea3b80eb37c7a5ca",
                 "760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f",
             ),
         ] {
             let operations = CarriedOperations(operations);
-            assert_eq!(hex::encode(EventId::from_genesis_parts(&minter, &nonce, timestamp, &operations).as_bytes()), genesis);
+            assert_eq!(hex::encode(EventId::from_genesis_parts(&nonce, timestamp, &operations).as_bytes()), genesis);
             assert_eq!(hex::encode(EventId::from_update_parts(&entity_id, &nonce, timestamp, &operations, &parent).as_bytes()), update);
         }
     }
