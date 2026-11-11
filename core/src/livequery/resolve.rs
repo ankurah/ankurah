@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 
 /// A livequery's selection, resolved now or as soon as the node can resolve it.
 ///
-/// Resolution turns field names into property IDs, adds `MemberOf(model)`, and applies the
+/// Resolution turns field names into property IDs, adds `MemberOf` for each component, and applies the
 /// context's read policy. A livequery subscribes only once it holds a resolved selection.
 ///
 /// ```text
@@ -27,13 +27,13 @@ impl QueryResolution {
     /// Every other error, such as an unknown field, returns immediately.
     pub(crate) fn prepare(
         resolver: &dyn SchemaResolver,
-        schema: &'static ModelStructDescriptor,
+        components: Vec<&'static ModelStructDescriptor>,
         selection: Selection<Parsed>,
     ) -> Result<Self, RetrievalError> {
-        match resolver.resolve_query_selection(schema, selection.clone()) {
+        match resolver.resolve_query_selection(&components, selection.clone()) {
             Ok(selection) => Ok(Self::Resolved(selection)),
             Err(RetrievalError::NodeNotReady | RetrievalError::UnboundDeclaration { .. }) => {
-                Ok(Self::Pending(resolver.resolve_query_selection_when_ready(schema, selection)))
+                Ok(Self::Pending(resolver.resolve_query_selection_when_ready(components, selection)))
             }
             Err(error) => Err(error),
         }

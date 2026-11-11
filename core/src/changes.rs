@@ -1,7 +1,7 @@
 use crate::{
     entity::Entity,
     error::RetrievalError,
-    model::{Model, View},
+    model::{ComponentViews, Model, View},
     reactor::ChangeNotification,
 };
 use ankurah_proto::{Attested, Event};
@@ -90,12 +90,12 @@ impl std::fmt::Display for EntityChange {
 use crate::resultset::ResultSet;
 
 #[derive(Debug, Clone)]
-pub struct ChangeSet<R: View> {
+pub struct ChangeSet<R: ComponentViews> {
     pub resultset: ResultSet<R>,
     pub changes: Vec<ItemChange<R>>,
 }
 
-impl<R: View> ChangeSet<R>
+impl<R: ComponentViews> ChangeSet<R>
 where R: Clone
 {
     /// Returns items from the initial query load (before subscription was active)

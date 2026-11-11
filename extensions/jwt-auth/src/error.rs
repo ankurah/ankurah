@@ -17,3 +17,12 @@ pub enum AuthError {
     #[error("Token verification failed: {0}")]
     Verification(String),
 }
+
+/// A policy the agent refuses to author.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PolicyAuthoringError {
+    /// A scope filter names a property as `Component::name`. A scope restricts one model's entities by that
+    /// model's own properties, so its property names take no qualifier.
+    #[error("the scope filter '{filter}' on '{model}' qualifies a property with component '{component}'; a scope names its own model's properties without a qualifier")]
+    QualifiedScopeProperty { model: String, filter: String, component: String },
+}

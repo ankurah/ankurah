@@ -306,14 +306,14 @@ fn generate_selection_code_with_replacements(
         let order_items: Vec<_> = order_by
             .iter()
             .map(|item| {
-                let steps: Vec<_> = item.path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
+                let path_code = generate_path_expr_code(&item.path);
                 let direction_code = match item.direction {
                     ankql::ast::OrderDirection::Asc => quote! { ::ankql::ast::OrderDirection::Asc },
                     ankql::ast::OrderDirection::Desc => quote! { ::ankql::ast::OrderDirection::Desc },
                 };
                 quote! {
                     ::ankql::ast::OrderByItem {
-                        path: ::ankql::ast::PathExpr { steps: vec![#(#steps),*] },
+                        path: #path_code,
                         direction: #direction_code,
                     }
                 }
@@ -558,7 +558,13 @@ fn tokens_to_template_string(tokens: &proc_macro2::TokenStream) -> String {
                 }
             },
             proc_macro2::TokenTree::Ident(ident) => {
-                if !result.is_empty() && !result.ends_with(' ') && !result.ends_with('(') && !result.ends_with('{') {
+                // `::` binds a component qualifier to its property name, as in `Assignment::assignee`.
+                if !result.is_empty()
+                    && !result.ends_with(' ')
+                    && !result.ends_with('(')
+                    && !result.ends_with('{')
+                    && !result.ends_with("::")
+                {
                     result.push(' ');
                 }
                 result.push_str(&ident.to_string());
@@ -587,8 +593,17 @@ fn tokens_to_template_string(tokens: &proc_macro2::TokenStream) -> String {
 }
 
 fn generate_path_code(path: &ankql::ast::PathExpr) -> proc_macro2::TokenStream {
+    let path_code = generate_path_expr_code(path);
+    quote! { ::ankql::ast::Expr::Path(#path_code) }
+}
+
+fn generate_path_expr_code(path: &ankql::ast::PathExpr) -> proc_macro2::TokenStream {
+    let component = match &path.component {
+        Some(component) => quote! { Some(#component.to_string()) },
+        None => quote! { None },
+    };
     let steps: Vec<_> = path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
-    quote! { ::ankql::ast::Expr::Path(::ankql::ast::PathExpr { steps: vec![#(#steps),*] }) }
+    quote! { ::ankql::ast::PathExpr { component: #component, steps: vec![#(#steps),*] } }
 }
 
 fn generate_comparison_op_code(operator: &ankql::ast::ComparisonOperator) -> proc_macro2::TokenStream {

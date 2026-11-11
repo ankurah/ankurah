@@ -3,6 +3,9 @@ use crate::error::SqlGenerationError;
 use ankurah_core_types::{Path, Value};
 
 pub(crate) fn write_path<S: Stage>(path: &S::Path, output: &mut impl std::fmt::Write) -> std::fmt::Result {
+    if let Some(component) = path.display_component() {
+        write!(output, "\"{}\"::", component.replace('"', "\"\""))?;
+    }
     for (i, step) in path.display_steps().enumerate() {
         if i > 0 {
             output.write_char('.')?;
@@ -378,7 +381,7 @@ mod tests {
         assert_eq!(
             parsed.predicate,
             Predicate::Comparison {
-                left: Box::new(Expr::Path(PathExpr { steps: vec!["true".into(), "a.b".into()] })),
+                left: Box::new(Expr::Path(PathExpr { component: None, steps: vec!["true".into(), "a.b".into()] })),
                 operator: ComparisonOperator::Equal,
                 right: Box::new(Expr::Literal(Value::String("O'Brien".into()))),
             }

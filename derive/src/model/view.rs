@@ -124,6 +124,14 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
             }
 
+            // A view is its entity seen through one component: `task.cast::<AssignmentView>()` reaches `Entity::cast`.
+            impl ::std::ops::Deref for #view_name {
+                type Target = #base::entity::Entity;
+                fn deref(&self) -> &Self::Target {
+                    &self.entity
+                }
+            }
+
             impl #base::signals::Signal for #view_name {
                 fn listen(&self, listener: #base::signals::signal::Listener) -> #base::signals::signal::ListenerGuard {
                     self.entity.broadcast().reference().listen(listener).into()

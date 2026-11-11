@@ -1,6 +1,9 @@
+mod component_views;
 pub mod tsify;
 #[cfg(feature = "wasm")]
 pub mod wasm;
+
+pub use component_views::ComponentViews;
 
 use std::sync::Arc;
 
