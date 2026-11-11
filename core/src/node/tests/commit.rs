@@ -358,7 +358,7 @@ async fn a_durable_node_refuses_a_remote_commit_holding_an_operation_it_cannot_r
     let mut unknown_kind = Event::update(genesis.entity_id, proto::Clock::singleton(&committed), OperationSet::default());
     let proto::EventBody::Update { operations, .. } = &mut unknown_kind.body else { unreachable!("Event::update mints an update") };
     // Variant index 2, which no build of `Operation` defines yet.
-    let unknown_operation = proto::CarriedOperation::Bytes(vec![2, 0, 0, 0]);
+    let unknown_operation = proto::CarriedOperation::Bytes { salt: [6; 16], bytes: vec![2, 0, 0, 0] };
     operations.0.push(unknown_operation.clone());
 
     for (event, operation) in [(erased, erased_operation), (unknown_kind.clone(), unknown_operation)] {

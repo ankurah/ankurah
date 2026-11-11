@@ -1,13 +1,14 @@
 //! Deterministic entity ids and hand-forged events.
 //!
 //! Every event id, and therefore every entity id, is a hash over a
-//! creator-random nonce, so events minted by the real commit path
-//! (`trx.create`) carry fresh entropy on every run and would defeat the
-//! determinism audit. The harness sidesteps this the way the containment
-//! tests already do (`tests/tests/update_batch_containment.rs`): it
-//! constructs `proto::Event` values directly, with a nonce derived from the
-//! event's own content instead of drawn at random, so every id is a pure
-//! function of the schedule. Events still flow through the real Node ingest
+//! creator-random nonce and a creator-random salt for each operation, so
+//! events minted by the real commit path (`trx.create`) carry fresh entropy
+//! on every run and would defeat the determinism audit. The harness sidesteps
+//! this the way the containment tests already do
+//! (`tests/tests/update_batch_containment.rs`): it constructs `proto::Event`
+//! values directly, with a nonce and salts derived from the event's own
+//! content instead of drawn at random, so every id is a pure function of the
+//! schedule. Events still flow through the real Node ingest
 //! (`handle_message` / `add_event` / `set_state`), so the applier, staging,
 //! containment, and head-maintenance logic under test is the production
 //! code, not a mock.
@@ -163,8 +164,8 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 pub fn genesis_event(minter: proto::Identity, counter: u64, field: Field, value: &str) -> proto::Event {
     let mut operations = lww_ops(field, value);
     operations.push(proto::Operation::Membership(proto::Membership::Add(ankurah::ModelId::EntityId(sim_model_id()))));
-    let operations = proto::CarriedOperations::encode(&operations);
     let nonce = content_nonce(counter, &[field.name().as_bytes(), value.as_bytes()]);
+    let operations = carried(&operations, &nonce);
     let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&minter, &nonce, SIM_TIMESTAMP, &operations).into();
     proto::Event {
         entity_id,
@@ -184,12 +185,14 @@ pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, v
     proto::Event {
         entity_id: entity,
         parent,
-        body: proto::EventBody::Update {
-            nonce,
-            timestamp: SIM_TIMESTAMP,
-            operations: proto::CarriedOperations::encode(&lww_ops(field, value)),
-        },
+        body: proto::EventBody::Update { nonce, timestamp: SIM_TIMESTAMP, operations: carried(&lww_ops(field, value), &nonce) },
     }
+}
+
+/// `operations` carried under a salt taken from the event's `nonce`, so that, like the nonce, it
+/// comes from the schedule rather than from entropy.
+fn carried(operations: &proto::OperationSet, nonce: &[u8; 32]) -> proto::CarriedOperations {
+    ankurah::core::test_helpers::carried_under_salt(operations, std::array::from_fn(|i| nonce[i]))
 }
 
 /// The advisory timestamp every forged event carries. Fixed, because a

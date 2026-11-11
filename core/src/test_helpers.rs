@@ -57,13 +57,22 @@ pub fn apply_backend_event(backend: &dyn crate::property::backend::PropertyBacke
     .expect("fixture comparison has no asynchronous I/O")
 }
 
+/// Each of `operations` carried under `salt`, for a fixture whose ids must be the same in every
+/// run. A node draws a salt for each operation it carries.
+pub fn carried_under_salt(operations: &proto::OperationSet, salt: [u8; 16]) -> proto::CarriedOperations {
+    proto::CarriedOperations(operations.iter().map(|operation| proto::CarriedOperation::encode_with_salt(operation, salt)).collect())
+}
+
 /// Commit a backend's staged fixture values under a deterministic genesis event.
 /// Storage tests can use the returned event's clock when constructing a snapshot.
 pub fn commit_backend<B: crate::property::backend::PropertyBackend>(backend: &B, seed: u8) -> Result<proto::Event, MutationError> {
-    let operations = proto::CarriedOperations::encode(&proto::OperationSet::from_backends(std::collections::BTreeMap::from([(
-        B::property_backend_name().to_owned(),
-        backend.to_operations()?.unwrap_or_default(),
-    )])));
+    let operations = carried_under_salt(
+        &proto::OperationSet::from_backends(std::collections::BTreeMap::from([(
+            B::property_backend_name().to_owned(),
+            backend.to_operations()?.unwrap_or_default(),
+        )])),
+        [seed; 16],
+    );
     let minter = proto::Identity::Ed25519([seed; 32]);
     let nonce = [seed; 32];
     let entity_id = proto::EventId::from_genesis_parts(&minter, &nonce, 0, &operations).into();

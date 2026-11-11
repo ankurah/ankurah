@@ -721,7 +721,7 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
 fn unreadable_operations() -> anyhow::Result<[proto::CarriedOperation; 2]> {
     let erased = proto::CarriedOperation::Erased(proto::CarriedOperation::encode(&value_operation("erased")?).digest());
     // Variant index 2, which no build of `Operation` defines yet.
-    Ok([erased, proto::CarriedOperation::Bytes(vec![2, 0, 0, 0])])
+    Ok([erased, proto::CarriedOperation::Bytes { salt: [6; 16], bytes: vec![2, 0, 0, 0] }])
 }
 
 /// An update over the fixture's genesis carrying one readable operation and then `unreadable`.

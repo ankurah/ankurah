@@ -325,15 +325,15 @@ mod tests {
 
     #[test]
     fn layers_keep_the_greater_rank_in_either_order() {
-        use ankurah_proto::{CarriedOperations, Clock, Event, OperationSet};
+        use ankurah_proto::{Clock, Event, OperationSet};
         let scratch = LWWBackend::new();
         scratch.set(title(), Some(Value::String("shallower".into())));
         let shallower = crate::test_helpers::commit_backend(&scratch, 9).unwrap();
         scratch.set(title(), Some(Value::String("deeper".into())));
-        let operations = CarriedOperations::encode(&OperationSet::from_backends(BTreeMap::from([(
-            "lww".into(),
-            scratch.to_operations().unwrap().unwrap(),
-        )])));
+        let operations = crate::test_helpers::carried_under_salt(
+            &OperationSet::from_backends(BTreeMap::from([("lww".into(), scratch.to_operations().unwrap().unwrap())])),
+            [0; 16],
+        );
         let deeper = (0..200)
             .find_map(|seed| {
                 let event = Event {

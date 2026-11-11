@@ -2,7 +2,10 @@ use ankurah_core::{
     node::NodeKey,
     storage::{StorageEngine, StorageTransaction},
 };
-use ankurah_proto::{AttestationSet, Attested, EntityId, Event, Identity, OperationSet, SealedAttestation, Subject};
+use ankurah_proto::{
+    AttestationSet, Attested, EntityId, Event, Identity, Membership, ModelId, Operation, OperationSet, SealedAttestation, Subject,
+    SystemModel,
+};
 
 /// Attestations about `subject`: bytes that do not parse, no bytes at all, and a genuine
 /// statement of a kind nobody defines, which unseals but which no build can interpret.
@@ -12,9 +15,13 @@ fn attestations(subject: Subject) -> AttestationSet {
 }
 
 /// Shared black-box case: an attestation's content never makes an event unreadable, and every
-/// read path returns each of an event's attestations with exactly the bytes it was stored with.
+/// read path returns the event, each operation's salt and bytes and each of its attestations
+/// exactly as they were stored.
 pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
-    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+    let genesis = Event::genesis(
+        Identity::Ed25519([1; 32]),
+        OperationSet(vec![Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))]),
+    );
     let event = Attested { attestations: attestations(Subject::event(&genesis)), payload: genesis };
     let mut transaction = engine.transaction();
     transaction.add_events(std::slice::from_ref(&event)).await?;

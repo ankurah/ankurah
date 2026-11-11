@@ -187,10 +187,10 @@ arm** (the C4 part-2 test that pins it), and **Status** (enforced | open gap (ow
 Invariant: an update's id equals `SHA-256(tag(update) || entity_id || nonce ||
 timestamp || count || digest_1 .. digest_n || parent)` and a genesis's id equals
 `SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 ..
-digest_n)`, where each digest is `SHA-256(tag(operation) || the operation's
-bytes)` (byte for byte in specs/protocol/bytes.md section 4); recomputed from
-contents on every use, never read from the wire; a peer cannot present an event
-under an id its contents do not hash to.
+digest_n)`, where each digest is `SHA-256(tag(operation) || salt || the
+operation's bytes)` (byte for byte in specs/protocol/bytes.md section 4);
+recomputed from contents on every use, never read from the wire; a peer cannot
+present an event under an id its contents do not hash to.
 Trust tier: Byzantine-safe.
 Enforcing seam: `proto/src/event_id.rs` `EventId::from_genesis_parts` and
 `EventId::from_update_parts` (the hash) and `Event::id()`

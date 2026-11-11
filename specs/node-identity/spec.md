@@ -225,11 +225,11 @@ pub enum EventBody {
     Genesis { minter: Identity, nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
     Update  { nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
 }
-pub enum CarriedOperation { Bytes(Vec<u8>), Erased([u8; 32]) }
+pub enum CarriedOperation { Bytes { salt: [u8; 16], bytes: Vec<u8> }, Erased([u8; 32]) }
 pub enum UnreadableOperation { UnknownKind { indices: Vec<u32> }, Malformed(String), Erased }
 
-// operation digest = SHA-256( tag(operation) || bytes )       for Bytes
-//                  = the 32 bytes carried                     for Erased
+// operation digest = SHA-256( tag(operation) || salt || bytes )   for Bytes
+//                  = the 32 bytes carried                         for Erased
 // genesis id = SHA-256( tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n )
 // update id  = SHA-256( tag(update)  || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent )
 // entity id  = genesis id
@@ -251,14 +251,17 @@ pub enum UnreadableOperation { UnknownKind { indices: Vec<u32> }, Malformed(Stri
   build does not know, for bytes that do not parse, and for an erased operation; a node that
   meets any of the three while taking in an event refuses that event (section 2). Nothing in
   0.10 erases. A test builds an event with an erased operation and shows its id unchanged.
-  Whether erased content needs a salt is left to the operation kinds that want one: the digest
-  covers whatever bytes the operation carries.
+  Each operation is carried with 16 random bytes of salt, which its digest covers and which are
+  erased with its bytes. Without the salt, anyone holding the digest of an erased short value, a
+  flag or a name from a list, could confirm a guess by hashing it.
 - **The parent clock** of an update is inside its id, so a `Clock` decodes strictly from the
   wire and from a store: entries out of order, repeated, or with a zero generation are refused
   with a typed error.
-- **Chosen parts.** `Event::genesis` and `Event::update` draw a nonce and read the clock for the
-  timestamp. `Event::genesis_from_parts` and `Event::update_from_parts` take every part from
-  the caller, for a migration tool or a publisher that must arrive at the same id twice.
+- **Chosen parts.** `Event::genesis` and `Event::update` draw a nonce, read the clock for the
+  timestamp and draw each operation's salt. `Event::genesis_from_parts` and
+  `Event::update_from_parts` take every part from the caller, the salts included: they take the
+  operations already carried, each under the salt the caller chose. They are for a migration
+  tool or a publisher that must arrive at the same id twice.
 - **The encoding.** Every hashed or signed string, and the encoding of each type inside it, is
   written out byte by byte in `specs/protocol/bytes.md`, with literal hex vectors. The encoding
   is what bincode 1.3.3's default produces (fixed-width little-endian integers, four-byte
@@ -441,7 +444,7 @@ server holds one `M` entity per seeding.
 
 | Later work | What 0.10 fixes so it needs no break |
 | --- | --- |
-| Erasing an operation's content | The per-operation digest in every event id |
+| Erasing an operation's content | The per-operation digest in every event id, and the salt inside it |
 | New operation kinds | Carried operations and the refusal rule of section 2 |
 | Membership removal | A free `Membership` index. Its design must settle the shape of stored state before the freeze |
 | A signed tree root in place of a signature per served state | A new statement kind |
@@ -484,10 +487,11 @@ Beyond the suites staying green, these exist and each states its scenario:
   and the connection stays up; a subscription whose peer registers again while its request is
   checked stands on the connection it arrived on.
 - **Events.** Each hashed string against literal hex; the tags' bytes and that none prefixes
-  another; the minter inside the genesis id; the same parts give the same id; an erased
-  operation leaves the id unchanged and makes the event refused on arrival; an operation of an
-  unknown kind is refused with its typed error and nothing is stored; a clock out of order is
-  refused at decode.
+  another; the minter inside the genesis id; the same parts give the same id; two carryings of
+  one operation have different digests and one salt gives one digest; an operation's digest is
+  not the hash of its tag and bytes alone; an erased operation leaves the id unchanged and makes
+  the event refused on arrival; an operation of an unknown kind is refused with its typed error
+  and nothing is stored; a clock out of order is refused at decode.
 - **Attestation.** An agent that requests one gets a statement signed by the node, on an event
   and on a served state, and an agent that requests none gets none; an attestation of a kind
   nobody knows, and one whose bytes do not parse, are stored and relayed unchanged by a node

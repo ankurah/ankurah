@@ -83,7 +83,7 @@ mod tests {
         let genesis = Event::genesis(Identity::Ed25519([4; 32]), membership());
         let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), membership());
         // Variant index 2, which no build of `Operation` defines yet.
-        let unknown = CarriedOperation::Bytes(vec![2, 0, 0, 0]);
+        let unknown = CarriedOperation::Bytes { salt: [6; 16], bytes: vec![2, 0, 0, 0] };
         for event in [genesis, update] {
             for (operation, expected) in [
                 (CarriedOperation::Erased([5; 32]), UnreadableOperation::Erased),

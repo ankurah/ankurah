@@ -56,14 +56,15 @@ async fn created_id_is_the_committed_genesis_id() -> Result<()> {
 }
 
 /// Two `create()` calls with byte-identical payloads are two entities, because
-/// each mint draws its own nonce. Without the nonce the two genesis preimages
-/// would be equal and the second creation would silently address the first.
+/// each mint draws its own nonce and a salt for each operation. Without them the
+/// two genesis preimages would be equal and the second creation would silently
+/// address the first.
 ///
 /// The model here is LWW-backed on purpose: LWW encodes a field write to the
-/// same bytes every time, so the two genesis events agree on their operations
-/// and the nonce is demonstrably the only thing left that separates them. A
-/// yrs-backed field would not show that, because a yrs update embeds the
-/// document's own randomly chosen client id.
+/// same bytes every time, so the two genesis events carry the same operations
+/// and only what each mint draws separates them. A yrs-backed field would not
+/// show that, because a yrs update embeds the document's own randomly chosen
+/// client id.
 #[tokio::test]
 async fn identical_payloads_mint_distinct_entities() -> Result<()> {
     let node = durable_node().await?;
@@ -80,8 +81,8 @@ async fn identical_payloads_mint_distinct_entities() -> Result<()> {
 
     let first_genesis = entity_events(&node, first).await?.into_iter().find(|e| e.is_entity_create()).expect("first genesis");
     let second_genesis = entity_events(&node, second).await?.into_iter().find(|e| e.is_entity_create()).expect("second genesis");
-    assert_eq!(first_genesis.operations(), second_genesis.operations(), "the two mints froze identical operations");
-    assert_ne!(first_genesis.nonce(), second_genesis.nonce(), "and the nonce is what separates them");
+    assert_eq!(first_genesis.operations().decode()?, second_genesis.operations().decode()?, "the two mints froze identical operations");
+    assert_ne!(first_genesis.nonce(), second_genesis.nonce(), "and each mint drew its own nonce");
     Ok(())
 }
 

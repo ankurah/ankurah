@@ -150,14 +150,17 @@ mod tests {
     }
 
     /// The id vectors of specs/protocol/bytes.md section 5: a genesis and an update over zero, one and two
-    /// operations, and over the one operation erased, which leaves each id unchanged.
+    /// operations, each carried under the salt 00 to 0f, and over the one operation erased, which leaves
+    /// each id unchanged.
     #[test]
     fn event_ids_match_the_byte_specification_vectors() {
-        let membership = CarriedOperation::encode(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))));
-        let backend = CarriedOperation::encode(&Operation::Backend {
-            backend: "lww".to_owned(),
-            operations: vec![BackendOperation { diff: vec![1, 2, 3] }],
-        });
+        let salt = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let membership =
+            CarriedOperation::encode_with_salt(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))), salt);
+        let backend = CarriedOperation::encode_with_salt(
+            &Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![1, 2, 3] }] },
+            salt,
+        );
         let erased = CarriedOperation::Erased(membership.digest());
         let minter = Identity::Ed25519([0x11; 32]);
         let (nonce, timestamp) = ([0x22; 32], 1_720_000_000_000);
@@ -172,18 +175,18 @@ mod tests {
             ),
             (
                 vec![membership.clone()],
-                "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
-                "c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8",
+                "6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821",
+                "760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f",
             ),
             (
                 vec![membership, backend],
-                "0395ecaf7e93f57b19cf2098a8161c6c0c72b182ff1f5dfc8a0525359cd927a3",
-                "342304016d7452fae948903da6bb928e9b69b3c460d1bdb49d69fbcead6e1b43",
+                "9fcc73ceeb855f5a66085b2c5efa3fb367cb6c078e55da1c89d9aae6e5fc4b83",
+                "f6068afad6389a9d0c6ee253f24965dd9f9a481fa0648a1a08007c171d24ac72",
             ),
             (
                 vec![erased],
-                "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
-                "c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8",
+                "6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821",
+                "760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f",
             ),
         ] {
             let operations = CarriedOperations(operations);

@@ -18,7 +18,7 @@ fn prop(name: &str) -> ankurah_proto::PropertyId {
 
 use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
-use ankurah_proto::{CarriedOperations, Clock, EntityId, Event, EventId, EventStructureError, OperationSet};
+use ankurah_proto::{Clock, EntityId, Event, EventId, EventStructureError, OperationSet};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -56,14 +56,15 @@ impl GetEvents for MockRetriever {
 }
 
 /// The body for a synthetic fixture event: a genesis when it has no parents,
-/// an update otherwise. The nonce comes from the fixture's seed rather than
-/// from entropy, so every fixture id is reproducible.
+/// an update otherwise. The nonce comes from the fixture's seed and every
+/// operation's salt is fixed, rather than drawn, so every fixture id is
+/// reproducible.
 ///
 /// These fixtures keep their seed-derived entity ids, so a genesis built here
 /// does not satisfy `Event::validate_structure`. Nothing on the paths under
 /// test consults it: lineage comparison sees only ids and parent clocks.
 fn fixture_body(nonce_seed: &[u8], parent: &Clock, operations: OperationSet) -> ankurah_proto::EventBody {
-    let operations = CarriedOperations::encode(&operations);
+    let operations = crate::test_helpers::carried_under_salt(&operations, [0; 16]);
     let mut nonce = [0u8; 32];
     nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
     if parent.is_empty() {
@@ -1776,9 +1777,16 @@ mod phase4_stored_below_meet {
     #[test]
     fn test_stored_event_id_below_meet_loses_to_layer_candidate() {
         let backend = LWWBackend::new();
+        // Both writes sit at the saturated generation, where generation no longer orders
+        // them and the `older_than_meet` rule decides.
+        let saturated = |seed: u8, value: &str| {
+            let event = make_lww_event(seed, vec![("x", value)]);
+            let parent = Clock::new(vec![(u32::MAX, EventId::from_bytes([0xEE; 32]))]).unwrap();
+            Event { body: fixture_body(&[seed], &parent, event.operations().decode().unwrap()), parent, ..event }
+        };
 
         // Step 1: Apply an initial event so the backend has a stored value with an event_id.
-        let old_event = make_lww_event(1, vec![("x", "old_value")]);
+        let old_event = saturated(1, "old_value");
         let old_event_id = old_event.id();
 
         // Apply the old event as a normal layer first (so the backend tracks the event_id)
@@ -1795,7 +1803,7 @@ mod phase4_stored_below_meet {
         // Step 2: Create a new layer candidate event. Build the DAG WITHOUT the
         // old_event_id. This simulates the case where the stored value's event_id
         // is below the meet (not in the accumulated DAG).
-        let new_event = make_lww_event(2, vec![("x", "new_value")]);
+        let new_event = saturated(2, "new_value");
         let new_event_id = new_event.id();
 
         // DAG only contains the new event, NOT the old event.

@@ -148,19 +148,19 @@ pub(crate) trait ConformanceBackend {
 /// A synthetic fixture event: a genesis when it has no parents, an update
 /// otherwise, together with the entity id that event names.
 ///
-/// The nonce comes from the fixture's seed rather than from entropy, so every
-/// fixture id is reproducible across runs. A genesis derives the entity id from
-/// its own content, the way the production mint does, so the laws below run over
-/// the only genesis shape a node can produce rather than one the commit funnels
-/// would refuse. An update names the seed-derived id instead; no law reads an
-/// event's entity id.
+/// The nonce comes from the fixture's seed and every operation's salt is
+/// fixed, rather than drawn, so every fixture id is reproducible across runs.
+/// A genesis derives the entity id from its own content, the way the
+/// production mint does, so the laws below run over the only genesis shape a
+/// node can produce rather than one the commit funnels would refuse. An update
+/// names the seed-derived id instead; no law reads an event's entity id.
 fn fixture_body(
     nonce_seed: &[u8],
     seeded_entity_id: EntityId,
     parent: &Clock,
     operations: OperationSet,
 ) -> (EntityId, ankurah_proto::EventBody) {
-    let operations = ankurah_proto::CarriedOperations::encode(&operations);
+    let operations = crate::test_helpers::carried_under_salt(&operations, [0; 16]);
     let mut nonce = [0u8; 32];
     nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
     if parent.is_empty() {

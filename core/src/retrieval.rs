@@ -373,7 +373,7 @@ mod tests {
         let mut unreadable = event.clone();
         let ankurah_proto::EventBody::Genesis { operations, .. } = &mut unreadable.body else { unreachable!("a test genesis") };
         // Variant index 2, which no build of `Operation` defines yet.
-        operations.0.push(ankurah_proto::CarriedOperation::Bytes(vec![2, 0, 0, 0]));
+        operations.0.push(ankurah_proto::CarriedOperation::Bytes { salt: [6; 16], bytes: vec![2, 0, 0, 0] });
         let unreadable = Event { entity_id: EntityId::from(unreadable.id()), ..unreadable };
         unreadable.validate_structure().expect("the unreadable genesis still derives the id it names");
         assert!(matches!(

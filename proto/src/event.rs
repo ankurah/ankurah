@@ -85,29 +85,30 @@ pub enum EventStructureError {
 
 impl Event {
     /// Mint an entity under `minter`: freeze `operations` into a genesis,
-    /// draw its nonce and timestamp, and derive the entity id from the whole
-    /// of it. The id is the return value's `entity_id`.
+    /// draw its nonce, its timestamp and each operation's salt, and derive the
+    /// entity id from the whole of it. The id is the return value's `entity_id`.
     pub fn genesis(minter: Identity, operations: OperationSet) -> Self {
-        Self::genesis_from_parts(minter, draw_nonce(), crate::time::unix_ms_now(), operations)
+        Self::genesis_from_parts(minter, draw_nonce(), crate::time::unix_ms_now(), CarriedOperations::encode(&operations))
     }
 
-    /// The genesis that `minter`, `nonce`, `timestamp` and `operations` make, for a tool that
-    /// rebuilds an entity or publishes one under an id fixed in advance.
-    pub fn genesis_from_parts(minter: Identity, nonce: [u8; 32], timestamp: u64, operations: OperationSet) -> Self {
-        let operations = CarriedOperations::encode(&operations);
+    /// The genesis made of `minter`, `nonce`, `timestamp` and `operations`, already carried under
+    /// salts the caller chose, for a tool that rebuilds an entity or publishes one under an id
+    /// fixed in advance.
+    pub fn genesis_from_parts(minter: Identity, nonce: [u8; 32], timestamp: u64, operations: CarriedOperations) -> Self {
         let entity_id: EntityId = EventId::from_genesis_parts(&minter, &nonce, timestamp, &operations).into();
         Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { minter, nonce, timestamp, operations } }
     }
 
-    /// Mint an update extending `parent`, drawing its nonce and timestamp.
+    /// Mint an update extending `parent`, drawing its nonce, its timestamp and each operation's salt.
     pub fn update(entity_id: EntityId, parent: Clock, operations: OperationSet) -> Self {
-        Self::update_from_parts(entity_id, parent, draw_nonce(), crate::time::unix_ms_now(), operations)
+        Self::update_from_parts(entity_id, parent, draw_nonce(), crate::time::unix_ms_now(), CarriedOperations::encode(&operations))
     }
 
-    /// The update of `entity_id` extending `parent` that `nonce`, `timestamp` and `operations`
-    /// make, for a tool that rebuilds an entity's history or publishes it under ids fixed in advance.
-    pub fn update_from_parts(entity_id: EntityId, parent: Clock, nonce: [u8; 32], timestamp: u64, operations: OperationSet) -> Self {
-        Event { entity_id, parent, body: EventBody::Update { nonce, timestamp, operations: CarriedOperations::encode(&operations) } }
+    /// The update of `entity_id` extending `parent` made of `nonce`, `timestamp` and `operations`,
+    /// already carried under salts the caller chose, for a tool that rebuilds an entity's history
+    /// or publishes it under ids fixed in advance.
+    pub fn update_from_parts(entity_id: EntityId, parent: Clock, nonce: [u8; 32], timestamp: u64, operations: CarriedOperations) -> Self {
+        Event { entity_id, parent, body: EventBody::Update { nonce, timestamp, operations } }
     }
 
     pub fn is_entity_create(&self) -> bool { matches!(self.body, EventBody::Genesis { .. }) }
@@ -279,7 +280,7 @@ mod tests {
     #[test]
     fn an_event_holding_an_operation_of_an_unknown_kind_derives_its_id() {
         // Variant index 2, which no build of `Operation` defines yet.
-        let operations = CarriedOperations(vec![CarriedOperation::Bytes(vec![2, 0, 0, 0, 7])]);
+        let operations = CarriedOperations(vec![CarriedOperation::Bytes { salt: [5; 16], bytes: vec![2, 0, 0, 0, 7] }]);
         let nonce = [6u8; 32];
         let entity_id = EventId::from_genesis_parts(&minter(), &nonce, 0, &operations).into();
         let genesis =
@@ -359,22 +360,32 @@ mod tests {
     }
 
     /// The membership vectors of specs/protocol/bytes.md section 5, built from their parts: the same
-    /// parts make the same event, and so the same id.
+    /// parts, each operation's salt among them, make the same event, and so the same id.
     #[test]
     fn the_same_parts_make_the_same_genesis_and_update() {
         let (minter, nonce, timestamp) = (Identity::Ed25519([0x11; 32]), [0x22; 32], 1_720_000_000_000);
-        let membership = || OperationSet(vec![Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))]);
-        let genesis = Event::genesis_from_parts(minter, nonce, timestamp, membership());
-        assert_eq!(genesis, Event::genesis_from_parts(minter, nonce, timestamp, membership()));
-        assert_eq!(hex::encode(genesis.id().as_bytes()), "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a");
+        let membership = |salt| {
+            let operation = Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)));
+            CarriedOperations(vec![CarriedOperation::encode_with_salt(&operation, salt)])
+        };
+        let salt = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let genesis = Event::genesis_from_parts(minter, nonce, timestamp, membership(salt));
+        assert_eq!(genesis, Event::genesis_from_parts(minter, nonce, timestamp, membership(salt)));
+        assert_eq!(hex::encode(genesis.id().as_bytes()), "6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821");
         genesis.validate_structure().expect("a genesis built from its parts names the entity its content derives");
-        assert_ne!(Event::genesis_from_parts(minter, [0x23; 32], timestamp, membership()).id(), genesis.id(), "another nonce");
+        assert_ne!(Event::genesis_from_parts(minter, [0x23; 32], timestamp, membership(salt)).id(), genesis.id(), "another nonce");
+        assert_ne!(Event::genesis_from_parts(minter, nonce, timestamp, membership([0x23; 16])).id(), genesis.id(), "another salt");
 
         let (entity_id, parent) = (EntityId::from_bytes([0x33; 32]), Clock::new(vec![(1, EventId::from_bytes([0x44; 32]))]).unwrap());
-        let update = Event::update_from_parts(entity_id, parent.clone(), nonce, timestamp, membership());
-        assert_eq!(update, Event::update_from_parts(entity_id, parent.clone(), nonce, timestamp, membership()));
-        assert_eq!(hex::encode(update.id().as_bytes()), "c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8");
-        assert_ne!(Event::update_from_parts(entity_id, parent, nonce, timestamp + 1, membership()).id(), update.id(), "another timestamp");
+        let update = Event::update_from_parts(entity_id, parent.clone(), nonce, timestamp, membership(salt));
+        assert_eq!(update, Event::update_from_parts(entity_id, parent.clone(), nonce, timestamp, membership(salt)));
+        assert_eq!(hex::encode(update.id().as_bytes()), "760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f");
+        assert_ne!(
+            Event::update_from_parts(entity_id, parent.clone(), nonce, timestamp + 1, membership(salt)).id(),
+            update.id(),
+            "another timestamp"
+        );
+        assert_ne!(Event::update_from_parts(entity_id, parent, nonce, timestamp, membership([0x23; 16])).id(), update.id(), "another salt");
     }
 
     #[test]

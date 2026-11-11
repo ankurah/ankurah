@@ -116,27 +116,34 @@ pub struct BackendOperation {
     pub diff: Vec<u8>,
 }
 
-/// One operation as an event carries it: the exact bytes its author produced, or
-/// only their digest once the bytes are erased. An event's id covers each
-/// operation's digest, so a node that cannot read an operation still derives
-/// the id, and erasing the bytes changes no id.
+/// One operation as an event carries it: the exact bytes its author produced with
+/// the salt drawn for them, or only their digest once both are erased. An event's
+/// id covers each operation's digest, so a node that cannot read an operation
+/// still derives the id, and erasing changes no id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CarriedOperation {
-    /// The encoding of one [`Operation`], exactly as its author produced it.
-    Bytes(Vec<u8>),
-    /// The digest of bytes that were erased.
+    /// The encoding of one [`Operation`], exactly as its author produced it, and the random
+    /// salt its digest covers, without which hashing a guess would confirm an erased short value.
+    Bytes { salt: [u8; 16], bytes: Vec<u8> },
+    /// The digest of a salt and bytes that were erased.
     Erased([u8; 32]),
 }
 
 impl CarriedOperation {
-    /// `operation` as its author carries it.
-    pub fn encode(operation: &Operation) -> Self { Self::Bytes(encoding::encode(operation)) }
+    /// `operation` as its author carries it, under a freshly drawn salt.
+    pub fn encode(operation: &Operation) -> Self { Self::encode_with_salt(operation, draw_salt()) }
+
+    /// `operation` as its author carries it, under `salt`, for a caller that must arrive at the
+    /// same digest twice.
+    pub fn encode_with_salt(operation: &Operation, salt: [u8; 16]) -> Self { Self::Bytes { salt, bytes: encoding::encode(operation) } }
 
     /// The digest an event's id covers for this operation: SHA-256 over
-    /// [`DomainTag::Operation`] and the bytes, or what erased bytes left.
+    /// [`DomainTag::Operation`], the salt and the bytes, or what erasing them left.
     pub fn digest(&self) -> [u8; 32] {
         match self {
-            Self::Bytes(bytes) => Sha256::new().chain_update(DomainTag::Operation.encoded()).chain_update(bytes).finalize().into(),
+            Self::Bytes { salt, bytes } => {
+                Sha256::new().chain_update(DomainTag::Operation.encoded()).chain_update(salt).chain_update(bytes).finalize().into()
+            }
             Self::Erased(digest) => *digest,
         }
     }
@@ -144,7 +151,7 @@ impl CarriedOperation {
     /// The operation these bytes encode.
     pub fn decode(&self) -> Result<Operation, UnreadableOperation> {
         match self {
-            Self::Bytes(bytes) => encoding::decode_variant(bytes).map_err(|undecodable| match undecodable {
+            Self::Bytes { bytes, .. } => encoding::decode_variant(bytes).map_err(|undecodable| match undecodable {
                 UndecodableVariant::Unknown { index } => UnreadableOperation::UnknownKind { indices: vec![index] },
                 UndecodableVariant::Malformed(error) => match encoding::unknown_variant_within::<Membership>(bytes, MEMBERSHIP_INDEX) {
                     Some(membership) => UnreadableOperation::UnknownKind { indices: vec![MEMBERSHIP_INDEX, membership] },
@@ -154,6 +161,13 @@ impl CarriedOperation {
             Self::Erased(_) => Err(UnreadableOperation::Erased),
         }
     }
+}
+
+/// 16 fresh random bytes for one carried operation, from the source an event's nonce is drawn from.
+fn draw_salt() -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt);
+    salt
 }
 
 /// Why this build cannot read an operation an event carries.
@@ -178,7 +192,7 @@ pub enum UnreadableOperation {
 pub struct CarriedOperations(pub Vec<CarriedOperation>);
 
 impl CarriedOperations {
-    /// Each of `operations` as its author carries it, in order.
+    /// Each of `operations` as its author carries it, in order, each under a freshly drawn salt.
     pub fn encode(operations: &OperationSet) -> Self { Self(operations.iter().map(CarriedOperation::encode).collect()) }
 
     /// The operations, decoded in order; the first this build cannot read fails the whole.
@@ -207,23 +221,53 @@ mod tests {
 
     fn membership() -> Operation { Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))) }
 
-    /// The operation vectors of specs/protocol/bytes.md section 5: each operation's bytes and its digest.
+    /// The salt the vectors of specs/protocol/bytes.md section 5 carry each operation under.
+    const SALT: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    /// The operation vectors of specs/protocol/bytes.md section 5: each operation's bytes and its
+    /// digest under [`SALT`], and the membership operation as an event carries it.
     #[test]
     fn operation_bytes_and_digests_match_the_byte_specification_vectors() {
         let backend = Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![1, 2, 3] }] };
         for (operation, bytes, digest) in [
-            (membership(), "01000000000000000100000000000000", "76ef9eee987e3dc3a09adbf20c51740e948216e9a8f79bdd1994deffedf5fd98"),
+            (membership(), "01000000000000000100000000000000", "bea9486dbdfdd7696dd382ae5c3cd36e45a2646584bf94a2f954b6ab1d737b7c"),
             (
                 backend,
                 "0000000003000000000000006c777701000000000000000300000000000000010203",
-                "75307fbd9932f311bc6799c89a2051231dc6e731410b47a0096484352f219db5",
+                "e777ce023d7df90ddcc01b515526fe0ed4bfef7e81789674aac5d404d4cf9309",
             ),
         ] {
-            let carried = CarriedOperation::encode(&operation);
-            assert_eq!(carried, CarriedOperation::Bytes(hex::decode(bytes).unwrap()));
+            let carried = CarriedOperation::encode_with_salt(&operation, SALT);
+            assert_eq!(carried, CarriedOperation::Bytes { salt: SALT, bytes: hex::decode(bytes).unwrap() });
             assert_eq!(hex::encode(carried.digest()), digest);
             assert_eq!(CarriedOperation::Erased(carried.digest()).digest(), carried.digest(), "an erased operation keeps its digest");
         }
+        assert_eq!(
+            hex::encode(encode(&CarriedOperation::encode_with_salt(&membership(), SALT))),
+            "00000000000102030405060708090a0b0c0d0e0f100000000000000001000000000000000100000000000000",
+            "the variant index, the salt with no length, then the bytes with theirs"
+        );
+    }
+
+    /// Each carrying draws its own salt, so two carryings of one operation have different
+    /// digests; under one salt an operation has one digest.
+    #[test]
+    fn each_carrying_draws_a_salt_and_one_salt_gives_one_digest() {
+        assert_ne!(CarriedOperation::encode(&membership()).digest(), CarriedOperation::encode(&membership()).digest());
+        assert_eq!(
+            CarriedOperation::encode_with_salt(&membership(), SALT).digest(),
+            CarriedOperation::encode_with_salt(&membership(), SALT).digest()
+        );
+    }
+
+    /// The digest covers the salt, so it is not the hash of the tag and the bytes alone, which
+    /// anyone could compute from a guess at an erased value.
+    #[test]
+    fn the_digest_is_not_the_hash_of_the_bytes_alone() {
+        let digest = hex::encode(CarriedOperation::encode_with_salt(&membership(), SALT).digest());
+        // SHA-256( tag(operation) || bytes ) for the membership operation.
+        assert_ne!(digest, "76ef9eee987e3dc3a09adbf20c51740e948216e9a8f79bdd1994deffedf5fd98");
+        assert_eq!(digest, "bea9486dbdfdd7696dd382ae5c3cd36e45a2646584bf94a2f954b6ab1d737b7c");
     }
 
     #[test]
@@ -239,7 +283,7 @@ mod tests {
         let erased = CarriedOperation::Erased(CarriedOperation::encode(&membership()).digest());
         assert_eq!(erased.decode(), Err(UnreadableOperation::Erased));
         // Variant index 2, which no build of `Operation` defines yet.
-        let unknown = CarriedOperation::Bytes(vec![2, 0, 0, 0, 7]);
+        let unknown = CarriedOperation::Bytes { salt: SALT, bytes: vec![2, 0, 0, 0, 7] };
         assert_eq!(unknown.decode(), Err(UnreadableOperation::UnknownKind { indices: vec![2] }));
         let carried = CarriedOperations(vec![CarriedOperation::encode(&membership()), unknown]);
         assert_eq!(
@@ -253,7 +297,8 @@ mod tests {
     #[test]
     fn bytes_that_do_not_decode_as_a_known_kind_are_malformed() {
         for bytes in [vec![], vec![1, 0, 0], vec![0, 0, 0, 0, 7], vec![1, 0, 0, 0, 0, 0, 0, 0]] {
-            assert!(matches!(CarriedOperation::Bytes(bytes.clone()).decode(), Err(UnreadableOperation::Malformed(_))), "{bytes:?}");
+            let carried = CarriedOperation::Bytes { salt: SALT, bytes: bytes.clone() };
+            assert!(matches!(carried.decode(), Err(UnreadableOperation::Malformed(_))), "{bytes:?}");
         }
     }
 
@@ -261,17 +306,21 @@ mod tests {
     /// build adds inside the membership operation this build knows.
     #[test]
     fn a_membership_of_the_reserved_removal_index_is_of_a_kind_this_build_does_not_know() {
-        let CarriedOperation::Bytes(mut bytes) = CarriedOperation::encode(&membership()) else { unreachable!("encoding yields bytes") };
+        let CarriedOperation::Bytes { salt, mut bytes } = CarriedOperation::encode(&membership()) else {
+            unreachable!("encoding yields bytes")
+        };
         // The operation's variant index, then the membership's.
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
-        assert_eq!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::UnknownKind { indices: vec![1, 1] }));
+        assert_eq!(CarriedOperation::Bytes { salt, bytes }.decode(), Err(UnreadableOperation::UnknownKind { indices: vec![1, 1] }));
     }
 
     #[test]
     fn bytes_left_over_after_the_operation_make_it_unreadable() {
-        let CarriedOperation::Bytes(mut bytes) = CarriedOperation::encode(&membership()) else { unreachable!("encoding yields bytes") };
+        let CarriedOperation::Bytes { salt, mut bytes } = CarriedOperation::encode(&membership()) else {
+            unreachable!("encoding yields bytes")
+        };
         bytes.push(0);
-        assert!(matches!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::Malformed(_))));
+        assert!(matches!(CarriedOperation::Bytes { salt, bytes }.decode(), Err(UnreadableOperation::Malformed(_))));
     }
 
     /// Variant order is part of the bincode contract for event payloads:
@@ -292,7 +341,7 @@ mod tests {
             assert_eq!(encode(&round), bytes);
         }
 
-        assert_eq!(encode(&CarriedOperation::Bytes(vec![]))[..4], [0, 0, 0, 0], "CarriedOperation::Bytes");
+        assert_eq!(encode(&CarriedOperation::Bytes { salt: SALT, bytes: vec![] })[..4], [0, 0, 0, 0], "CarriedOperation::Bytes");
         assert_eq!(encode(&CarriedOperation::Erased([0; 32]))[..4], [1, 0, 0, 0], "CarriedOperation::Erased");
     }
 }

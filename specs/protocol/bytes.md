@@ -123,8 +123,13 @@ An event carries each operation as a `CarriedOperation`, an enum:
 
 | Index | Variant | Fields |
 |---|---|---|
-| 0 | `Bytes` | byte string: the encoding of one `Operation`, exactly as its author produced it |
-| 1 | `Erased` | `[u8; 32]`: the digest of bytes that were erased |
+| 0 | `Bytes` | `salt: [u8; 16]`, then `bytes`, a byte string: the encoding of one `Operation`, exactly as its author produced it |
+| 1 | `Erased` | `[u8; 32]`: the digest of a salt and bytes that were erased |
+
+A `Bytes` operation is its variant index, then the 16 salt bytes with no
+length, then the bytes with their length. Its author draws the salt at random
+for each operation it carries. Erasing an operation drops the salt with the
+bytes and keeps the digest (4.1).
 
 The bytes of a `Bytes` operation hold one encoded `Operation` and nothing
 after it. A node cannot read an operation whose bytes it cannot decode (an
@@ -204,11 +209,14 @@ to the bytes it was read from.
 ### 4.1 Operation digest
 
 ```text
-digest = SHA-256( tag(operation) || bytes )
+digest = SHA-256( tag(operation) || salt || bytes )
 ```
 
-for a `Bytes` operation, where `bytes` are the carried bytes without their
-length. An `Erased` operation's digest is the 32 bytes it carries.
+for a `Bytes` operation, where `salt` is its 16 bytes and `bytes` are the
+carried bytes without their length. The salt is fixed-width, so nothing else
+delimits it. Without the salt, anyone holding the digest of an erased short
+value could confirm a guess at it by hashing. An `Erased` operation's digest is
+the 32 bytes it carries.
 
 ### 4.2 Genesis id
 
@@ -287,25 +295,32 @@ gives vectors for these rules.
 Each vector gives its inputs, then the expected bytes or hash in hex. `[b; n]`
 is n bytes of value b.
 
-Operations:
+Operations, each carried under the salt `000102030405060708090a0b0c0d0e0f`:
 
 | Operation | Bytes | Digest |
 |---|---|---|
-| `Membership(Add(System(Model)))` | `01000000000000000100000000000000` | `76ef9eee987e3dc3a09adbf20c51740e948216e9a8f79bdd1994deffedf5fd98` |
-| `Backend { backend: "lww", operations: [{ diff: 010203 }] }` | `0000000003000000000000006c777701000000000000000300000000000000010203` | `75307fbd9932f311bc6799c89a2051231dc6e731410b47a0096484352f219db5` |
+| `Membership(Add(System(Model)))` | `01000000000000000100000000000000` | `bea9486dbdfdd7696dd382ae5c3cd36e45a2646584bf94a2f954b6ab1d737b7c` |
+| `Backend { backend: "lww", operations: [{ diff: 010203 }] }` | `0000000003000000000000006c777701000000000000000300000000000000010203` | `e777ce023d7df90ddcc01b515526fe0ed4bfef7e81789674aac5d404d4cf9309` |
+
+The membership operation carried under that salt:
+
+```text
+00000000 000102030405060708090a0b0c0d0e0f
+1000000000000000 01000000000000000100000000000000
+```
 
 Event ids, with minter `Ed25519([0x11; 32])`, nonce `[0x22; 32]`, timestamp
 `1720000000000`, and for the update the entity id `[0x33; 32]` and the parent
 clock with one entry, generation 1 and event id `[0x44; 32]`. "Membership" and
-"backend" are the operations above; "erased membership" is the membership
-operation carried as `Erased` with its digest.
+"backend" are the operations above, carried under that salt; "erased
+membership" is the membership operation carried as `Erased` with its digest.
 
 | Operations | Genesis id | Update id |
 |---|---|---|
 | none | `133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649` | `036ff81f4ba2285f3ccd38e0ad3232855a466bb6c0b9d6f0fd254a202180364e` |
-| membership | `9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a` | `c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8` |
-| membership, backend | `0395ecaf7e93f57b19cf2098a8161c6c0c72b182ff1f5dfc8a0525359cd927a3` | `342304016d7452fae948903da6bb928e9b69b3c460d1bdb49d69fbcead6e1b43` |
-| erased membership | `9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a` | `c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8` |
+| membership | `6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821` | `760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f` |
+| membership, backend | `9fcc73ceeb855f5a66085b2c5efa3fb367cb6c078e55da1c89d9aae6e5fc4b83` | `f6068afad6389a9d0c6ee253f24965dd9f9a481fa0648a1a08007c171d24ac72` |
+| erased membership | `6f23dd9c9cc044d9ce9dfcebd266667625b4955dc723f723809fd0f34a43f821` | `760a5569fdfd623e4c1bdf40482c77f57e747f00a38a4389c067916d94886e1f` |
 
 State digest of the entity `[0x55; 32]` whose state buffers map `"lww"` to
 `010203` and `"yrs"` to `0405`, whose memberships are `{ EntityId([0x77; 32]),
@@ -372,8 +387,8 @@ eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 00000000 99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999
 ```
 
-The line breaks and spaces in the last four vectors separate fields; the
-string is the bytes alone.
+The line breaks and spaces in the vectors written as blocks separate fields;
+the string is the bytes alone.
 
 Signatures over the signed bytes `6d657373616765` (the ASCII of `message`),
 under the rules of 4.7. The base point B encodes as `58` followed by 31 bytes

@@ -96,7 +96,8 @@ fn row(
     let lww = staged.to_operations().expect("staged LWW values extract").expect("a written LWW backend yields operations");
     let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), lww.clone())]));
     operations.push(proto::Operation::Membership(proto::Membership::Add(membership.clone())));
-    let operations = proto::CarriedOperations::encode(&operations);
+    // A fixed salt, not a drawn one, so a forged catalog keeps the same ids in every run.
+    let operations = ankurah::core::test_helpers::carried_under_salt(&operations, [0; 16]);
 
     let nonce = content_nonce(counter, &[b"catalog-row", namespace, collection.as_bytes()]);
     let timestamp = 0u64;

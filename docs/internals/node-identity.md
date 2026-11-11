@@ -116,10 +116,15 @@ A genesis names the `Identity` that minted it, and the minter is inside the
 entity's id:
 
 ```text
-operation digest = SHA-256(tag(operation) || the operation's bytes)
+operation digest = SHA-256(tag(operation) || salt || the operation's bytes)
 genesis id = SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n)
 update id  = SHA-256(tag(update) || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent)
 ```
+
+An id covers each operation's digest rather than its bytes, so erasing an
+operation's bytes later changes no id. Each operation is carried with 16 random
+bytes of salt, which its digest covers and which are erased with its bytes, so
+nobody can confirm a guess at an erased short value by hashing it.
 
 Every string Ankurah hashes or signs opens with a domain tag naming what the
 string is for: `ankurah.genesis.v1`, `ankurah.update.v1`,
