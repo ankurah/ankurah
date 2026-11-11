@@ -9,7 +9,7 @@ use ankurah_core::schema::registration::RegistrationPlan;
 use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
 use ankurah_core_types::ValueType;
 
-use crate::{bound_predicate::BoundPredicate, graph::PolicyGraph, model::*, PolicyCatalog, PolicyConfig};
+use crate::{bound_predicate::BoundPredicate, graph::PolicyGraph, model::*, PolicyAuthoringError, PolicyCatalog, PolicyConfig};
 
 /// Replace rule entities in one transaction, retaining role/privilege identities and retiring old rules.
 pub(crate) async fn set_policy(context: &Context, catalog: &CatalogManager, config: &PolicyConfig, pem: String) -> anyhow::Result<()> {
@@ -86,6 +86,7 @@ pub(crate) async fn set_policy(context: &Context, catalog: &CatalogManager, conf
         let mut property_labels = BTreeSet::new();
         for scope in &rule.scope {
             let (parsed, _) = crate::variables::parse_template(&scope.filter)?;
+            refuse_qualified_scope_property(label, &scope.filter, &parsed)?;
             collect_property_labels(&parsed, label, &mut property_labels);
             let row = PolicyScope {
                 policy: policy.into(),
@@ -330,6 +331,38 @@ fn collect_expr_labels(expr: &Expr<Parsed>, model: &str, labels: &mut BTreeSet<S
         }
         Expr::Predicate(predicate) => collect_property_labels(predicate, model, labels),
         _ => {}
+    }
+}
+
+/// Refuse a scope filter that names a property as `Component::name`: a scope restricts one model's entities by
+/// that model's own properties.
+fn refuse_qualified_scope_property(model: &str, filter: &str, predicate: &Predicate<Parsed>) -> Result<(), PolicyAuthoringError> {
+    match first_qualifier(predicate) {
+        Some(component) => {
+            Err(PolicyAuthoringError::QualifiedScopeProperty { model: model.to_owned(), filter: filter.to_owned(), component })
+        }
+        None => Ok(()),
+    }
+}
+
+/// The component of the first property path in `predicate` that names one.
+fn first_qualifier(predicate: &Predicate<Parsed>) -> Option<String> {
+    predicate.walk(None, &mut |found: Option<String>, predicate| {
+        found.or_else(|| match predicate {
+            Predicate::Comparison { left, right, .. } => expr_qualifier(left).or_else(|| expr_qualifier(right)),
+            Predicate::IsNull(expr) => expr_qualifier(expr),
+            _ => None,
+        })
+    })
+}
+
+fn expr_qualifier(expr: &Expr<Parsed>) -> Option<String> {
+    match expr {
+        Expr::Path(path) => path.component.clone(),
+        Expr::ExprList(items) => items.iter().find_map(expr_qualifier),
+        Expr::InfixExpr { left, right, .. } => expr_qualifier(left).or_else(|| expr_qualifier(right)),
+        Expr::Predicate(predicate) => first_qualifier(predicate),
+        _ => None,
     }
 }
 

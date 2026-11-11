@@ -147,11 +147,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
 
     /// Construct a livequery, resolving its selection now or scheduling asynchronous resolution.
-    fn query(self: Arc<Self>, schema: &'static ModelStructDescriptor, args: MatchArgs<Parsed>) -> Result<EntityLiveQuery, RetrievalError> {
+    fn query(
+        self: Arc<Self>,
+        components: Vec<&'static ModelStructDescriptor>,
+        args: MatchArgs<Parsed>,
+    ) -> Result<EntityLiveQuery, RetrievalError> {
         if matches!(&self.auth, ContextAuth::Privileged) {
             return Err(RetrievalError::Other("the privileged context does not query".into()));
         }
-        let resolution = crate::livequery::QueryResolution::prepare(self.schema_resolver(), schema, args.selection)?;
+        let resolution = crate::livequery::QueryResolution::prepare(self.schema_resolver(), components, args.selection)?;
         EntityLiveQuery::new(self, args.cache_policy, resolution)
     }
 }

@@ -1,14 +1,13 @@
-//! Tests for per-rule `applies_to` on scope rules: a `"write"`-only rule
-//! gates what may be written without hiding rows from reads. The fixture
-//! models the role-assignment shape: everyone with admin privileges may see
-//! all assignments, but only holders of `account:write` may write rows whose
-//! `role_key` is outside the allowlist.
+//! Tests of scope rules: per-rule `applies_to`, by which a `"write"`-only rule gates what may be written
+//! without hiding rows from reads, and which names a scope filter may use. `scope_ops.json` models the
+//! role-assignment shape: everyone with admin privileges may see all assignments, but only holders of
+//! `account:write` may write rows whose `role_key` is outside the allowlist.
 
 mod common;
 
 use ankurah::{Model, Node};
 use ankurah_connector_local_process::LocalProcessConnection;
-use ankurah_jwt_auth::{JwtAgent, JwtContext, ScopeRuleOp};
+use ankurah_jwt_auth::{JwtAgent, JwtContext, PolicyAuthoringError, PolicyConfig, ScopeRuleOp};
 use ankurah_storage_sled::SledStorageEngine;
 use common::{make_claims, sign_token};
 use std::sync::Arc;
@@ -115,5 +114,24 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
     trx.create(&Assignment { role_key: "owner".into(), label: "legit grant".into() }).await.expect("owner create");
     trx.commit().await.expect("owner bypass commit should be allowed");
 
+    Ok(())
+}
+
+/// A scope restricts one model's entities by that model's own properties, so a filter that names a property
+/// as `Component::name` is refused when the policy is set.
+#[tokio::test]
+async fn a_scope_filter_with_a_component_qualifier_is_refused_when_the_policy_is_set() -> anyhow::Result<()> {
+    let agent = JwtAgent::new_durable(common::test_keys(), scope_ops_config_path())?;
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    node.system.create().await?;
+    let filter = "Other::owner = $jwt.sub";
+    let config: PolicyConfig = serde_json::from_value(serde_json::json!({
+        "roles": { "Owner": ["account:write"] },
+        "collections": { "assignment": { "read": "account:write", "scope": [{ "filter": filter, "unless_privilege": null }] } }
+    }))?;
+    let error = agent.set_policy(&node, &config).await.expect_err("a qualified scope filter must be refused");
+    let expected =
+        PolicyAuthoringError::QualifiedScopeProperty { model: "assignment".into(), filter: filter.into(), component: "Other".into() };
+    assert_eq!(error.downcast_ref::<PolicyAuthoringError>(), Some(&expected), "{error:#}");
     Ok(())
 }

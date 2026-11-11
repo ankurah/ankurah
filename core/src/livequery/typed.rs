@@ -1,6 +1,6 @@
 use super::EntityLiveQuery;
 use crate::internal::prelude::*;
-use crate::model::Model;
+use crate::model::ComponentViews;
 use crate::reactor::ReactorUpdate;
 use crate::resultset::ResultSet;
 use ankurah_signals::{
@@ -12,18 +12,18 @@ use ankurah_signals::{
 use std::marker::PhantomData;
 
 #[derive(Clone)]
-pub struct LiveQuery<R: View>(pub(super) EntityLiveQuery, pub(super) PhantomData<R>);
+pub struct LiveQuery<R: ComponentViews>(pub(super) EntityLiveQuery, pub(super) PhantomData<R>);
 
-impl<R: View> From<LiveQuery<R>> for EntityLiveQuery {
+impl<R: ComponentViews> From<LiveQuery<R>> for EntityLiveQuery {
     fn from(query: LiveQuery<R>) -> Self { query.0 }
 }
 
-impl<R: View> std::ops::Deref for LiveQuery<R> {
+impl<R: ComponentViews> std::ops::Deref for LiveQuery<R> {
     type Target = EntityLiveQuery;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl<R: View> LiveQuery<R> {
+impl<R: ComponentViews> LiveQuery<R> {
     /// Resolve typed field names now; defer missing bindings or readiness.
     pub fn update_selection(
         &self,
@@ -31,7 +31,7 @@ impl<R: View> LiveQuery<R> {
     ) -> Result<(), RetrievalError> {
         let resolution = super::QueryResolution::prepare(
             self.0 .0.context.schema_resolver(),
-            R::Model::descriptor(),
+            R::components(),
             selection.try_into().map_err(Into::into)?,
         )?;
         self.0.update_resolution(resolution)
@@ -62,13 +62,13 @@ impl<R: View> LiveQuery<R> {
     }
 }
 
-impl<R: View> Signal for LiveQuery<R> {
+impl<R: ComponentViews> Signal for LiveQuery<R> {
     fn listen(&self, listener: Listener) -> ListenerGuard { self.0 .0.subscription.listen(listener) }
 
     fn broadcast_id(&self) -> BroadcastId { self.0 .0.subscription.broadcast_id() }
 }
 
-impl<R: View + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
+impl<R: ComponentViews + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
     fn get(&self) -> Vec<R> {
         use ankurah_signals::CurrentObserver;
         CurrentObserver::track(&self);
@@ -76,11 +76,11 @@ impl<R: View + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
     }
 }
 
-impl<R: View + Clone + 'static> Peek<Vec<R>> for LiveQuery<R> {
+impl<R: ComponentViews + Clone + 'static> Peek<Vec<R>> for LiveQuery<R> {
     fn peek(&self) -> Vec<R> { self.0 .0.resultset.wrap().peek() }
 }
 
-impl<R: View> Subscribe<ChangeSet<R>> for LiveQuery<R>
+impl<R: ComponentViews> Subscribe<ChangeSet<R>> for LiveQuery<R>
 where R: Clone + Send + Sync + 'static
 {
     fn subscribe<L>(&self, listener: L) -> SubscriptionGuard
@@ -95,7 +95,7 @@ where R: Clone + Send + Sync + 'static
     }
 }
 
-fn changes_from_update<R: View>(resultset: ResultSet<R>, reactor_update: ReactorUpdate) -> ChangeSet<R> {
+fn changes_from_update<R: ComponentViews>(resultset: ResultSet<R>, reactor_update: ReactorUpdate) -> ChangeSet<R> {
     use crate::changes::{ChangeSet, ItemChange};
 
     let mut changes = Vec::new();

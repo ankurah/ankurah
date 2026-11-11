@@ -425,3 +425,12 @@ fn test_selection_macro_list_expansion() {
     // parsing to distinguish between single values and collections in the token stream
     // processing. The current quoted syntax with {} works perfectly for list expansion.
 }
+
+#[test]
+fn selection_macro_keeps_a_component_qualifier() {
+    let assignee = "ada";
+    assert_eq!(
+        selection!(Assignment::assignee = {assignee} ORDER BY Assignment::assignee),
+        ankql::parser::parse_selection("Assignment::assignee = 'ada' ORDER BY Assignment::assignee").unwrap()
+    );
+}

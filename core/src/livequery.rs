@@ -71,7 +71,7 @@ impl EntityLiveQuery {
         crate::task::spawn(task);
     }
 
-    pub(crate) fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
+    pub(crate) fn map<R: crate::model::ComponentViews>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
 
     pub(crate) fn fail_resolution(&self, version: u32, error: RetrievalError) { self.0.fail_initialization(version, error); }
 

@@ -44,5 +44,9 @@ pub(crate) trait DynContextInner: LocalEntitySource {
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
 
     /// Construct a livequery, resolving its selection now or scheduling asynchronous resolution.
-    fn query(self: Arc<Self>, schema: &'static ModelStructDescriptor, args: MatchArgs<Parsed>) -> Result<EntityLiveQuery, RetrievalError>;
+    fn query(
+        self: Arc<Self>,
+        components: Vec<&'static ModelStructDescriptor>,
+        args: MatchArgs<Parsed>,
+    ) -> Result<EntityLiveQuery, RetrievalError>;
 }

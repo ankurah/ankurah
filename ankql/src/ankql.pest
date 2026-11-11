@@ -36,7 +36,8 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
                 Unsigned = @{ ASCII_DIGIT+ }
                 SingleQuotedString = @{ "'" ~ ("''" | !"'" ~ ANY)* ~ "'" }
             QuestionParameter = @{ "?" }
-            PathExpr = { Identifier ~ ("." ~ Identifier)* }
+            PathExpr = { ComponentQualifier? ~ Identifier ~ ("." ~ Identifier)* }
+                ComponentQualifier = ${ Identifier ~ "::" ~ !WS }
             ExpressionInParentheses = { "(" ~ Expr ~ ")" }
             Row = { "(" ~ Expr ~ ("," ~ Expr)* ~ ")" }
 
@@ -50,7 +51,7 @@ Identifier = @{ DoubleQuotedIdentifier | IdentifierInner  }
                 | ^"values" | LimitClause | OrderByClause }
 
 OrderByClause = ${ ^"order" ~ WS+ ~ ^"by" ~ WS+ ~ (OrderByItem ~ WS* ~ ("," ~ WS* ~ OrderByItem)*)? }
-OrderByItem = ${ Identifier ~ (WS+ ~ OrderDirection)? }
+OrderByItem = ${ ComponentQualifier? ~ Identifier ~ (WS+ ~ OrderDirection)? }
 OrderDirection = { ^"asc" | ^"desc" }
 LimitClause = ${ ^"limit" ~ WS+ ~ Unsigned }
 

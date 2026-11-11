@@ -213,20 +213,33 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>
     }
 }
 
-/// Parse a path expression (dot-separated identifiers like `name` or `licensing.territory`)
+/// Parse a path expression (dot-separated identifiers like `name` or `licensing.territory`),
+/// optionally preceded by a component qualifier (`Assignment::assignee`).
 fn parse_path_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr<ast::Parsed>, ParseError> {
     if pair.as_rule() != grammar::Rule::PathExpr {
         return Err(ParseError::UnexpectedRule { expected: "PathExpr", got: pair.as_rule() });
     }
 
-    let steps: Vec<String> =
-        pair.into_inner().filter(|p| p.as_rule() == grammar::Rule::Identifier).map(|p| parse_identifier(p.as_str())).collect();
-
+    let (component, steps) = parse_qualified_steps(pair.into_inner());
     if steps.is_empty() {
         return Err(ParseError::InvalidPredicate("Empty path expression".into()));
     }
 
-    Ok(ast::Expr::Path(ast::PathExpr { steps }))
+    Ok(ast::Expr::Path(ast::PathExpr { component, steps }))
+}
+
+/// The optional `Component::` qualifier and the identifiers after it.
+fn parse_qualified_steps<'i>(pairs: impl Iterator<Item = Pair<'i, grammar::Rule>>) -> (Option<String>, Vec<String>) {
+    let mut component = None;
+    let mut steps = Vec::new();
+    for pair in pairs {
+        match pair.as_rule() {
+            grammar::Rule::ComponentQualifier => component = pair.into_inner().next().map(|name| parse_identifier(name.as_str())),
+            grammar::Rule::Identifier => steps.push(parse_identifier(pair.as_str())),
+            _ => {}
+        }
+    }
+    (component, steps)
 }
 
 fn parse_identifier(text: &str) -> String {
@@ -320,12 +333,11 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem<ast
 
     let inner_pairs: Vec<_> = pair.into_inner().collect();
 
-    let identifier_pair = inner_pairs
-        .iter()
-        .find(|p| p.as_rule() == grammar::Rule::Identifier)
-        .ok_or(ParseError::InvalidPredicate("Missing property name in ORDER BY item".into()))?;
-
-    let path = ast::PathExpr::simple(parse_identifier(identifier_pair.as_str()));
+    let (component, steps) = parse_qualified_steps(inner_pairs.iter().cloned());
+    if steps.is_empty() {
+        return Err(ParseError::InvalidPredicate("Missing property name in ORDER BY item".into()));
+    }
+    let path = ast::PathExpr { component, steps };
 
     let direction = inner_pairs
         .iter()
@@ -755,6 +767,58 @@ mod tests {
         // Dotted identifiers are intentionally not supported in ORDER BY
         let result = parse_selection("true ORDER BY user.name ASC");
         assert!(result.is_err());
+        Ok(())
+    }
+
+    fn qualified(component: &str, steps: &[&str]) -> ast::PathExpr {
+        ast::PathExpr { component: Some(component.to_owned()), steps: steps.iter().map(|step| step.to_string()).collect() }
+    }
+
+    #[test]
+    fn component_qualifier_precedes_the_path_and_leaves_dots_alone() {
+        let path = |source: &str| match parse_round_trip(source) {
+            ast::Predicate::Comparison { left, .. } => *left,
+            ast::Predicate::IsNull(expr) => *expr,
+            other => panic!("expected a comparison, got {other:?}"),
+        };
+        assert_eq!(path("Assignment::assignee = 'x'"), ast::Expr::Path(qualified("Assignment", &["assignee"])));
+        assert_eq!(path("\"records.closure\"::closed_at IS NULL"), ast::Expr::Path(qualified("records.closure", &["closed_at"])));
+        assert_eq!(
+            path("Assignment::assignee.display_name = 'x'"),
+            ast::Expr::Path(qualified("Assignment", &["assignee", "display_name"]))
+        );
+        assert_eq!(
+            path("licensing.territory = 'x'"),
+            ast::Expr::Path(ast::PathExpr { component: None, steps: vec!["licensing".into(), "territory".into()] })
+        );
+        assert!(parse_selection("Assignment::assignee::name = 'x'").is_err(), "one qualifier per path");
+    }
+
+    #[test]
+    fn component_qualifier_takes_no_whitespace_around_its_colons() {
+        for source in [
+            "Assignment:: assignee = 'x'",
+            "Assignment ::assignee = 'x'",
+            "Assignment :: assignee = 'x'",
+            "true ORDER BY Assignment:: assignee",
+            "true ORDER BY Assignment ::assignee",
+        ] {
+            assert!(parse_selection(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn order_by_takes_a_component_qualifier() -> anyhow::Result<()> {
+        let selection = parse_selection("true ORDER BY Assignment::assignee DESC, \"records.closure\"::closed_at")?;
+        assert_eq!(
+            selection.order_by,
+            Some(vec![
+                ast::OrderByItem { path: qualified("Assignment", &["assignee"]), direction: ast::OrderDirection::Desc },
+                ast::OrderByItem { path: qualified("records.closure", &["closed_at"]), direction: ast::OrderDirection::Asc },
+            ])
+        );
+        assert_eq!(parse_selection(&selection.to_string())?, selection);
+        assert!(parse_selection("true ORDER BY Assignment::assignee.name").is_err(), "ORDER BY names whole properties");
         Ok(())
     }
 

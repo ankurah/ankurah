@@ -1,6 +1,7 @@
 use super::{proxy::EntityProxy, set::Registration, state::EntityState};
 use crate::{
-    error::{MutationError, StateError},
+    error::{MutationError, RetrievalError, StateError},
+    model::View,
     property::PropertyError,
     schema::SystemEpoch,
     value::Value,
@@ -58,6 +59,12 @@ impl Entity {
     pub fn memberships(&self) -> BTreeSet<ModelId> { self.with_state(EntityState::memberships).unwrap_or_default() }
 
     pub fn has_membership(&self, model: &ModelId) -> bool { self.memberships().contains(model) }
+
+    /// This entity seen through `V`'s component. Fails with `MissingComponent` if the entity lacks that component,
+    /// `UnboundDeclaration` if this node has not bound `V`'s model at the entity's epoch, and a `TransactionClosed`
+    /// property error for a creation whose transaction rolled back. A cast cannot register a model: a query
+    /// on `V`, or `Context::resolve_model_id` for its model, must have bound it on this node.
+    pub fn cast<V: View>(&self) -> Result<V, RetrievalError> { V::from_entity(self.clone()) }
 
     /// Whether this handle still has an entity to read; false only for a creation whose transaction rolled back.
     pub fn is_alive(&self) -> bool { self.with_state(|_| ()).is_ok() }

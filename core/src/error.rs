@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::connector::SendError;
 pub use crate::node::event_admissibility::InadmissibleEvent;
+pub use crate::schema::resolver::ComponentScopeError;
 
 /// Why this node permanently stopped accepting work, not a rejected connection or operation.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,8 @@ pub enum RetrievalError {
     ApplyError(Arc<ApplyError>),
     #[error("model '{label}' has no complete compatible binding in the local catalog; schema synchronization or registration is required")]
     UnboundDeclaration { label: String },
+    #[error(transparent)]
+    ComponentScope(#[from] ComponentScopeError),
 }
 
 impl From<NodeReadinessError> for RetrievalError {
