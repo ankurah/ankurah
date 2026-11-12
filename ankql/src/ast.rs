@@ -135,6 +135,8 @@ impl<S: Stage> Selection<S> {
     deserialize = "S::Path: Deserialize<'de>, S::ModelId: Deserialize<'de>"
 ))]
 pub enum Predicate<S: Stage> {
+    // TODO: make this `Comparison(Comparison)`, a struct that owns its operands, so that readers take that struct
+    // rather than building a `Comparison` view of these fields.
     Comparison {
         left: Box<Expr<S>>,
         operator: ComparisonOperator,
@@ -397,7 +399,7 @@ impl<S: Stage> Expr<S> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ComparisonOperator {
     Equal,              // =
     NotEqual,           // <> or !=
@@ -407,6 +409,55 @@ pub enum ComparisonOperator {
     LessThanOrEqual,    // <=
     In,                 // IN
     Between,            // BETWEEN
+}
+
+impl ComparisonOperator {
+    /// The operator that holds with the operands the other way round: `5 < x` holds exactly when `x > 5`. None for
+    /// IN and BETWEEN, whose operands cannot change places.
+    pub fn converse(&self) -> Option<Self> {
+        match self {
+            Self::Equal => Some(Self::Equal),
+            Self::NotEqual => Some(Self::NotEqual),
+            Self::GreaterThan => Some(Self::LessThan),
+            Self::GreaterThanOrEqual => Some(Self::LessThanOrEqual),
+            Self::LessThan => Some(Self::GreaterThan),
+            Self::LessThanOrEqual => Some(Self::GreaterThanOrEqual),
+            Self::In | Self::Between => None,
+        }
+    }
+}
+
+/// The operands and operator of a `Predicate::Comparison`, borrowed from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comparison<'a, S: Stage> {
+    pub left: &'a Expr<S>,
+    pub operator: ComparisonOperator,
+    pub right: &'a Expr<S>,
+}
+
+impl<'a, S: Stage> TryFrom<&'a Predicate<S>> for Comparison<'a, S> {
+    /// The predicate, which is not a comparison.
+    type Error = &'a Predicate<S>;
+
+    fn try_from(predicate: &'a Predicate<S>) -> Result<Self, Self::Error> {
+        match predicate {
+            Predicate::Comparison { left, operator, right } => Ok(Comparison { left, operator: *operator, right }),
+            other => Err(other),
+        }
+    }
+}
+
+impl<'a, S: Stage> Comparison<'a, S> {
+    /// The path, the operator as it reads from the path, and the literal, for a path compared with a literal
+    /// whichever side the path is written on: `5 < x` gives `x`, `>`, `5`. None for any other comparison, and for an
+    /// IN or BETWEEN with its path second, which has no converse.
+    pub fn path_op_lit(self) -> Option<(&'a S::Path, ComparisonOperator, &'a Value)> {
+        match (self.left, self.right) {
+            (Expr::Path(path), Expr::Literal(value)) => Some((path, self.operator, value)),
+            (Expr::Literal(value), Expr::Path(path)) => Some((path, self.operator.converse()?, value)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -421,6 +472,26 @@ pub enum InfixOperator {
 mod tests {
     use super::*;
     use crate::parser::parse_selection;
+
+    /// `5 < x` reads from `x` as `x > 5`; a comparison of two paths, of two literals, or an IN with its path second,
+    /// does not read from a path.
+    #[test]
+    fn a_comparison_reads_alike_from_its_path_written_either_way_round() {
+        let read = |source: &str| {
+            let predicate = parse_selection(source).unwrap().predicate;
+            let read = Comparison::try_from(&predicate).ok().and_then(Comparison::path_op_lit);
+            read.map(|(path, operator, value)| (path.clone(), operator, value.clone()))
+        };
+        for (path_first, literal_first) in
+            [("x = 5", "5 = x"), ("x != 5", "5 != x"), ("x > 5", "5 < x"), ("x >= 5", "5 <= x"), ("x < 5", "5 > x"), ("x <= 5", "5 >= x")]
+        {
+            assert!(read(path_first).is_some(), "{path_first}");
+            assert_eq!(read(literal_first), read(path_first), "{literal_first}");
+        }
+        for source in ["x < y", "1 < 2", "'a' IN x", "TRUE"] {
+            assert_eq!(read(source), None, "{source}");
+        }
+    }
 
     fn prop_id(name: &str) -> EntityId {
         let mut bytes = [0u8; 32];

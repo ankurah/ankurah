@@ -182,18 +182,19 @@ impl WatcherSet {
         watcher_id: (ReactorSubscriptionId, proto::QueryId), // Should this be a tuple of (subscription_id, query_id) or just subscription_id?
         op: WatcherOp,
     ) {
-        use ankql::ast::{Expr, Predicate};
+        use ankql::ast::{Comparison, Predicate};
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
+                // The index holds the operator as it reads from the property: `'m' < status` as `status > 'm'`
+                if let Some((path, operator, literal)) = (Comparison { left, operator: *operator, right }).path_op_lit() {
                     let index = self.index_watchers.entry(path.clone()).or_default();
 
                     match op {
                         WatcherOp::Add => {
-                            index.add((*literal).clone(), operator.clone(), watcher_id);
+                            index.add((*literal).clone(), operator, watcher_id);
                         }
                         WatcherOp::Remove => {
-                            index.remove((*literal).clone(), operator.clone(), watcher_id);
+                            index.remove((*literal).clone(), operator, watcher_id);
                         }
                     }
                 } else {
@@ -212,13 +213,10 @@ impl WatcherSet {
                 self.recurse_predicate_watchers(left, watcher_id, op);
                 self.recurse_predicate_watchers(right, watcher_id, op);
             }
-            Predicate::Not(pred) => {
-                if pred.walk(false, &mut |found, p| found || matches!(p, Predicate::MemberOf(_))) {
-                    self.recurse_predicate_watchers(&Predicate::True, watcher_id, op);
-                } else {
-                    self.recurse_predicate_watchers(pred, watcher_id, op);
-                }
-            }
+            // Bandaid until the reactor's watchers are redesigned.
+            // A NOT holds where its inner predicate does not, so the inner predicate's watchers need not wake the entities
+            // it admits: it wakes its query on every change, and evaluation decides
+            Predicate::Not(_) => self.recurse_predicate_watchers(&Predicate::True, watcher_id, op),
             Predicate::IsNull(_) => {
                 unimplemented!("Not sure how to implement this")
             }
@@ -370,6 +368,43 @@ mod tests {
                 let mut candidates = BTreeMap::new();
                 watchers.accumulate_interested_watchers(&entity, 0, &changes, &mut candidates);
                 assert_eq!(candidates[&subscription].query_iter().map(|candidate| *candidate.query_id).collect::<Vec<_>>(), vec![query]);
+            }
+        }
+        Ok(())
+    }
+
+    /// `'open' < status` is watched as `status > 'open'`: a status above 'open' wakes the query, one below does not. A
+    /// NOT wakes its query on every change, so its negation in either writing hears a status below 'open', which it
+    /// admits.
+    #[test]
+    fn comparisons_are_watched_as_they_read_from_the_property_and_negations_on_every_change() -> anyhow::Result<()> {
+        let property = proto::EntityId::from_bytes([2; 32]);
+        let status = || Box::new(Expr::Path(PropertyPath::registered(property, "status", vec![])));
+        let open = || Box::new(Expr::Literal(Value::String("open".into())));
+        let literal_first = Predicate::Comparison { left: open(), operator: ComparisonOperator::LessThan, right: status() };
+        let path_first = Predicate::Comparison { left: status(), operator: ComparisonOperator::GreaterThan, right: open() };
+        let pending = LocalTrxEntity::new(
+            None,
+            proto::AuthorId::Unknown,
+            SystemEpoch::allocate(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let backend = pending.get_backend::<LWWBackend>()?;
+        let entity = pending.read();
+        let changes = Arc::new(vec![entity.clone()]);
+        for (predicate, wakes) in [
+            (literal_first.clone(), [("paused", true), ("done", false)]),
+            (Predicate::Not(Box::new(literal_first)), [("paused", true), ("done", true)]),
+            (Predicate::Not(Box::new(path_first)), [("paused", true), ("done", true)]),
+        ] {
+            let (subscription, query) = (ReactorSubscriptionId::new(), proto::QueryId::new());
+            let mut watchers = WatcherSet::new();
+            watchers.recurse_predicate_watchers(&predicate, (subscription, query), WatcherOp::Add);
+            for (status, woken) in wakes {
+                backend.set(proto::PropertyId::EntityId(property), Some(Value::String(status.into())));
+                let mut candidates = BTreeMap::new();
+                watchers.accumulate_interested_watchers(&entity, 0, &changes, &mut candidates);
+                assert_eq!(candidates.contains_key(&subscription), woken, "{predicate:?} at status {status}");
             }
         }
         Ok(())
