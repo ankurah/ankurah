@@ -1,5 +1,5 @@
 use crate::{EngineColumns, KeyBounds, predicate::ConjunctFinder, types::*};
-use ankql::ast::{ComparisonOperator, Expr, Predicate};
+use ankql::ast::{Comparison, ComparisonOperator, Expr, Predicate};
 use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_core_types::{Value, ValueType};
 use indexmap::IndexMap;
@@ -323,7 +323,8 @@ impl Planner {
         let mut inequalities: IndexMap<String, Vec<(ComparisonOperator, Value)>> = IndexMap::new();
 
         for conjunct in conjuncts {
-            if let Some((field, op, value)) = self.extract_comparison(conjunct) {
+            if let Some((path, op, value)) = Comparison::try_from(conjunct).ok().and_then(Comparison::path_op_lit) {
+                let (field, value) = (path.to_string(), value.clone());
                 // Skip primary key predicates - they'll be handled by TableScan bounds
                 if field == primary_key {
                     continue;
@@ -348,29 +349,6 @@ impl Planner {
         }
 
         (equalities, inequalities)
-    }
-
-    /// Extract field path, operator, and value from a comparison predicate.
-    /// Returns the full path as a dot-separated string (e.g., "context.session_id").
-    fn extract_comparison(&self, predicate: &Predicate<EngineColumns>) -> Option<(String, ComparisonOperator, Value)> {
-        match predicate {
-            Predicate::Comparison { left, operator, right } => {
-                // Extract field path from left side (supports multi-step paths)
-                let field_path = match left.as_ref() {
-                    Expr::Path(path) => path.to_string(),
-                    _ => return None,
-                };
-
-                // Extract value from right side
-                let value = match right.as_ref() {
-                    Expr::Literal(literal) => literal.clone(),
-                    _ => return None,
-                };
-
-                Some((field_path, operator.clone(), value))
-            }
-            _ => None,
-        }
     }
 
     // removed: legacy generate_order_by_plan (superseded by ORDER-FIRST/INEQ-FIRST)
@@ -650,7 +628,10 @@ impl Planner {
 
         for conjunct in conjuncts {
             let mut consumed = false;
-            if let Some((field, op, value)) = self.extract_comparison(conjunct)
+            if let Some((field, op, value)) = Comparison::try_from(conjunct)
+                .ok()
+                .and_then(Comparison::path_op_lit)
+                .map(|(path, op, value)| (path.to_string(), op, value.clone()))
                 && let Some(bound) = bounds.keyparts.iter().find(|bound| bound.column == field)
             {
                 // A shared column is insufficient: the endpoints must imply this comparison.
@@ -792,13 +773,13 @@ impl Planner {
 
     /// Extract a single primary key bound from a predicate
     fn extract_primary_key_bound(&self, predicate: &Predicate<EngineColumns>, primary_key: &str) -> Option<KeyBoundComponent> {
-        if let Predicate::Comparison { left, operator, right } = predicate {
-            // Check if this is a primary key comparison
-            let value = match (left.as_ref(), right.as_ref()) {
-                (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.column.as_str() == primary_key => literal.clone(),
-                (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.column.as_str() == primary_key => literal.clone(),
-                _ => return None,
-            };
+        // Check if this is a primary key comparison, with the operator as it reads from the key
+        if let Ok(comparison) = Comparison::try_from(predicate)
+            && let Some((path, operator, literal)) = comparison.path_op_lit()
+            && path.is_simple()
+            && path.column.as_str() == primary_key
+        {
+            let value = literal.clone();
 
             // Convert comparison operator to bounds
             let (low, high) = match operator {
@@ -893,9 +874,10 @@ impl Planner {
 
     /// Check if a predicate is on the primary key field
     fn is_primary_key_predicate(&self, predicate: &Predicate<EngineColumns>, primary_key: &str) -> bool {
-        if let Predicate::Comparison { left, operator: _, right: _ } = predicate {
-            match left.as_ref() {
-                Expr::Path(path) if path.is_simple() => path.column.as_str() == primary_key,
+        if let Predicate::Comparison { left, operator: _, right } = predicate {
+            // The key on the left compared with anything, or a literal compared with the key on the right
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Path(path), _) | (Expr::Literal(_), Expr::Path(path)) if path.is_simple() => path.column.as_str() == primary_key,
                 _ => false,
             }
         } else {
@@ -917,10 +899,12 @@ impl Planner {
     /// Check if conjuncts contain primary key range predicates that should skip index generation
     fn has_primary_key_range_predicates(&self, conjuncts: &[Predicate<EngineColumns>], primary_key: &str) -> bool {
         conjuncts.iter().any(|predicate| {
-            if let Predicate::Comparison { left, operator, right: _ } = predicate {
-                // Check if this is a primary key comparison with supported operators
-                let is_primary_key_field = match left.as_ref() {
-                    Expr::Path(path) if path.is_simple() => path.column.as_str() == primary_key,
+            if let Predicate::Comparison { left, operator, right } = predicate {
+                // Check if this is a primary key comparison with supported operators: the key on the left compared with
+                // anything, or a literal compared with the key on the right (the operators below are their own set either
+                // way round)
+                let is_primary_key_field = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Path(path), _) | (Expr::Literal(_), Expr::Path(path)) if path.is_simple() => path.column.as_str() == primary_key,
                     _ => false,
                 };
 
@@ -1932,6 +1916,29 @@ mod tests {
         }
 
         #[test]
+        fn test_range_written_literal_first() {
+            // `25 <= age AND 50 > age` uses the index and bounds of `age >= 25 AND age < 50`
+            assert_eq!(
+                plan!("'album' = __collection AND 25 <= age AND 50 > age"),
+                vec![
+                    Plan::Index {
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
+                        scan_direction: ScanDirection::Forward,
+                        bounds: bounds!("__collection" => ("album"..="album"), "age" => (25..50)),
+                        remaining_predicate: Predicate::True,
+                        order_by_spill: order_by_components!()
+                    },
+                    Plan::TableScan {
+                        bounds: KeyBounds::empty(),
+                        scan_direction: ScanDirection::Forward,
+                        remaining_predicate: selection!("'album' = __collection AND 25 <= age AND 50 > age").predicate,
+                        order_by_spill: order_by_components!()
+                    }
+                ]
+            );
+        }
+
+        #[test]
         fn test_range_mixed_gt_lte() {
             // > AND <= should produce exclusive lower, inclusive upper
             assert_eq!(
@@ -2638,6 +2645,30 @@ mod tests {
                     )
                     .predicate,
                     order_by_spill: order_by_components!()
+                }]
+            );
+        }
+
+        #[test]
+        fn test_primary_key_range_written_literal_first() {
+            // `'aaa' <= id AND 'zzz' > id` bounds the keys as `id >= 'aaa' AND id < 'zzz'` does
+            assert_eq!(
+                plan!("'aaa' <= id AND 'zzz' > id"),
+                vec![Plan::TableScan {
+                    bounds: bounds!("id" => ("aaa".."zzz")),
+                    scan_direction: ScanDirection::Forward,
+                    remaining_predicate: selection!("'aaa' <= id AND 'zzz' > id").predicate,
+                    order_by_spill: order_by_components!()
+                }]
+            );
+            // Ordered by another column, it is planned by the keys alone, as `id >= 'aaa' ORDER BY name` is
+            assert_eq!(
+                plan!("'aaa' <= id ORDER BY name"),
+                vec![Plan::TableScan {
+                    bounds: bounds!("id" => ("aaa"..)),
+                    scan_direction: ScanDirection::Forward,
+                    remaining_predicate: selection!("'aaa' <= id").predicate,
+                    order_by_spill: order_by_components!(spill: [oby_asc!("name")])
                 }]
             );
         }

@@ -112,6 +112,12 @@ pub fn evaluate_predicate<S: Stage, I: ValueLookup<S>>(item: &I, predicate: &Pre
         Predicate::Comparison { left, operator, right } => {
             let left_val = evaluate_expr(item, left)?;
             let right_val = evaluate_expr(item, right)?;
+            // Values of different types are compared in the left operand's type, so a literal written first is compared
+            // as if written second: `5 < x` as `x > 5`
+            let (left_val, operator, right_val) = match (left.as_ref(), right.as_ref(), operator.converse()) {
+                (Expr::Literal(_), Expr::Path(_), Some(converse)) => (right_val, converse, left_val),
+                _ => (left_val, *operator, right_val),
+            };
 
             Ok(match operator {
                 ComparisonOperator::Equal => left_val
@@ -837,6 +843,19 @@ mod tests {
                 assert!(matches!(results[0], FilterResult::Pass(_)));
                 assert!(matches!(results[1], FilterResult::Skip(_)));
                 assert!(matches!(results[2], FilterResult::Skip(_)));
+            }
+
+            #[test]
+            fn test_json_comparison_written_literal_first() {
+                // `50 < licensing.score` compares numbers as `licensing.score > 50` does, though as JSON text "100"
+                // sorts below "50"
+                let items =
+                    [TrackItem::new("A", serde_json::json!({ "score": 25 })), TrackItem::new("B", serde_json::json!({ "score": 100 }))];
+                let matched = |query| {
+                    items.iter().map(|item| evaluate_predicate(item, &resolve(query, TRACKS).predicate).unwrap()).collect::<Vec<_>>()
+                };
+                assert_eq!(matched("50 < licensing.score"), [false, true]);
+                assert_eq!(matched("50 > licensing.score"), [true, false]);
             }
 
             #[test]
