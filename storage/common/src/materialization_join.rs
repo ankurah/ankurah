@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
-use ankql::ast::{Predicate, Resolved, Selection};
+use ankql::ast::{Comparison, ComparisonOperator, Predicate, Resolved, Selection};
 use ankql::selection::map_references;
-use ankurah_proto::{ModelId, PropertyId};
+use ankurah_core_types::Value;
+use ankurah_proto::{EntityId, ModelId, PropertyId};
 
 use crate::{ColumnPath, EngineColumns};
 
@@ -75,6 +76,54 @@ impl MaterializationJoin {
 
 pub fn membership_column(model: &ModelId) -> String { format!("m_{model}") }
 
+/// Extract an entity id range bound for SQL comparisons in byte order.
+///
+/// Matches `>`, `>=`, `<`, or `<=` between an id literal and the `id` column projected by
+/// [`MaterializationJoin::sql`], in either operand order. Returns the operator with `id` on
+/// the left and the literal on the right. Returns `None` for other comparisons.
+pub fn entity_id_bound<'a>(comparison: Comparison<'a, EngineColumns>) -> Option<(ComparisonOperator, &'a EntityId)> {
+    use ComparisonOperator::*;
+    match comparison.path_op_lit()? {
+        (path, operator @ (GreaterThan | GreaterThanOrEqual | LessThan | LessThanOrEqual), Value::EntityId(id))
+            if path.is_simple() && path.column == "id" =>
+        {
+            Some((operator, id))
+        }
+        _ => None,
+    }
+}
+
 fn property_column(property: &PropertyId) -> String { if *property == PropertyId::Id { "id".to_owned() } else { format!("p_{property}") } }
 
 fn quote(identifier: &str) -> String { format!("\"{}\"", identifier.replace('"', "\"\"")) }
+
+#[cfg(test)]
+mod tests {
+    use ankql::ast::Expr;
+
+    use super::*;
+
+    fn bound(
+        left: Expr<EngineColumns>,
+        operator: ComparisonOperator,
+        right: Expr<EngineColumns>,
+    ) -> Option<(ComparisonOperator, EntityId)> {
+        entity_id_bound(Comparison { left: &left, operator, right: &right }).map(|(operator, id)| (operator, *id))
+    }
+
+    #[test]
+    fn only_an_ordering_comparison_of_the_id_column_with_an_id_is_an_entity_id_bound() {
+        use ComparisonOperator::*;
+        let x = EntityId::from_bytes([7; 32]);
+        let column = |name: &str| Expr::Path(ColumnPath::simple(name));
+        let literal = || Expr::Literal(Value::EntityId(x));
+
+        assert_eq!(bound(column("id"), GreaterThanOrEqual, literal()), Some((GreaterThanOrEqual, x)));
+        assert_eq!(bound(literal(), GreaterThan, column("id")), Some((LessThan, x)));
+        assert_eq!(bound(column("id"), Equal, literal()), None);
+        // An id-valued property's column is not the entity's id
+        assert_eq!(bound(column("p_parent"), GreaterThan, literal()), None);
+        // A JSON path into the id column is not the entity's id
+        assert_eq!(bound(Expr::Path(ColumnPath::new("id", vec!["x".to_owned()])), GreaterThan, literal()), None);
+    }
+}

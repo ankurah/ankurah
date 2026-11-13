@@ -47,6 +47,7 @@ impl SqliteConnectionManager {
              PRAGMA mmap_size=268435456;
              PRAGMA temp_store=MEMORY;",
         )?;
+        crate::id_bytes::register(&conn)?;
 
         Ok(conn)
     }

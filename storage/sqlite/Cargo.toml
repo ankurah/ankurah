@@ -9,8 +9,8 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
-# SQLite bindings with bundled SQLite
-rusqlite = { version = "0.32", features = ["bundled"] }
+# SQLite bindings with bundled SQLite; `functions` registers the function that reads an id's bytes
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 
 # Connection pooling - match Postgres pattern
 bb8 = "0.9"

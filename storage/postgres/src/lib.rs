@@ -19,6 +19,7 @@ use ankurah_core::{
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
 use ankurah_proto::{ModelId, SystemModel};
 
+mod id_bytes;
 pub mod sql_builder;
 pub mod value;
 
@@ -256,6 +257,14 @@ impl Postgres {
                             "attestations" bytea[] NOT NULL
                         )"#
                     ),
+                    &[],
+                )
+                .await
+                .map_err(|error| StateError::DDLError(Box::new(error)))?;
+            // Stores without this index gain it on their first read or write.
+            client
+                .execute(
+                    &format!(r#"CREATE INDEX IF NOT EXISTS "{ENTITY_TABLE}_id_bytes_idx" ON "{ENTITY_TABLE}" (({}))"#, id_bytes::SQL),
                     &[],
                 )
                 .await

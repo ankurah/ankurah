@@ -10,7 +10,7 @@
 mod common;
 
 use ankurah::signals::Subscribe;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
+use ankurah::{fetch, policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
 use common::{Album, AlbumView, TestWatcher};
@@ -167,5 +167,34 @@ async fn test_sqlite_query_with_subscription() -> Result<()> {
     let changes: Vec<(EntityId, ankurah::changes::ChangeKind)> = watcher.take_one().await;
     assert!(changes.len() >= 1, "Should receive at least one change notification");
 
+    Ok(())
+}
+
+/// Fetch the range returned by `EntityId::base64_prefix_range` to find entities by a base64 id prefix.
+#[tokio::test]
+async fn test_sqlite_fetch_by_id_prefix() -> Result<()> {
+    use common::EntityId;
+    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(c).await.unwrap();
+
+    let mut ids = Vec::new();
+    let trx = ctx.begin();
+    for n in 0..16 {
+        ids.push(trx.create(&Album { name: format!("Album {n}"), year: "2020".to_string() }).await?.id());
+    }
+    trx.commit().await?;
+    ids.sort();
+
+    for id in &ids {
+        let prefix = &id.to_base64()[..1];
+        let range = EntityId::base64_prefix_range(prefix)?;
+        let albums: Vec<AlbumView> = fetch!(ctx, "id >= {} AND id <= {}", range.start(), range.end()).await?;
+        let mut found: Vec<EntityId> = albums.iter().map(|album| album.id()).collect();
+        found.sort();
+        let expected: Vec<EntityId> = ids.iter().copied().filter(|other| other.to_base64().starts_with(prefix)).collect();
+        assert_eq!(found, expected, "prefix {prefix}");
+    }
     Ok(())
 }

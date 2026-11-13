@@ -2,10 +2,10 @@
 //!
 //! Converts AnkQL predicates to SQLite-compatible SQL WHERE clauses.
 
-use crate::error::SqliteError;
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
+use crate::{error::SqliteError, id_bytes};
+use ankql::ast::{Comparison, ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core_types::Value;
-use ankurah_storage_common::EngineColumns;
+use ankurah_storage_common::{materialization_join::entity_id_bound, EngineColumns};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
@@ -249,6 +249,14 @@ impl SqlBuilder {
     }
 
     pub fn predicate(&mut self, predicate: &Predicate<EngineColumns>) -> Result<(), SqlGenerationError> {
+        if let Some((operator, id)) = Comparison::try_from(predicate).ok().and_then(entity_id_bound) {
+            self.push_sql(id_bytes::SQL);
+            self.push_sql(" ");
+            self.comparison_op(&operator)?;
+            self.push_sql(" ");
+            self.push_param(rusqlite::types::Value::Blob(id.to_bytes().to_vec()));
+            return Ok(());
+        }
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 // Emit: left op right
@@ -319,7 +327,10 @@ impl SqlBuilder {
 
     pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
         // Use -> for multi-step sort paths.
-        if order_by.path.is_simple() {
+        if order_by.path.is_simple() && order_by.path.column == "id" {
+            // In `MaterializationJoin`'s projection, `id` is the entity id.
+            self.push_sql(id_bytes::SQL);
+        } else if order_by.path.is_simple() {
             // Single-step path: regular column reference
             let escaped = order_by.path.column.replace('"', "\"\"");
             self.push_sql(&format!(r#""{}""#, escaped));
@@ -434,5 +445,44 @@ mod tests {
 
         assert_eq!(sql_string, r#""name" IN (?, ?)"#);
         assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn a_comparison_that_orders_the_entity_id_compares_bytes() {
+        use ankurah_core_types::EntityId;
+        use rusqlite::types::Value::Blob;
+        let (low, high) = (EntityId::from_bytes([0x10; 32]), EntityId::from_bytes([0xF0; 32]));
+        let compare = |operator, id| Predicate::Comparison {
+            left: Box::new(Expr::Path(ColumnPath::simple("id"))),
+            operator,
+            right: Box::new(Expr::Literal(Value::EntityId(id))),
+        };
+        let predicate = Predicate::And(
+            Box::new(compare(ComparisonOperator::GreaterThanOrEqual, low)),
+            Box::new(compare(ComparisonOperator::LessThanOrEqual, high)),
+        );
+        let mut sql = SqlBuilder::new();
+        sql.predicate(&predicate).unwrap();
+        let (sql_string, params) = sql.build_where_clause();
+
+        assert_eq!(sql_string, r#"ankurah_id_bytes("id") >= ? AND ankurah_id_bytes("id") <= ?"#);
+        assert_eq!(params, vec![Blob(low.to_bytes().to_vec()), Blob(high.to_bytes().to_vec())]);
+    }
+
+    #[test]
+    fn order_by_id_orders_by_the_ids_bytes() {
+        let selection = Selection {
+            predicate: Predicate::True,
+            order_by: Some(vec![
+                OrderByItem { path: ColumnPath::simple("id"), direction: OrderDirection::Desc },
+                OrderByItem { path: ColumnPath::simple("p_name"), direction: OrderDirection::Asc },
+            ]),
+            limit: None,
+        };
+        let mut sql = SqlBuilder::new();
+        sql.selection(&selection).unwrap();
+        let (sql_string, _) = sql.build_where_clause();
+
+        assert_eq!(sql_string, r#"1=1 ORDER BY ankurah_id_bytes("id") DESC, "p_name" ASC"#);
     }
 }
