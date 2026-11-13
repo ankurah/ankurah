@@ -1,9 +1,11 @@
-use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
+use ankql::ast::{Comparison, ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core::error::RetrievalError;
 use ankurah_core_types::Value;
-use ankurah_storage_common::EngineColumns;
+use ankurah_storage_common::{materialization_join::entity_id_bound, EngineColumns};
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
+
+use crate::id_bytes;
 
 #[derive(Debug, Error, Clone)]
 pub enum SqlGenerationError {
@@ -316,6 +318,14 @@ impl SqlBuilder {
     }
 
     pub fn predicate(&mut self, predicate: &Predicate<EngineColumns>) -> Result<(), SqlGenerationError> {
+        if let Some((operator, id)) = Comparison::try_from(predicate).ok().and_then(entity_id_bound) {
+            self.sql(id_bytes::SQL);
+            self.sql(" ");
+            self.comparison_op(&operator)?;
+            self.sql(" ");
+            self.arg(id.to_bytes().to_vec());
+            return Ok(());
+        }
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 // Resolution casts JSON-subpath literals to Value::Json;
@@ -392,8 +402,13 @@ impl SqlBuilder {
         if !order_by.path.subpath.is_empty() {
             return Err(SqlGenerationError::UnsupportedExpression("JSON paths are not supported in ORDER BY"));
         }
-        let column = order_by.path.column.replace('"', "\"\"");
-        self.sql(format!(r#""{}""#, column));
+        if order_by.path.column == "id" {
+            // In `MaterializationJoin`'s projection, `id` is the entity id.
+            self.sql(id_bytes::SQL);
+        } else {
+            let column = order_by.path.column.replace('"', "\"\"");
+            self.sql(format!(r#""{}""#, column));
+        }
 
         // Add the direction
         match order_by.direction {
@@ -553,6 +568,41 @@ mod tests {
         assert_eq!(sql_string, r#"SELECT "id", "name" FROM "users" WHERE "name" IN ($1, $2, $3)"#);
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice"), Box::new("Bob"), Box::new("Charlie")];
         assert_args(&args, &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn a_comparison_that_orders_the_entity_id_compares_bytes() -> Result<()> {
+        let (low, high) = (EntityId::from_bytes([0x10; 32]), EntityId::from_bytes([0xF0; 32]));
+        let selection = lowered(&format!("id >= '{low}' AND id <= '{high}'"));
+        let mut sql = SqlBuilder::new();
+        sql.selection(&selection)?;
+        let (sql_string, args) = sql.build_where_clause();
+
+        assert_eq!(
+            sql_string,
+            r#"decode(translate("id", '-_', '+/') || '=', 'base64') >= $1 AND decode(translate("id", '-_', '+/') || '=', 'base64') <= $2"#
+        );
+        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(low.to_bytes().to_vec()), Box::new(high.to_bytes().to_vec())];
+        assert_args(&args, &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn order_by_id_orders_by_the_ids_bytes() -> Result<()> {
+        let selection = Selection {
+            predicate: Predicate::True,
+            order_by: Some(vec![
+                OrderByItem { path: ColumnPath::simple("id"), direction: OrderDirection::Desc },
+                OrderByItem { path: ColumnPath::simple("name"), direction: OrderDirection::Asc },
+            ]),
+            limit: None,
+        };
+        let mut sql = SqlBuilder::new();
+        sql.selection(&selection)?;
+        let (sql_string, _) = sql.build_where_clause();
+
+        assert_eq!(sql_string, r#"TRUE ORDER BY decode(translate("id", '-_', '+/') || '=', 'base64') DESC, "name" ASC"#);
         Ok(())
     }
 

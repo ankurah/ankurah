@@ -9,13 +9,20 @@ pub struct PlannerConfig {
     /// Whether the storage backend supports descending indexes
     /// false for IndexedDB, true for engines with real DESC indexes
     pub supports_desc_indexes: bool,
+    /// Whether primary keys have the same ordering in scans and value comparisons.
+    ///
+    /// Applies to both index scans and table scans by primary key. IndexedDB stores ids as base64
+    /// text, which sorts differently from their bytes, so this is false there. When it is false, the
+    /// planner sorts the primary key and any following ORDER BY keys in memory instead of relying on
+    /// scan order.
+    pub index_orders_primary_key_by_value: bool,
 }
 
 impl PlannerConfig {
-    pub fn new(supports_desc_indexes: bool) -> Self { Self { supports_desc_indexes } }
+    pub fn new(supports_desc_indexes: bool) -> Self { Self { supports_desc_indexes, index_orders_primary_key_by_value: true } }
 
     /// IndexedDB configuration
-    pub fn indexeddb() -> Self { Self::new(false) }
+    pub fn indexeddb() -> Self { Self { supports_desc_indexes: false, index_orders_primary_key_by_value: false } }
 
     /// Generic storage with full index support
     pub fn full_support() -> Self { Self::new(true) }
@@ -65,7 +72,7 @@ impl Planner {
         if let Some(order_by) = &selection.order_by
             && !order_by.is_empty()
         {
-            if let Some(plan) = self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts) {
+            if let Some(plan) = self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts, primary_key) {
                 plans.push(plan);
             }
             // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
@@ -134,10 +141,19 @@ impl Planner {
         inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
         order_by: &[ankql::ast::OrderByItem<EngineColumns>],
         conjuncts: &[Predicate<EngineColumns>],
+        primary_key: &str,
     ) -> Option<Plan> {
         if order_by.is_empty() {
             return None;
         }
+
+        // Keep later ORDER BY keys out of the index when the primary key must sort in memory:
+        // IndexedDB indexes omit records missing an indexed field.
+        let index_ordered = match self.config.index_orders_primary_key_by_value {
+            true => order_by.len(),
+            false => order_by.iter().position(|item| item.path.is_simple() && item.path.column == primary_key).unwrap_or(order_by.len()),
+        };
+        let (index_ordered, sorted_in_memory) = order_by.split_at(index_ordered);
 
         // Keyparts: EQ prefix (using asc_path for multi-step path support)
         let mut index_keyparts: Vec<IndexKeyPart<String>> = Vec::new();
@@ -147,7 +163,7 @@ impl Planner {
 
         // Append ORDER BY fields per capability
         if self.config.supports_desc_indexes {
-            for item in order_by {
+            for item in index_ordered {
                 if item.path.is_simple() {
                     let name = item.path.column.as_str();
                     push_keypart_once(
@@ -163,7 +179,7 @@ impl Planner {
             // IndexedDB: ASC-only index parts, keep longest same-direction prefix
             let first_dir = order_by[0].direction.clone();
             let mut broke = false;
-            for item in order_by {
+            for item in index_ordered {
                 if item.path.is_simple() {
                     let name = item.path.column.as_str();
                     if !broke && item.direction == first_dir {
@@ -173,6 +189,12 @@ impl Planner {
                     }
                 }
             }
+        }
+
+        // Skip ORDER-FIRST when ORDER BY starts with a primary key the index cannot order and
+        // there is no equality prefix. Use INEQ-FIRST or the table scan instead.
+        if index_keyparts.is_empty() && !sorted_in_memory.is_empty() {
+            return None;
         }
 
         // Bounds: equalities + (optional) bounds on the first ORDER BY field that has inequalities
@@ -211,7 +233,7 @@ impl Planner {
             let mut presort = Vec::new();
             let mut spill = Vec::new();
             let mut broke = false;
-            for item in order_by {
+            for item in index_ordered {
                 if item.path.is_simple() {
                     if !broke && item.direction == first_dir {
                         presort.push(item.clone());
@@ -221,10 +243,10 @@ impl Planner {
                     }
                 }
             }
+            spill.extend(sorted_in_memory.iter().filter(|item| item.path.is_simple()).cloned());
             OrderByComponents::new(presort, spill)
         } else {
-            // DESC indexes supported - entire ORDER BY satisfied by index
-            OrderByComponents::new(order_by.to_vec(), vec![])
+            OrderByComponents::new(index_ordered.to_vec(), sorted_in_memory.to_vec())
         };
 
         Some(Plan::Index {
@@ -720,7 +742,10 @@ impl Planner {
         // Determine scan direction and ORDER BY components based on primary key ORDER BY
         let (scan_direction, order_by_spill) = if let Some(order_items) = order_by {
             if let Some(first_item) = order_items.first() {
-                if first_item.path.is_simple() && first_item.path.column.as_str() == primary_key {
+                if first_item.path.is_simple()
+                    && first_item.path.column.as_str() == primary_key
+                    && self.config.index_orders_primary_key_by_value
+                {
                     // Primary key ORDER BY is satisfied by scan direction
                     let direction = match first_item.direction {
                         ankql::ast::OrderDirection::Asc => ScanDirection::Forward,
@@ -731,7 +756,6 @@ impl Planner {
                     let spill = order_items[1..].to_vec();
                     (direction, OrderByComponents::new(presort, spill))
                 } else {
-                    // Primary key not in ORDER BY, use forward scan and spill all
                     (ScanDirection::Forward, OrderByComponents::new(vec![], order_items.clone()))
                 }
             } else {
@@ -1707,6 +1731,83 @@ mod tests {
         }
     }
 
+    mod primary_key_order_tests {
+        use super::*;
+
+        #[test]
+        fn a_key_before_the_id_is_read_in_index_order() {
+            assert_eq!(
+                plan!("__materialization = 'album' ORDER BY name, id")[0],
+                Plan::Index {
+                    index_spec: KeySpec::new(vec![asc!("__materialization", ValueType::String), asc!("name", ValueType::String)]),
+                    scan_direction: ScanDirection::Forward,
+                    bounds: bounds!("__materialization" => ("album"..="album")),
+                    remaining_predicate: Predicate::True,
+                    order_by_spill: order_by_components!(presort: [oby_asc!("name")], spill: [oby_asc!("id")])
+                }
+            );
+        }
+
+        #[test]
+        fn a_key_after_the_id_is_sorted_in_memory_with_it() {
+            assert_eq!(
+                plan!("__materialization = 'album' ORDER BY id, name")[0],
+                Plan::Index {
+                    index_spec: KeySpec::new(vec![asc!("__materialization", ValueType::String)]),
+                    scan_direction: ScanDirection::Forward,
+                    bounds: bounds!("__materialization" => ("album"..="album")),
+                    remaining_predicate: Predicate::True,
+                    order_by_spill: order_by_components!(spill: [oby_asc!("id"), oby_asc!("name")])
+                }
+            );
+        }
+
+        #[test]
+        fn a_table_scan_sorts_the_ids_in_memory() {
+            assert_eq!(
+                plan!("true ORDER BY id DESC"),
+                vec![Plan::TableScan {
+                    bounds: KeyBounds::empty(),
+                    scan_direction: ScanDirection::Forward,
+                    remaining_predicate: Predicate::True,
+                    order_by_spill: order_by_components!(spill: [oby_desc!("id")])
+                }]
+            );
+        }
+
+        /// Use the inequality's index when ORDER BY starts with `id` and there is no equality prefix.
+        /// ORDER-FIRST has no index key parts in that case.
+        #[test]
+        fn order_by_id_with_no_equality_is_answered_by_the_inequalitys_index() {
+            assert_eq!(
+                plan!("name > 'b' ORDER BY id")[0],
+                Plan::Index {
+                    index_spec: KeySpec::new(vec![asc!("name", ValueType::String)]),
+                    scan_direction: ScanDirection::Forward,
+                    bounds: bounds_list!(open_lower!("name" => "b"..)),
+                    remaining_predicate: Predicate::True,
+                    order_by_spill: order_by_components!(spill: [oby_asc!("id")])
+                }
+            );
+        }
+
+        /// Stop index ordering at the first direction change before `id`.
+        /// The spill order keeps that key ahead of `id`.
+        #[test]
+        fn a_direction_break_before_the_id_spills_ahead_of_it() {
+            assert_eq!(
+                plan!("__materialization = 'album' ORDER BY a ASC, b DESC, id ASC")[0],
+                Plan::Index {
+                    index_spec: KeySpec::new(vec![asc!("__materialization", ValueType::String), asc!("a", ValueType::String)]),
+                    scan_direction: ScanDirection::Forward,
+                    bounds: bounds!("__materialization" => ("album"..="album")),
+                    remaining_predicate: Predicate::True,
+                    order_by_spill: order_by_components!(presort: [oby_asc!("a")], spill: [oby_desc!("b"), oby_asc!("id")])
+                }
+            );
+        }
+    }
+
     // Test cases for inequality scenarios
     mod inequality_tests {
         use super::*;
@@ -2563,7 +2664,7 @@ mod tests {
             // TODO: Primary key ORDER BY should be satisfied by table scan direction, not index
             // Currently the planner generates an index plan for 'id' field
             assert_eq!(
-                plan!("id > '12345678-1234-1234-1234-123456789abc' ORDER BY id DESC"),
+                plan_full_support!("id > '12345678-1234-1234-1234-123456789abc' ORDER BY id DESC"),
                 vec![Plan::TableScan {
                     bounds: bounds_list!(open_lower!("id" => "12345678-1234-1234-1234-123456789abc"..)),
                     scan_direction: ScanDirection::Reverse, // DESC ORDER BY on primary key
@@ -2622,7 +2723,7 @@ mod tests {
         fn test_no_predicate_with_order_by() {
             // Query with no WHERE but ORDER BY - should use table scan with appropriate direction
             assert_eq!(
-                plan!("true ORDER BY id DESC"),
+                plan_full_support!("true ORDER BY id DESC"),
                 vec![Plan::TableScan {
                     bounds: KeyBounds::empty(),
                     scan_direction: ScanDirection::Reverse, // DESC ORDER BY on primary key

@@ -238,6 +238,11 @@ impl SqliteStorageEngine {
                 ),
                 [],
             )?;
+            // Stores without this index gain it on their first read or write.
+            c.execute(
+                &format!(r#"CREATE INDEX IF NOT EXISTS "{ENTITY_TABLE}_id_bytes_idx" ON "{ENTITY_TABLE}" ({})"#, crate::id_bytes::SQL),
+                [],
+            )?;
             c.execute(
                 &format!(
                     r#"CREATE TABLE IF NOT EXISTS "{EVENT_TABLE}" (
@@ -688,6 +693,56 @@ mod tests {
         assert_eq!(load_states(&snapshot, &[selected])?, vec![before]);
         drop(snapshot);
         assert_eq!(engine.get_state(id).await?, after);
+        Ok(())
+    }
+
+    fn has_id_bytes_index(path: &Path) -> rusqlite::Result<bool> {
+        Connection::open(path)?.query_row(
+            "SELECT count(*) = 1 FROM sqlite_master WHERE type = 'index' AND name = '_ankurah_entity_id_bytes_idx'",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_store_without_the_id_bytes_index_gains_it_on_its_first_read() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("older.sqlite");
+        let id = entity_id(0x31);
+        commit_canonical_state(&SqliteStorageEngine::open(&path).await?, Clock::default(), state_with_strings(id, 1, &[])).await;
+        Connection::open(&path)?.execute_batch(r#"DROP INDEX "_ankurah_entity_id_bytes_idx""#)?;
+        assert!(!has_id_bytes_index(&path)?);
+
+        let engine = SqliteStorageEngine::open(&path).await?;
+        assert_eq!(engine.get_state(id).await?.payload.entity_id, id);
+        assert!(has_id_bytes_index(&path)?);
+        Ok(())
+    }
+
+    /// A connection without `ankurah_id_bytes`, such as the `sqlite3` shell's or an older build's, can
+    /// look up entities and sort their base64 ids, but deleting an entity by id fails.
+    #[tokio::test]
+    async fn a_connection_without_the_id_bytes_function_reads_entities_but_cannot_delete_one() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("by-hand.sqlite");
+        let engine = SqliteStorageEngine::open(&path).await?;
+        let (first, second) = (entity_id(0x41), entity_id(0xd2));
+        for (byte, id) in [(1, first), (2, second)] {
+            commit_canonical_state(&engine, Clock::default(), state_with_strings(id, byte, &[])).await;
+        }
+        assert!(has_id_bytes_index(&path)?);
+
+        let other = Connection::open(&path)?;
+        let found: String =
+            other.query_row(r#"SELECT "id" FROM "_ankurah_entity" WHERE "id" = ?"#, [second.to_base64()], |row| row.get(0))?;
+        assert_eq!(found, second.to_base64());
+        let mut statement = other.prepare(r#"SELECT * FROM "_ankurah_entity" ORDER BY "id""#)?;
+        let ordered = statement.query_map([], |row| row.get::<_, String>("id"))?.collect::<Result<Vec<_>, _>>()?;
+        // In text order `0` (0xd2's first digit) sorts before `Q` (0x41's), though 0x41 < 0xd2.
+        assert_eq!(ordered, [second.to_base64(), first.to_base64()]);
+
+        let refused = other.execute(r#"DELETE FROM "_ankurah_entity" WHERE "id" = ?"#, [first.to_base64()]).unwrap_err();
+        assert!(refused.to_string().contains("unknown function: ankurah_id_bytes"), "{refused}");
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::ops::RangeInclusive;
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -27,6 +28,9 @@ pub struct EntityId([u8; 32]);
 impl EntityId {
     /// The exact byte width of an entity id.
     pub const BYTE_LEN: usize = 32;
+
+    /// The base64 representation's length: 32 bytes encoded at six bits per character, rounded up.
+    const BASE64_LEN: usize = 43;
 
     /// Draw 32 random bytes as an identity.
     ///
@@ -65,6 +69,35 @@ impl EntityId {
     pub fn to_base64_short(&self) -> String {
         let value = self.to_base64();
         value[..6].to_owned()
+    }
+
+    /// Return the inclusive range of ids whose base64 representation starts with `prefix`.
+    ///
+    /// Base64 encodes six bits per character, most significant first, so matching ids form a
+    /// contiguous range in byte order. Query this range with `id >= first AND id <= last`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prefix` contains a character outside the URL-safe base64 alphabet,
+    /// exceeds 43 characters, or has a 43rd character with either of its two unused bits set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let range = EntityId::base64_prefix_range("Qk7")?;
+    /// let albums: Vec<AlbumView> = fetch!(ctx, "id >= {} AND id <= {}", range.start(), range.end()).await?;
+    /// ```
+    pub fn base64_prefix_range(prefix: &str) -> Result<RangeInclusive<Self>, DecodeError> {
+        let missing = Self::BASE64_LEN.checked_sub(prefix.len()).ok_or(DecodeError::InvalidLength)?;
+        // Fill the remaining bits with zeros for the lower bound and ones for the upper bound.
+        // In base64 these are `A` and `_`, except at position 43: only four bits carry data,
+        // so the two zero padding bits make `8` the largest valid final digit.
+        let first = format!("{prefix}{}", "A".repeat(missing));
+        let last = match missing {
+            0 => prefix.to_owned(),
+            missing => format!("{prefix}{}8", "_".repeat(missing - 1)),
+        };
+        Ok(Self::from_base64(first)?..=Self::from_base64(last)?)
     }
 }
 
@@ -247,5 +280,47 @@ mod tests {
         assert_eq!(id.to_base64().len(), 43);
         assert_eq!(EntityId::from_base64(id.to_base64()).unwrap(), id);
         assert!(matches!(EntityId::from_base64("AQIDBAUGBwgJCgsMDQ4PEA"), Err(DecodeError::InvalidLength)));
+    }
+
+    /// Reject invalid URL-safe base64 characters, prefixes longer than 43 characters, and a
+    /// 43rd digit with either of its two unused bits set.
+    #[test]
+    fn a_prefix_that_no_ids_text_starts_with_is_refused() {
+        assert!(matches!(EntityId::base64_prefix_range("Ab+"), Err(DecodeError::InvalidBase64(_))));
+        assert!(matches!(EntityId::base64_prefix_range(&"A".repeat(44)), Err(DecodeError::InvalidLength)));
+        assert!(matches!(EntityId::base64_prefix_range(&format!("{}B", "A".repeat(42))), Err(DecodeError::InvalidBase64(_))));
+    }
+
+    /// Return the next or previous id in byte order, or `None` at the corresponding limit.
+    fn step(id: EntityId, up: bool) -> Option<EntityId> {
+        let mut bytes = id.to_bytes();
+        for byte in bytes.iter_mut().rev() {
+            let (next, carried) = if up { byte.overflowing_add(1) } else { byte.overflowing_sub(1) };
+            *byte = next;
+            if !carried {
+                return Some(EntityId::from_bytes(bytes));
+            }
+        }
+        None
+    }
+
+    /// Prefix matching and range membership agree for every prefix of the sample ids.
+    /// Check the samples, both range endpoints, and the ids immediately outside the range.
+    #[test]
+    fn an_ids_text_starts_with_a_prefix_exactly_when_the_id_is_in_its_range() {
+        let counting: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let samples = [[0x00; 32], [0xFF; 32], [0xAB; 32], [0x5A; 32], counting].map(EntityId::from_bytes);
+        for sample in samples {
+            let text = sample.to_base64();
+            for length in 0..=43 {
+                let prefix = &text[..length];
+                let range = EntityId::base64_prefix_range(prefix).unwrap();
+                let (first, last) = (*range.start(), *range.end());
+                let ends = [Some(first), Some(last), step(first, false), step(last, true)];
+                for id in samples.into_iter().chain(ends.into_iter().flatten()) {
+                    assert_eq!(range.contains(&id), id.to_base64().starts_with(prefix), "prefix {prefix:?}, id {id}");
+                }
+            }
+        }
     }
 }

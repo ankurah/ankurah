@@ -175,6 +175,32 @@ Property references in the AST stay logical `PropertyId`s. Each engine resolves
 that identity to its private physical column, object field, or numeric slot
 only when planning or emitting the operation.
 
+### Id ordering
+
+Entity ids compare and sort by their 32 bytes. That holds in the in-memory
+evaluator and, in every engine, for `>`, `>=`, `<` and `<=` between `id` and an
+id literal, and for `ORDER BY id`.
+
+PostgreSQL and SQLite keep an id as its URL-safe base64 text, which a person can
+read but which sorts differently. For those comparisons and that ordering, each
+decodes the text to the id's bytes: PostgreSQL with built-in functions, SQLite
+with `ankurah_id_bytes`, a function every connection the engine opens registers,
+since SQLite has no built-in that decodes base64. An index on each engine's
+expression over `_ankurah_entity` lets the database read a range of ids in
+order. `=`, `!=` and `IN` compare the text.
+
+A connection without that function, such as the `sqlite3` shell's or an older
+build's, can query a SQLite store that has the index, but inserting an entity or
+deleting one by id fails there.
+
+Sled keys entities by the bytes. IndexedDB filters and sorts ids in memory.
+
+Only an entity's own `id` is covered. An engine can still compare or sort an
+id-valued property by its text where the in-memory evaluator uses its bytes.
+
+`EntityId::base64_prefix_range` gives the first and last id whose text starts
+with a prefix, so a prefix search is a fetch of `id >= first AND id <= last`.
+
 ## Event retrieval and staging
 
 The retrieval layer remains separate from physical storage. `GetEvents`

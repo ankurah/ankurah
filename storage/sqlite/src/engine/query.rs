@@ -81,3 +81,99 @@ impl Query {
         select_states(states.0, &states.1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, PropertyPath};
+    use ankurah_core::{
+        property::backend::{LWWBackend, PropertyBackend},
+        storage::{StorageCommitOutcome, StorageTransaction},
+        value::Value,
+    };
+    use ankurah_proto::{Clock, ModelId, State, StateBuffers};
+
+    use super::*;
+
+    fn model() -> ModelId { ModelId::EntityId(EntityId::from_bytes([101; 32])) }
+
+    fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([201; 32])) }
+
+    fn compare(path: PropertyPath, operator: ComparisonOperator, value: Value) -> Predicate<Resolved> {
+        Predicate::Comparison { left: Box::new(Expr::Path(path)), operator, right: Box::new(Expr::Literal(value)) }
+    }
+
+    fn and(left: Predicate<Resolved>, right: Predicate<Resolved>) -> Predicate<Resolved> { Predicate::And(Box::new(left), Box::new(right)) }
+
+    /// Return SQLite's query plan steps for the SQL generated from `selection`.
+    async fn plan(engine: &SqliteStorageEngine, selection: &Selection<Resolved>) -> anyhow::Result<Vec<String>> {
+        let query = Query::prepare(engine, selection).await?;
+        let conn = engine.pool.get().await?;
+        Ok(conn
+            .with_connection(move |c| {
+                let mut statement = c.prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql))?;
+                let steps = statement.query_map(rusqlite::params_from_iter(&query.params), |row| row.get::<_, String>(3))?;
+                Ok(steps.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?)
+    }
+
+    /// SQLite scans the id byte index for both range bounds and ORDER BY id, without a separate sort.
+    /// Cover queries with no joins, with a component materialization join, and with that join
+    /// plus a property condition.
+    #[tokio::test]
+    async fn an_id_range_ordered_by_id_is_searched_in_the_id_bytes_index() -> anyhow::Result<()> {
+        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let mut ids = Vec::new();
+        for byte in 1..=40u8 {
+            let backend = LWWBackend::new();
+            backend.set(property(), Some(Value::String(format!("{}", byte % 3))));
+            let event = ankurah_core::test_helpers::commit_backend(&backend, byte)?;
+            let id = EntityId::from_bytes([byte.wrapping_mul(37); 32]);
+            let state = Attested::opt(
+                EntityState {
+                    entity_id: id,
+                    state: State {
+                        state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
+                        memberships: BTreeSet::from([model()]),
+                        head: Clock::singleton(&event),
+                    },
+                },
+                None,
+            );
+            let mut transaction = engine.transaction();
+            transaction.set_state(&Clock::default(), &state).await?;
+            assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+            ids.push(id);
+        }
+        let above = compare(PropertyPath::id(), ComparisonOperator::GreaterThan, Value::EntityId(ids[7]));
+        let prefix = EntityId::base64_prefix_range(&ids[7].to_base64()[..2])?;
+        let in_prefix = and(
+            compare(PropertyPath::id(), ComparisonOperator::GreaterThanOrEqual, Value::EntityId(*prefix.start())),
+            compare(PropertyPath::id(), ComparisonOperator::LessThanOrEqual, Value::EntityId(*prefix.end())),
+        );
+        let beside_property = and(in_prefix, compare(property().into(), ComparisonOperator::Equal, Value::String("1".into())));
+        let cases = [
+            ("id > X", Selection { predicate: above.clone(), order_by: None, limit: None }),
+            ("id > X, of the model", Selection { predicate: above, order_by: None, limit: None }.and_member_of(model())),
+            (
+                "a prefix beside a property, of the model",
+                Selection { predicate: beside_property, order_by: None, limit: None }.and_member_of(model()),
+            ),
+        ];
+        for (case, mut selection) in cases {
+            for direction in [OrderDirection::Asc, OrderDirection::Desc] {
+                selection.order_by = Some(vec![OrderByItem { path: PropertyPath::id(), direction: direction.clone() }]);
+                selection.limit = Some(5);
+                let steps = plan(&engine, &selection).await?;
+                assert!(
+                    steps.iter().any(|step| step.contains("USING INDEX _ankurah_entity_id_bytes_idx (<expr>")),
+                    "{case} ORDER BY id {direction:?}: {steps:?}"
+                );
+                assert!(!steps.iter().any(|step| step.contains("TEMP B-TREE")), "{case} ORDER BY id {direction:?}: {steps:?}");
+            }
+        }
+        Ok(())
+    }
+}

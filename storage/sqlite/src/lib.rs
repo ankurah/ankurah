@@ -35,6 +35,7 @@ mod connection;
 mod dump;
 mod engine;
 mod error;
+mod id_bytes;
 pub mod sql_builder;
 mod value;
 
