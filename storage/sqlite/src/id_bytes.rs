@@ -17,9 +17,13 @@ pub(crate) const SQL: &str = r#"ankurah_id_bytes("id")"#;
 
 /// Register the id decoder used by this engine's SQL on `connection`.
 ///
+/// The engine registers it on every connection it opens. A connection opened elsewhere, such
+/// as a backup tool's, needs it before writing to a store or running `PRAGMA integrity_check`
+/// on one, because both evaluate the index expression.
+///
 /// The function depends only on its argument and has no side effects. Mark it deterministic
 /// for use in expression indexes, and innocuous for use in schemas with `trusted_schema` off.
-pub(crate) fn register(connection: &Connection) -> rusqlite::Result<()> {
+pub fn register(connection: &Connection) -> rusqlite::Result<()> {
     connection.create_scalar_function(
         FUNCTION,
         1,
