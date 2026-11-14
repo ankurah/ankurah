@@ -746,6 +746,26 @@ mod tests {
         Ok(())
     }
 
+    /// A connection opened outside the engine, such as a backup tool's, checks and changes a store
+    /// once it registers the function.
+    #[tokio::test]
+    async fn a_connection_that_registers_the_id_bytes_function_checks_a_store_and_deletes_by_id() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("checked.sqlite");
+        let id = entity_id(0x41);
+        commit_canonical_state(&SqliteStorageEngine::open(&path).await?, Clock::default(), state_with_strings(id, 1, &[])).await;
+
+        let other = Connection::open(&path)?;
+        let integrity_check = || other.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0));
+        let refused = integrity_check().unwrap_err();
+        assert!(refused.to_string().contains("unknown function: ankurah_id_bytes"), "{refused}");
+
+        crate::register_id_bytes(&other)?;
+        assert_eq!(integrity_check()?, "ok");
+        assert_eq!(other.execute(r#"DELETE FROM "_ankurah_entity" WHERE "id" = ?"#, [id.to_base64()])?, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn concurrent_first_writes_share_ddl_coordination() {
         let directory = tempfile::tempdir().unwrap();

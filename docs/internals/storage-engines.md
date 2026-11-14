@@ -190,8 +190,10 @@ expression over `_ankurah_entity` lets the database read a range of ids in
 order. `=`, `!=` and `IN` compare the text.
 
 A connection without that function, such as the `sqlite3` shell's or an older
-build's, can query a SQLite store that has the index, but inserting an entity or
-deleting one by id fails there.
+build's, can query a SQLite store that has the index, but inserting an entity,
+deleting one by id, `PRAGMA integrity_check`, `REINDEX` and `VACUUM` fail there.
+A program that opens a store on a connection of its own, such as a backup tool,
+registers the function with `ankurah_storage_sqlite::register_id_bytes`.
 
 Sled keys entities by the bytes. IndexedDB filters and sorts ids in memory.
 
