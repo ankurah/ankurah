@@ -75,7 +75,7 @@ impl<T: Filterable> ValueLookup<Resolved> for T {
 
 fn evaluate_expr<S: Stage, I: ValueLookup<S>>(item: &I, expr: &Expr<S>) -> Result<ExprOutput<Value>, Error> {
     match expr {
-        Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
+        Expr::Placeholder => Err(Error::UnsupportedExpression("Placeholder values must be replaced before filtering")),
         Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone())),
         Expr::Path(path) => Ok(ExprOutput::Value(item.value_at(path).ok_or_else(|| Error::PropertyNotFound(path.to_string()))?)),
         Expr::ExprList(exprs) => {
@@ -152,14 +152,25 @@ pub fn evaluate_predicate<S: Stage, I: ValueLookup<S>>(item: &I, predicate: &Pre
                     .unwrap_or(false),
                 ComparisonOperator::In => {
                     let value =
-                        left_val.as_value().ok_or_else(|| Error::PropertyNotFound("Expected single value for IN left operand".into()))?;
-                    let list = right_val.as_list().ok_or_else(|| Error::PropertyNotFound("Expected list for IN right operand".into()))?;
+                        left_val.as_value().ok_or_else(|| Error::UnsupportedExpression("Expected single value for IN left operand"))?;
+                    let list = right_val.as_list().ok_or_else(|| Error::UnsupportedExpression("Expected list for IN right operand"))?;
                     list.iter().any(|item| item.as_value().map(|v| compare_values_with_cast(value, v, |a, b| a == b)).unwrap_or(false))
                 }
                 ComparisonOperator::Between => return Err(Error::UnsupportedOperator("BETWEEN operator not yet supported")),
             })
         }
-        Predicate::And(left, right) => Ok(evaluate_predicate(item, left)? && evaluate_predicate(item, right)?),
+        // False decides AND even when the other branch has a missing value.
+        // Other evaluation errors are not SQL UNKNOWN and must still propagate.
+        Predicate::And(left, right) => match evaluate_predicate(item, left) {
+            Ok(false) => Ok(false),
+            Ok(true) => evaluate_predicate(item, right),
+            Err(unknown @ Error::PropertyNotFound(_)) => match evaluate_predicate(item, right) {
+                Ok(false) => Ok(false),
+                Ok(true) | Err(Error::PropertyNotFound(_)) => Err(unknown),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
         // A true branch decides OR even when the other branch cannot be evaluated.
         Predicate::Or(left, right) => match evaluate_predicate(item, left) {
             Ok(true) => Ok(true),
@@ -179,7 +190,7 @@ pub fn evaluate_predicate<S: Stage, I: ValueLookup<S>>(item: &I, predicate: &Pre
         Predicate::MemberOf(model) => item.is_member_of(model),
         Predicate::True => Ok(true),
         Predicate::False => Ok(false),
-        Predicate::Placeholder => Err(Error::PropertyNotFound("Placeholder must be transformed before filtering".to_string())),
+        Predicate::Placeholder => Err(Error::UnsupportedExpression("Placeholder must be transformed before filtering")),
     }
 }
 
@@ -276,6 +287,83 @@ mod tests {
 
     impl TestItem {
         fn new(name: &str, age: &str) -> Self { Self { name: name.to_string(), age: age.to_string() } }
+    }
+
+    #[test]
+    fn invalid_expressions_are_not_missing_properties() {
+        let item = TestItem::new("Alice", "30");
+        let scalar = Expr::Literal(Value::I64(1));
+        let list = Expr::ExprList(vec![scalar.clone()]);
+        let cases = [
+            ("predicate placeholder", Predicate::<Resolved>::Placeholder),
+            (
+                "expression placeholder",
+                Predicate::Comparison {
+                    left: Box::new(Expr::Placeholder),
+                    operator: ComparisonOperator::Equal,
+                    right: Box::new(scalar.clone()),
+                },
+            ),
+            (
+                "list on the left of IN",
+                Predicate::Comparison { left: Box::new(list.clone()), operator: ComparisonOperator::In, right: Box::new(list) },
+            ),
+            (
+                "scalar on the right of IN",
+                Predicate::Comparison { left: Box::new(scalar.clone()), operator: ComparisonOperator::In, right: Box::new(scalar) },
+            ),
+        ];
+
+        for (case, predicate) in cases {
+            let result = evaluate_predicate(&item, &predicate);
+            assert!(matches!(&result, Err(Error::UnsupportedExpression(_))), "{case}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn nullable_and_preserves_sql_truth_table_under_not() {
+        let item = TestItem::new("Alice", "30");
+        let missing = Predicate::Comparison {
+            left: Box::new(Expr::Path(prop_id("missing").into())),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::Bool(true))),
+        };
+        let predicate = |truth| match truth {
+            Some(true) => Predicate::True,
+            Some(false) => Predicate::False,
+            None => missing.clone(),
+        };
+        let cases = [
+            (None, Some(false), Some(false)),
+            (Some(false), None, Some(false)),
+            (None, Some(true), None),
+            (Some(true), None, None),
+            (None, None, None),
+            (Some(false), Some(false), Some(false)),
+            (Some(false), Some(true), Some(false)),
+            (Some(true), Some(false), Some(false)),
+            (Some(true), Some(true), Some(true)),
+        ];
+        for (left, right, expected) in cases {
+            let and = Predicate::<Resolved>::And(Box::new(predicate(left)), Box::new(predicate(right)));
+            for negated in [true, false] {
+                let expression = if negated { Predicate::Not(Box::new(and.clone())) } else { and.clone() };
+                let actual = match evaluate_predicate(&item, &expression) {
+                    Ok(value) => Some(value),
+                    Err(Error::PropertyNotFound(_)) => None,
+                    Err(error) => panic!("unexpected evaluation error: {error}"),
+                };
+                let expected = expected.map(|value| if negated { !value } else { value });
+                assert_eq!(actual, expected, "left={left:?}, right={right:?}, negated={negated}");
+            }
+        }
+
+        // Only missing values represent UNKNOWN. A malformed expression that
+        // is evaluated must remain an error even beside false or UNKNOWN.
+        for (left, right) in [(Predicate::Placeholder, Predicate::False), (missing, Predicate::Placeholder)] {
+            let and = Predicate::And(Box::new(left), Box::new(right));
+            assert!(matches!(evaluate_predicate(&item, &and), Err(Error::UnsupportedExpression(_))));
+        }
     }
 
     #[test]
