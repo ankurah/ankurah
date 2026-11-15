@@ -101,7 +101,7 @@ pub use store::{Encode, ReadTrx, Residency, Row, RowKey, Store, StoreTrx, WriteI
 pub use store::{Locked, LockedRead, LockedTrx, MemoryMap, MemoryStore, OrderedMap};
 pub use tree::{
     Applied, ComparisonError, Created, Difference, DigestTree, DigestTreeView, IntoScanRange, Leaf, MemberStream, Page, PageGetter,
-    PageMisfit, Prepared, ScanDirection, ScanRange, Transaction,
+    PageMisfit, Prepared, ScanDirection, ScanRange, Transaction, WeakDigestTree,
 };
 
 #[cfg(any(test, feature = "test-support"))]

@@ -13,6 +13,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChangeEvent};
 
+use crate::engine::maps;
 use crate::util::{cb_future::CBFuture, cb_race::CBRace, require::WBGRequire};
 
 /// Key of the storage protocol epoch record in the `_ankurah_meta` object store.
@@ -147,7 +148,7 @@ impl Database {
         if self.0.index_cache.contains(&name) {
             return Ok(());
         }
-        if self.0.connection.lock().await.has_index(&name)? {
+        if self.0.fresh_connection().await?.has_index(&name)? {
             self.0.index_cache.insert(name);
             return Ok(());
         }
@@ -161,7 +162,7 @@ impl Database {
             if inner.index_cache.contains(&name) {
                 return Ok(());
             }
-            let mut connection = inner.connection.lock().await;
+            let mut connection = inner.fresh_connection().await?;
             if connection.has_index(&name)? {
                 inner.index_cache.insert(name);
                 return Ok(());
@@ -176,6 +177,43 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// A connection to the database once it has the object stores of the
+    /// engine's maps, made in an upgrade of the database under the navigator
+    /// lock unless it has them already.
+    pub(crate) async fn connection_with_map_stores(&self) -> Result<SendWrapper<IdbDatabase>, RetrievalError> {
+        let connection = self.0.fresh_connection().await?.db.clone();
+        if maps::has_object_stores(&connection) {
+            return Ok(connection);
+        }
+
+        let lock_name = format!("ankurah-idb-upgrade-{}", self.0.db_name);
+        let inner = self.0.clone();
+
+        NavigatorLock::with(&lock_name, async move || {
+            // Without the Web Locks API, another tab's upgrade may take the
+            // next version first, and this one then opens the database at
+            // that version with no map stores: the upgrade is tried again
+            // from the version found, until the stores are there.
+            loop {
+                let mut connection = inner.fresh_connection().await?;
+                if maps::has_object_stores(&connection.db) {
+                    return Ok(());
+                }
+
+                let current_version = connection.version();
+                connection.close();
+
+                // Should the upgrade fail, the next call opens the database
+                // again rather than keep a closed connection.
+                connection.stale.store(true, Ordering::SeqCst);
+                *connection = Connection::open_with_map_stores(&inner.db_name, current_version + 1).await?;
+            }
+        })
+        .await?;
+
+        Ok(self.0.fresh_connection().await?.db.clone())
     }
 
     /// Get database name
@@ -193,6 +231,20 @@ impl Database {
     }
 }
 
+impl Inner {
+    /// The connection, under its mutex, opened again first if another engine
+    /// on the database, in this tab or another, has upgraded it since, which
+    /// leaves the connection closed, its version behind the database's.
+    async fn fresh_connection(&self) -> Result<tokio::sync::MutexGuard<'_, Connection>, RetrievalError> {
+        let mut connection = self.connection.lock().await;
+        if connection.is_stale() {
+            *connection = Connection::open(&self.db_name).await?;
+        }
+
+        Ok(connection)
+    }
+}
+
 /// Whether any ankurah object store (beyond `_ankurah_meta`) already holds content:
 /// the engine-natural detection of an existing database, distinguishing a
 /// fresh store (record and proceed) from one predating the version record
@@ -200,7 +252,8 @@ impl Database {
 async fn has_ankurah_data(db: &IdbDatabase) -> Result<bool, RetrievalError> {
     let db = SendWrapper::new(db);
     SendWrapper::new(async move {
-        for store_name in ["entities", "materializations", "events", "entity_models", "property_columns", "model_registrations"] {
+        let stores = ["entities", "materializations", "events", "entity_models", "property_columns", "model_registrations"];
+        for store_name in stores.into_iter().chain(maps::STORES) {
             if !db.object_store_names().contains(store_name) {
                 continue;
             }
@@ -320,6 +373,21 @@ impl Connection {
             if transaction.object_store("_ankurah_meta").is_err() {
                 transaction.db().create_object_store("_ankurah_meta").require("create meta store")?;
             }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Open the database at a bumped version, creating the object stores of
+    /// the engine's maps.
+    async fn open_with_map_stores(db_name: &str, version: u32) -> Result<Self, RetrievalError> {
+        notice_info!("creating the maps' object stores in {db_name}");
+
+        Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
+            let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
+            let transaction = open_request.transaction().require("get upgrade transaction")?;
+            maps::create_object_stores(&transaction.db()).require("create the maps' object stores")?;
+
             Ok(())
         })
         .await

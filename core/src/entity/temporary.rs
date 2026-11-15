@@ -1,7 +1,7 @@
 use super::state::EntityInnerState;
 use crate::{error::RetrievalError, selection::filter::Filterable, value::Value};
 use ankql::ast::PropertyId;
-use ankurah_proto::{EntityId, ModelId, State};
+use ankurah_proto::{Clock, EntityId, ModelId, State};
 
 /// Reconstituted state for predicate evaluation, not registered with a node.
 pub struct TemporaryEntity {
@@ -11,6 +11,10 @@ pub struct TemporaryEntity {
 
 impl TemporaryEntity {
     pub fn new(id: EntityId, state: &State) -> Result<Self, RetrievalError> { Ok(Self { id, state: EntityInnerState::from_state(state)? }) }
+
+    pub fn id(&self) -> EntityId { self.id }
+
+    pub fn head(&self) -> Clock { self.state.head.clone() }
 
     pub fn values(&self) -> Vec<(PropertyId, Option<Value>)> {
         self.state.backends.values().flat_map(|backend| backend.property_values()).collect()

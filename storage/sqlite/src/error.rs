@@ -36,6 +36,12 @@ pub enum SqliteError {
 
     #[error("store has existing ankurah tables but no recorded protocol version (pre-{expected} store); reset your development database (or migrate the store) before opening it with this binary")]
     UnversionedStore { expected: u32 },
+
+    /// A database in memory keeps no ordered maps: each connection to it is
+    /// a database of its own, so a map transaction's or a snapshot's
+    /// connection would see none of the others' maps.
+    #[error("an SQLite database in memory keeps no ordered maps: each connection to it is a database of its own")]
+    MapsInMemory,
 }
 
 impl From<SqliteError> for ankurah_core::error::RetrievalError {

@@ -1,6 +1,4 @@
-//! Writing a tree: creating it, and committing transactions to it, either in
-//! a transaction its owner lends it or, on a store with no other owner, in
-//! one of the store's own.
+//! Creating, rebuilding and updating trees through storage transactions.
 
 mod commit;
 mod create;
@@ -9,6 +7,7 @@ mod hashing;
 mod locked;
 mod maintain;
 mod prepared;
+mod rebuild;
 mod transaction;
 
 use std::ops::Bound;
@@ -81,17 +80,17 @@ where
     pub fn transaction(&self) -> Transaction<K, I, L, G, S> { Transaction::new(self.clone()) }
 }
 
-/// A tree created in its owner's transaction, which exists once that
-/// transaction commits.
-#[must_use = "a created tree exists once its owner's transaction commits, and then `landed` gives it"]
+/// A pending creation or rebuild in the owner's transaction.
+/// Call [`landed`](Self::landed) only after that transaction commits.
+#[must_use = "commit the owner's transaction, then call `landed` to obtain the created or rebuilt tree"]
 pub struct Created<K, I, L, G: DigestGroup, S: Store<RowKey, Row<K, L, G>>> {
     tree: DigestTree<K, I, L, G, S>,
     pending: S::Pending,
 }
 
 impl<K, I, L, G: DigestGroup, S: Store<RowKey, Row<K, L, G>>> Created<K, I, L, G, S> {
-    /// The tree, once the owner's transaction its rows were written in has
-    /// committed: the store takes in what it kept of them.
+    /// Notify the store that these rows committed and return the tree.
+    /// Call only after the owner's transaction has committed.
     pub fn landed(self) -> DigestTree<K, I, L, G, S> {
         self.tree.inner.store.landed(self.pending);
         self.tree

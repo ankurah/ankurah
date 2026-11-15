@@ -41,3 +41,5 @@ tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 ankurah            = { path = "../../ankurah", version = "=0.10.0", features = ["derive", "test-helpers"] }
 tracing-subscriber = "0.3"
 ctor               = "0.2"
+
+ankurah-digest-tree = { path = "../../digest-tree" }

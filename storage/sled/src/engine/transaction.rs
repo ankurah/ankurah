@@ -1,8 +1,12 @@
+use super::maps::{MapEntries, TransactionMaps};
 use super::*;
 use crate::index::Index;
 use ankurah_core::{
     property::backend::backend_from_string,
-    storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageTransaction},
+    storage::{
+        transaction_call, CommittedEntityWrite, LockName, MapRead, MapRows, MapWrite, StorageCommitOutcome, StorageCommitResult,
+        StorageTransaction,
+    },
     value::Value,
 };
 use ankurah_proto::{AttestationSet, Clock, PropertyId, State};
@@ -13,6 +17,19 @@ pub struct SledTransaction<'a> {
     engine: &'a SledStorageEngine,
     entities: Vec<EntityRow>,
     events: Vec<(IVec, IVec)>,
+
+    /// Its map calls: from the first, the locks it holds, and its map writes
+    /// until its commit lands them.
+    maps: TransactionMaps,
+
+    /// Set by `poison`, and by each map call from its start until it returns
+    /// `Ok`, so that a call that fails, or is dropped part way, leaves it set:
+    /// every later call and the commit then fail.
+    poisoned: bool,
+
+    /// The greatest lock name taken so far, which each map call's names
+    /// ascend past.
+    last_lock: Option<LockName>,
 }
 
 struct EntityRow {
@@ -55,17 +72,28 @@ pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<(IVec, IVe
 }
 
 impl<'a> SledTransaction<'a> {
-    pub(super) fn new(engine: &'a SledStorageEngine) -> Self { Self { engine, entities: Vec::new(), events: Vec::new() } }
+    pub(super) fn new(engine: &'a SledStorageEngine) -> Self {
+        Self { engine, entities: Vec::new(), events: Vec::new(), maps: TransactionMaps::default(), poisoned: false, last_lock: None }
+    }
 }
 
 #[async_trait]
 impl StorageTransaction for SledTransaction<'_> {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
         self.events.extend(encode_events(events)?);
         Ok(())
     }
 
     async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
+        if self.maps.made_map_calls() {
+            return Err(MutationError::InvalidUpdate("state set after the transaction's first map call"));
+        }
         let entity_id = state.payload.entity_id;
         let index = self.entities.iter().position(|write| write.entity_id == entity_id);
         if index.is_some_and(|index| self.entities[index].head != *expected_head) {
@@ -97,19 +125,43 @@ impl StorageTransaction for SledTransaction<'_> {
     }
 
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError> {
-        if self.entities.is_empty() && self.events.is_empty() {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
+        let Self { engine, entities, events, maps, .. } = self;
+        let mut landing = maps.landing(engine).await;
+        if entities.is_empty() && events.is_empty() && landing.is_empty() {
             return Ok(StorageCommitOutcome::Committed(StorageCommitResult::default()));
         }
-        let Self { engine, entities, events, .. } = self;
+
         let database = engine.database.lock().unwrap().clone();
-        tokio::task::spawn_blocking(move || commit_staged(database, entities, events)).await?
+        tokio::task::spawn_blocking(move || {
+            let entries = landing.entries(&database.maps_tree).map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
+            let outcome = commit_staged(database, entities, events, entries);
+
+            drop(landing);
+            outcome
+        })
+        .await?
     }
+
+    async fn map_lock_and_read(&mut self, locks: &[LockName], reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> {
+        transaction_call(&mut self.poisoned, &mut self.last_lock, locks, self.maps.lock_and_read(self.engine, locks, reads)).await
+    }
+
+    async fn map_write(&mut self, writes: Vec<MapWrite>) -> Result<(), MutationError> {
+        let (maps, engine) = (&mut self.maps, self.engine);
+        transaction_call(&mut self.poisoned, &mut self.last_lock, &[], async move { Ok(maps.write(engine, writes).await) }).await
+    }
+
+    fn poison(&mut self) { self.poisoned = true; }
 }
 
 fn commit_staged(
     database: Arc<Database>,
     mut entities: Vec<EntityRow>,
     events: Vec<(IVec, IVec)>,
+    maps: Option<MapEntries>,
 ) -> Result<StorageCommitOutcome, MutationError> {
     // Index creation/backfill takes this same guard. Keep the current tree set
     // fixed from preparation through the native multi-tree transaction.
@@ -151,6 +203,11 @@ fn commit_staged(
             }
         }
     }
+    // The maps' tree joins the sled transaction only when it lands map writes.
+    let maps = maps.map(|entries| {
+        trees.push(database.maps_tree.clone());
+        (trees.len() - 1, entries)
+    });
     let attempt: Result<StorageCommitResult, TransactionError<SledCommitAbort>> = trees.as_slice().transaction(|transactional| {
         let canonical = &transactional[0];
         let associations = &transactional[1];
@@ -239,6 +296,9 @@ fn commit_staged(
                 prepared.original_index,
                 CommittedEntityWrite { entity_id, canonical_changed: prepared.expected_head != prepared.head },
             ));
+        }
+        if let Some((position, entries)) = &maps {
+            entries.land(&transactional[*position])?;
         }
         results.sort_by_key(|(index, _)| *index);
         let entities = results.into_iter().map(|(_, result)| result).collect();

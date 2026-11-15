@@ -14,7 +14,10 @@ use std::{
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     schema::CatalogResolver,
-    storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction},
+    storage::{
+        transaction_call, CommittedEntityWrite, LockName, MapRead, MapRows, MapWrite, StorageCommitOutcome, StorageCommitResult,
+        StorageEngine, StorageTransaction,
+    },
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
 use ankurah_proto::{ModelId, SystemModel};
@@ -32,9 +35,14 @@ use tokio_postgres::{error::SqlState, GenericClient};
 use tracing::{debug, error};
 
 mod dump;
+mod maps;
 mod materialization;
 mod query;
+#[cfg(test)]
+#[path = "../tests/server/mod.rs"]
+mod test_server;
 mod transaction;
+pub use maps::{MapError, MapSettings, PostgresMapSnapshot};
 use materialization::{Materialization, PreparedMaterialization};
 pub use transaction::PostgresTransaction;
 
@@ -55,9 +63,12 @@ const COLUMN_MAP_TABLE: &str = "_ankurah_postgres_column_map";
 const ENTITY_TABLE: &str = "_ankurah_entity";
 const EVENT_TABLE: &str = "_ankurah_event";
 const ENTITY_MODEL_TABLE: &str = "_ankurah_entity_model";
+/// Every ordered map's entries. A reset empties it rather than drop it, so
+/// that the statements each connection for map calls prepared stay good.
+const MAP_TABLE: &str = "_ankurah_map";
 const IDENTIFIER_MAX_BYTES: usize = 63;
 const FIXED_STORAGE_TABLES: &[&str] =
-    &[META_TABLE, MODEL_REGISTRATION_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE];
+    &[META_TABLE, MODEL_REGISTRATION_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE, MAP_TABLE];
 
 fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
 
@@ -88,6 +99,9 @@ pub struct Postgres {
     resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// Whether this instance created the shared tables since opening or since its last `delete_all`.
     shared_tables_ready: AtomicBool,
+    /// The connections that serve map calls: each storage transaction's from
+    /// its first map call to its end, each snapshot's, and each reset's.
+    maps: Arc<maps::Pool>,
 }
 
 impl Postgres {
@@ -97,7 +111,15 @@ impl Postgres {
     /// `check_protocol_version`) so every construction path verifies
     /// the store it is about to serve.
     pub async fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> {
+        Self::with_map_settings(pool, MapSettings::default()).await
+    }
+
+    /// Create a new storage engine with an existing pool, whose map calls
+    /// connect and wait as `settings` say. Their connections open as the
+    /// pool's do, apart from the pool.
+    pub async fn with_map_settings(pool: bb8::Pool<PostgresConnectionManager<NoTls>>, settings: MapSettings) -> anyhow::Result<Self> {
         let engine = Self {
+            maps: maps::Pool::new(pool.clone(), settings),
             pool,
             materializations: SafeMap::new(),
             resolver: Arc::new(RwLock::new(None)),
@@ -306,6 +328,19 @@ impl Postgres {
         Ok(())
     }
 
+    /// Ensure the shared tables on a connection of the engine's pool, for a
+    /// commit whose own connection holds its transaction open: DDL there
+    /// would land only with that transaction, after the DDL lock that keeps
+    /// two sessions from creating one table at once was released.
+    async fn ensure_shared_tables_aside(&self) -> Result<(), MutationError> {
+        if self.shared_tables_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let client = self.pool.get().await.map_err(|error| MutationError::General(Box::new(error)))?;
+        Ok(self.ensure_shared_tables(&client).await?)
+    }
+
     /// Open or create the private query surface for a model.
     async fn materialization(&self, model_id: &ModelId) -> Result<Arc<Materialization>, RetrievalError> {
         self.materializations
@@ -433,8 +468,15 @@ async fn release_ddl_lock(client: &tokio_postgres::Client, lock_key: i64) -> Res
 impl StorageEngine for Postgres {
     type Value = PGValue;
     type Transaction<'a> = PostgresTransaction<'a>;
+    type Snapshot = PostgresMapSnapshot;
 
     fn transaction(&self) -> Self::Transaction<'_> { PostgresTransaction::new(self) }
+
+    /// A snapshot on a connection of its own. Its reads never wait for a
+    /// commit, so it takes no lock: `locks` go unused.
+    async fn map_snapshot(&self, _locks: &[LockName]) -> Result<PostgresMapSnapshot, RetrievalError> {
+        Ok(PostgresMapSnapshot::begin(&self.maps).await?)
+    }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
@@ -489,7 +531,17 @@ impl StorageEngine for Postgres {
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
         self.materializations.clear();
-        let mut client = self.pool.get().await.map_err(|err| MutationError::General(Box::new(err)))?;
+
+        // Start a transaction to drop all tables atomically, on a connection
+        // of the maps': a map transaction the reset waits for then finds the
+        // engine's pool free for its commit, and the maps' lock timeout
+        // bounds every lock wait of the reset, the tables' drops included.
+        // It empties the maps before it lists the tables, so that it finds
+        // every table the map transactions it waited for made.
+        let lease = self.maps.lease().await.map_err(|err| MutationError::General(Box::new(err)))?;
+        let client = &lease.connection().client;
+        lease.begin("BEGIN").await.map_err(|err| MutationError::General(Box::new(err)))?;
+        let emptied = maps::reset(client).await.map_err(|err| MutationError::General(Box::new(err)))?;
 
         let rows = client
             .query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[])
@@ -503,7 +555,7 @@ impl StorageEngine for Postgres {
         let mut owned: BTreeSet<String> = FIXED_STORAGE_TABLES
             .iter()
             .copied()
-            .filter(|name| *name != META_TABLE && existing.contains(*name))
+            .filter(|name| ![META_TABLE, MAP_TABLE].contains(name) && existing.contains(*name))
             .map(str::to_owned)
             .collect();
         if existing.contains(MODEL_REGISTRATION_TABLE) {
@@ -515,21 +567,19 @@ impl StorageEngine for Postgres {
                 rows.into_iter().map(|row| row.get::<_, String>("materialization_table_name")).filter(|name| existing.contains(name)),
             );
         }
-        if owned.is_empty() {
+        if owned.is_empty() && !emptied {
+            lease.end("ROLLBACK").await.map_err(|err| MutationError::General(Box::new(err)))?;
             return Ok(false);
         }
-
-        // Start a transaction to drop all tables atomically
-        let transaction = client.transaction().await.map_err(|err| MutationError::General(Box::new(err)))?;
 
         // Drop each table
         for table_name in owned {
             let drop_query = format!("DROP TABLE IF EXISTS {}", quote_identifier(&table_name));
-            transaction.execute(&drop_query, &[]).await.map_err(|err| MutationError::General(Box::new(err)))?;
+            client.execute(&drop_query, &[]).await.map_err(|err| MutationError::General(Box::new(err)))?;
         }
 
         // Commit the transaction
-        transaction.commit().await.map_err(|err| MutationError::General(Box::new(err)))?;
+        lease.end("COMMIT").await.map_err(|err| MutationError::General(Box::new(err)))?;
         self.shared_tables_ready.store(false, Ordering::Release);
 
         Ok(true)

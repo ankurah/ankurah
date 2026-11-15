@@ -8,10 +8,8 @@ use crate::EntityId;
 pub enum RangeBound<T> {
     /// The range includes this value.
     Included(T),
-
-    /// The range ends just short of this value.
+    /// This value is excluded from the range at this bound.
     Excluded(T),
-
     /// The range has no bound on this side.
     Unbounded,
 }

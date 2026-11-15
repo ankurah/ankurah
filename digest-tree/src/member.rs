@@ -18,12 +18,13 @@ pub trait MemberId: Clone + Eq + Send + Sync + 'static {
     fn from_bytes(bytes: &[u8]) -> Option<Self>;
 }
 
-/// What a tree keeps with each member, hands back in reads, and covers in the
-/// member's leaf digest. Two trees whose members agree on ids, keys and
-/// payloads hold equal digests. The tree attaches no meaning to it.
+/// Data stored with each member and returned by reads. The member's leaf
+/// digest covers the bytes returned by [`digest_bytes`](Self::digest_bytes).
 pub trait Payload: Clone + Send + Sync + 'static {
-    /// The bytes the member's leaf digest covers. Payloads the caller regards
-    /// as equal must give equal bytes.
+    /// The bytes that define payload equality for version checks and tree
+    /// comparisons. Fields omitted from these bytes are still stored and
+    /// returned by reads; an update replaces them even when these bytes are
+    /// unchanged. Payloads the caller regards as equal must give equal bytes.
     fn digest_bytes(&self) -> Cow<'_, [u8]>;
 }
 

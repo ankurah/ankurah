@@ -1,6 +1,5 @@
 //! Dependency-leaf durable identities and values shared by the query,
-//! protocol, core, and storage crates, with how values sort, the key specs
-//! that order an index's entries, and which way a read runs over keys.
+//! protocol, core, and storage crates.
 
 #![deny(missing_docs)]
 

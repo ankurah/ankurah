@@ -3,9 +3,11 @@
 
 mod common;
 
-use ankurah_core_types::key_spec::KeySpec;
-use ankurah_core_types::ValueType;
-use ankurah_digest_tree::{Error, KeyRange, MemberId, MemoryStore, Ristretto255, Transaction};
+use std::borrow::Cow;
+
+use ankurah_core_types::key_spec::{IndexKeyPart, KeySpec};
+use ankurah_core_types::{Value, ValueType};
+use ankurah_digest_tree::{DigestTree, Error, KeyRange, Member, MemberId, MemoryStore, Payload, Ristretto255, Transaction};
 use common::{
     asc, assert_same_rows, counted, counted_store, failing_store, item, leaf_at, no_items, remove_add_and_move, removed_added_and_moved,
     stored_rows, ten_items, tree_of, CountedStore, CountedTree, FailingTree, Id, ItemTree, Named, NamedTree, Property, Tag,
@@ -40,6 +42,54 @@ async fn an_update_under_the_same_key_replaces_the_payload() {
 
     assert_eq!(leaf_at(&tree.view(), [2i64], &Id(2)).await.unwrap().payload, Tag(b"changed".to_vec()));
     assert_same_rows(&tree, &tree_of!(spec, [item!(1, 1, b"a"), item!(2, 2, b"changed")])).await;
+}
+
+#[tokio::test]
+async fn an_update_replaces_metadata_outside_the_payload_digest() {
+    // One id-only member that stores metadata outside its digest bytes.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct WithMetadata {
+        digest: [u8; 1],
+        metadata: u8,
+    }
+
+    impl Payload for WithMetadata {
+        fn digest_bytes(&self) -> Cow<'_, [u8]> { Cow::Borrowed(&self.digest) }
+    }
+
+    impl Member<Property> for WithMetadata {
+        type Id = Id;
+        type Payload = Self;
+        type KeyError = common::NoProperty;
+
+        fn id(&self) -> Id { Id(1) }
+
+        fn value(&self, part: &IndexKeyPart<Property>) -> Result<Option<Value>, Self::KeyError> { Err(common::NoProperty(part.key)) }
+
+        fn payload(&self) -> Self { self.clone() }
+    }
+
+    let original = WithMetadata { digest: [7], metadata: 1 };
+    let tree =
+        DigestTree::<Property, Id, _, Ristretto255, _>::create(MemoryStore::new(), KeySpec::new(vec![]), [original.clone()]).await.unwrap();
+    let digest = tree.view().span_digest(..).await.unwrap();
+
+    let mut trx = tree.transaction();
+    // Both the stored before-version and the next coalesced before-version
+    // agree by digest bytes, despite having different metadata.
+    trx.update(WithMetadata { metadata: 0, ..original.clone() }, WithMetadata { metadata: 2, ..original.clone() }).unwrap();
+    trx.update(WithMetadata { metadata: 99, ..original.clone() }, WithMetadata { metadata: 3, ..original.clone() }).unwrap();
+    trx.commit().await.unwrap();
+
+    let store = tree.store().clone();
+    drop(tree);
+    let reopened = DigestTree::<Property, Id, WithMetadata, Ristretto255, _>::open(store).await.unwrap();
+    let view = reopened.view();
+    let leaves: Vec<_> = view.range(..).unwrap().try_collect().await.unwrap();
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(leaves[0].payload, WithMetadata { metadata: 3, ..original });
+    assert_eq!(view.count(..).await.unwrap(), 1);
+    assert_eq!(view.span_digest(..).await.unwrap(), digest);
 }
 
 #[tokio::test]

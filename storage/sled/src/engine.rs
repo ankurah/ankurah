@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    storage::StorageEngine,
+    storage::{LockName, StorageEngine},
 };
 use ankurah_proto::{Attested, EntityId, EntityState, Event, EventId, ModelId, StateFragment};
 use async_trait::async_trait;
@@ -20,8 +20,11 @@ use crate::{
     model_store::SledModelStore,
 };
 
+mod maps;
 mod query;
 mod transaction;
+use maps::MapLocks;
+pub use maps::SledMapSnapshot;
 pub use transaction::SledTransaction;
 
 /// Sled implementation of the model-independent storage contract.
@@ -31,6 +34,8 @@ pub struct SledStorageEngine {
     #[cfg(debug_assertions)]
     /// Runtime test switch for disabling open-ended scan prefix guards.
     pub prefix_guard_disabled: Arc<AtomicBool>,
+    /// The in-process locks that map transactions, snapshots and resets take.
+    map_locks: MapLocks,
 }
 
 impl SledStorageEngine {
@@ -59,6 +64,7 @@ impl SledStorageEngine {
             database: Mutex::new(Arc::new(Database::open(db)?)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
+            map_locks: MapLocks::default(),
         })
     }
 
@@ -74,6 +80,7 @@ impl SledStorageEngine {
             database: Mutex::new(Arc::new(Database::open(db)?)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
+            map_locks: MapLocks::default(),
         })
     }
 
@@ -101,8 +108,13 @@ impl SledStorageEngine {
 impl StorageEngine for SledStorageEngine {
     type Value = Vec<u8>;
     type Transaction<'a> = SledTransaction<'a>;
+    type Snapshot = SledMapSnapshot;
 
     fn transaction(&self) -> Self::Transaction<'_> { SledTransaction::new(self) }
+
+    async fn map_snapshot(&self, locks: &[LockName]) -> Result<SledMapSnapshot, RetrievalError> {
+        Ok(SledMapSnapshot::begin(self, locks).await)
+    }
 
     async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> { SledStorageEngine::list_models(self) }
 
@@ -164,6 +176,7 @@ impl StorageEngine for SledStorageEngine {
     }
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
+        let _reset = self.map_locks.hold_reset().await;
         let mut any_deleted = false;
 
         // Get all tree names and drop them

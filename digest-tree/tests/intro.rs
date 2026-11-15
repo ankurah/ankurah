@@ -128,7 +128,7 @@ async fn a_change_names_the_version_the_tree_holds() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A stored tree's changes go into its owner's transaction on the store,
+/// A digest tree's changes go into its owner's transaction on the store,
 /// beside the owner's own records, and land only when the owner commits it:
 /// the description and the records never drift apart.
 #[tokio::test]

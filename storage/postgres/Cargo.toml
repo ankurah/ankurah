@@ -37,3 +37,4 @@ ctor                   = "0.2"
 serde                  = { version = "1.0", features = ["derive"] }
 testcontainers         = { version = "0.23", features = ["reusable-containers"] }
 testcontainers-modules = { version = "0.11.4", features = ["postgres"] }
+ankurah-digest-tree    = { path = "../../digest-tree" }

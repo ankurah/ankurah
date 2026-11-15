@@ -18,6 +18,10 @@ impl<K, V> Locked<MemoryMap<K, V>> {
     pub fn new() -> Self { Self::over(MemoryMap::new()) }
 }
 
+impl<K, V> Default for Locked<MemoryMap<K, V>> {
+    fn default() -> Self { Self::new() }
+}
+
 /// One tree's rows in memory, in a `BTreeMap`: the map of a [`MemoryStore`].
 /// A batch applies whole under the map's lock, so every read sees all of it or
 /// none of it, and no lock is held across an await.
@@ -29,6 +33,10 @@ pub struct MemoryMap<K, V> {
 impl<K, V> MemoryMap<K, V> {
     /// An empty map.
     pub fn new() -> Self { Self { rows: RwLock::new(BTreeMap::new()) } }
+}
+
+impl<K, V> Default for MemoryMap<K, V> {
+    fn default() -> Self { Self::new() }
 }
 
 /// The lock is poisoned only when a key's or row's own code panicked while a

@@ -1,7 +1,5 @@
-/// Which way a read runs over the keys it reads, in their order: smallest
-/// first, or largest first. A key spec's parts say which way each part's
-/// values sort within a key; a scan direction says which way a read runs over
-/// the keys that result.
+/// Traversal order over encoded keys. A key spec controls how each part's
+/// values sort within a key; scan direction controls traversal of the resulting keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScanDirection {
     /// Smallest key first.

@@ -94,7 +94,7 @@ pub(super) struct PreparedMaterialization {
 }
 
 impl PreparedMaterialization {
-    pub(super) fn write(&self, transaction: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
+    pub(super) fn write(&self, transaction: &rusqlite::Connection) -> Result<(), SqliteError> {
         let mut columns = vec!["id".to_owned()];
         let mut values = vec![rusqlite::types::Value::Text(self.entity_id.clone())];
         let mut placeholder_is_jsonb = vec![false];

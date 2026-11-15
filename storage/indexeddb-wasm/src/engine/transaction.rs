@@ -1,10 +1,24 @@
 use super::*;
+use maps::TransactionMaps;
 
 /// IndexedDB objects prepared before opening their shared write transaction.
 pub struct IndexedDbTransaction<'a> {
     engine: &'a IndexedDBStorageEngine,
     entities: Vec<EntityRow>,
     events: Vec<EventRow>,
+
+    /// Its map calls: from the first, the names it holds and what it noted
+    /// of the database's state.
+    maps: TransactionMaps<'a>,
+
+    /// Set by `poison`, and by each map call from its start until it returns
+    /// `Ok`, so that a call that fails, or is dropped part way, leaves it set:
+    /// every later call and the commit then fail.
+    poisoned: bool,
+
+    /// The greatest lock name taken so far, which each map call's names
+    /// ascend past.
+    last_lock: Option<LockName>,
 }
 
 struct EntityRow {
@@ -50,17 +64,35 @@ pub(super) async fn insert_events(store: &web_sys::IdbObjectStore, events: &[Eve
 }
 
 impl<'a> IndexedDbTransaction<'a> {
-    pub(super) fn new(engine: &'a IndexedDBStorageEngine) -> Self { Self { engine, entities: Vec::new(), events: Vec::new() } }
+    pub(super) fn new(engine: &'a IndexedDBStorageEngine) -> Self {
+        Self {
+            engine,
+            entities: Vec::new(),
+            events: Vec::new(),
+            maps: TransactionMaps::new(&engine.db, &engine.map_locks),
+            poisoned: false,
+            last_lock: None,
+        }
+    }
 }
 
 #[async_trait]
 impl StorageTransaction for IndexedDbTransaction<'_> {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
         self.events.extend(encode_events(events)?);
         Ok(())
     }
 
     async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
+        if self.maps.made_map_calls() {
+            return Err(MutationError::InvalidUpdate("state set after the transaction's first map call"));
+        }
         let entity_id = state.payload.entity_id;
         let index = self.entities.iter().position(|write| write.entity_id == entity_id);
         if index.is_some_and(|index| self.entities[index].head != *expected_head) {
@@ -102,9 +134,14 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
     }
 
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError> {
-        if self.entities.is_empty() && self.events.is_empty() {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
+        let mut landing = self.maps.landing();
+        if self.entities.is_empty() && self.events.is_empty() && landing.is_none() {
             return Ok(StorageCommitOutcome::Committed(StorageCommitResult::default()));
         }
+
         let Self { engine, entities: staged_entities, events: staged_events, .. } = self;
         let db_connection = engine.db.get_connection().await;
         SendWrapper::new(async move {
@@ -112,10 +149,18 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
             for name in ["entities", "entity_models", "materializations", "events"] {
                 store_names.push(&JsValue::from_str(name));
             }
+            if landing.is_some() {
+                for name in maps::STORES {
+                    store_names.push(&JsValue::from_str(name));
+                }
+            }
             let transaction = db_connection
                 .transaction_with_str_sequence_and_mode(store_names.as_ref(), web_sys::IdbTransactionMode::Readwrite)
                 .require("create prepared state transaction")?;
             let _abort = AbortUnfinishedTransaction(transaction.clone());
+            if let Some(landing) = &landing {
+                landing.compare(&transaction).await?;
+            }
             let entities = transaction.object_store("entities").require("get canonical entities store")?;
             let associations = transaction.object_store("entity_models").require("get entity-model association store")?;
             let materializations = transaction.object_store("materializations").require("get materializations store")?;
@@ -141,8 +186,8 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
                 observed.insert(entity_id, current);
             }
             if conflict {
-                cb_future(&transaction, "complete", "error").await.require("complete conflicting state transaction")?;
-                return Ok::<_, RetrievalError>(StorageCommitOutcome::Conflict { observed });
+                completed(&transaction).await?;
+                return Ok::<_, MutationError>(StorageCommitOutcome::Conflict { observed });
             }
 
             let mut prior_models = BTreeMap::<EntityId, BTreeSet<ModelId>>::new();
@@ -152,7 +197,8 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
                 if !prior.is_subset(&write.memberships) {
                     return Err(RetrievalError::Other(format!(
                         "canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported"
-                    )));
+                    ))
+                    .into());
                 }
                 prior_models.insert(entity_id, prior);
             }
@@ -188,10 +234,23 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
             }
             committed.sort_by_key(|(index, _)| *index);
             let entities = committed.into_iter().map(|(_, result)| result).collect();
-            cb_future(&transaction, "complete", "error").await.require("complete prepared state transaction")?;
+            if let Some(landing) = &mut landing {
+                landing.write(&transaction)?;
+            }
+            completed(&transaction).await?;
+
             Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities }))
         })
         .await
-        .map_err(MutationError::from)
     }
+
+    async fn map_lock_and_read(&mut self, locks: &[LockName], reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> {
+        transaction_call(&mut self.poisoned, &mut self.last_lock, locks, self.maps.lock_and_read(locks, reads)).await
+    }
+
+    async fn map_write(&mut self, writes: Vec<MapWrite>) -> Result<(), MutationError> {
+        transaction_call(&mut self.poisoned, &mut self.last_lock, &[], self.maps.write(writes)).await
+    }
+
+    fn poison(&mut self) { self.poisoned = true; }
 }

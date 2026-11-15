@@ -1,5 +1,5 @@
-//! Key specs: the parts that order an index's entries, each with the direction
-//! it sorts in, the type its values have and where missing values go.
+//! Index key specifications: ordered parts with a value type, sort direction,
+//! and placement of missing values.
 
 use crate::ValueType;
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,6 @@ pub struct KeySpec<K> {
 pub enum IndexDirection {
     /// Smallest value first.
     Asc,
-
     /// Largest value first.
     Desc,
 }
@@ -26,7 +25,6 @@ pub enum IndexDirection {
 pub enum NullsOrder {
     /// Before every value.
     First,
-
     /// After every value.
     Last,
 }
@@ -42,20 +40,15 @@ pub struct IndexKeyPart<K> {
     /// encoded value (`value_type` + `direction`), not on the key, so this field
     /// only needs `Eq`/`Hash` for index matching, never `Ord`.
     pub key: K,
-
     /// Optional path within property value (for JSON, future Ref, etc.)
     pub sub_path: Option<Vec<String>>,
-
-    /// ASC or DESC.
+    /// ASC/DESC
     pub direction: IndexDirection,
-
-    /// The expected type for this key component.
+    /// Expected type for this key component
     pub value_type: ValueType,
-
-    /// PostgreSQL-style NULLS FIRST or LAST, if given.
+    /// PG-style NULLS FIRST/LAST (optional)
     pub nulls: Option<NullsOrder>,
-
-    /// A collation's name or id, if relevant.
+    /// collation name/id if relevant (optional)
     pub collation: Option<String>,
 }
 
@@ -64,7 +57,6 @@ impl<K> IndexKeyPart<K> {
     pub fn asc(key: impl Into<K>, value_type: ValueType) -> Self {
         Self { key: key.into(), sub_path: None, direction: IndexDirection::Asc, value_type, nulls: None, collation: None }
     }
-
     /// A descending part on `key`, whose values are `value_type`.
     pub fn desc(key: impl Into<K>, value_type: ValueType) -> Self {
         Self { key: key.into(), sub_path: None, direction: IndexDirection::Desc, value_type, nulls: None, collation: None }
@@ -199,7 +191,6 @@ impl<K: PartialEq> KeySpec<K> {
 pub enum IndexSpecMatch {
     /// The index specs match
     Match,
-
     /// The index specs match, but scan direction must be inverted
     Inverse,
 }

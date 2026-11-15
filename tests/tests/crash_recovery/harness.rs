@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ankurah::core::error::{MutationError, RetrievalError};
-use ankurah::core::storage::{StorageCommitOutcome, StorageEngine, StorageTransaction};
+use ankurah::core::storage::{LockName, MapRead, MapRows, MapWrite, StorageCommitOutcome, StorageEngine, StorageTransaction};
 use ankurah::proto::{self, Attested, EntityId, EntityState, Event, EventId};
 use ankurah::ModelId;
 use ankurah_storage_sled::SledStorageEngine;
@@ -181,8 +181,11 @@ impl CrashState {
 impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorageEngine<E> {
     type Value = ();
     type Transaction<'a> = CrashStorageTransaction<'a, E>;
+    type Snapshot = E::Snapshot;
 
     fn transaction(&self) -> Self::Transaction<'_> { CrashStorageTransaction { engine: self, inner: self.inner.transaction() } }
+
+    async fn map_snapshot(&self, locks: &[LockName]) -> Result<E::Snapshot, RetrievalError> { self.inner.map_snapshot(locks).await }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { self.inner.get_state(id).await }
 
@@ -236,6 +239,16 @@ impl<E: StorageEngine + CrashFlushable> StorageTransaction for CrashStorageTrans
         }
         Ok(outcome)
     }
+
+    async fn map_lock_and_read(&mut self, locks: &[LockName], reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> {
+        self.inner.map_lock_and_read(locks, reads).await
+    }
+
+    async fn map_read(&mut self, reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> { self.inner.map_read(reads).await }
+
+    async fn map_write(&mut self, writes: Vec<MapWrite>) -> Result<(), MutationError> { self.inner.map_write(writes).await }
+
+    fn poison(&mut self) { self.inner.poison(); }
 }
 
 // ============================================================================

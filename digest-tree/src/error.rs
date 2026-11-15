@@ -10,7 +10,7 @@ pub enum Error {
     // The caller's.
     /// A member couldn't give its value for a part of the tree's key. A
     /// transaction records nothing of the change that named it, and a
-    /// creation that held it writes nothing.
+    /// creation or rebuild containing it writes nothing.
     #[error("member {member:02x?} couldn't give a value for the tree's key: {source}")]
     Key {
         /// The member's id, as its bytes.
@@ -23,7 +23,7 @@ pub enum Error {
     /// A member gave a part of the tree's key a value of another type than
     /// the part's, which would sort its key among values it can't be compared
     /// with. A transaction records nothing of the change that named it, and a
-    /// creation that held it writes nothing.
+    /// creation or rebuild containing it writes nothing.
     #[error("member {member:02x?} gives key part {part} a {found:?}, where the key spec wants a {expected:?}")]
     WrongValueType {
         /// The member's id, as its bytes.
@@ -74,8 +74,9 @@ pub enum Error {
     /// A change named a version of a member that isn't the one held. At the
     /// change's call, the transaction had left the member in another version,
     /// and the change isn't recorded. When the commit is applied, the tree's
-    /// leaf is missing or holds another payload: the tree and its owner
-    /// disagree, so nothing is written, and the owner rebuilds the tree.
+    /// leaf is missing or holds another payload, so nothing is written.
+    /// The owner decides how to reconcile the mismatch; replayed or stale
+    /// input can disagree with an otherwise correct tree.
     #[error("member {member:02x?} is not held in the version a change names")]
     NotHeld {
         /// The member's id, as its bytes.
@@ -102,7 +103,7 @@ pub enum Error {
         new: Vec<u8>,
     },
 
-    /// A tree's creation was given two members with the same id. Keeping
+    /// A creation or rebuild was given two members with the same id. Keeping
     /// either would hide the mistake.
     #[error("member {member:02x?} is given twice")]
     DuplicateMember {
@@ -115,18 +116,23 @@ pub enum Error {
     #[error("the store already holds rows")]
     StoreNotEmpty,
 
-    /// A commit or a creation was given a transaction on another tree's
+    /// A commit, creation or rebuild was given a transaction on another tree's
     /// store, where its rows would land beside that tree's.
     #[error("the transaction is on another tree's store")]
     OtherTree,
 
-    /// `DigestTree::open` was given a store that holds no tree.
+    /// Opening or rebuilding found a store that holds no tree.
     #[error("the store holds no tree")]
     NoTree,
 
-    /// `DigestTree::open` found a tree summed in another digest group.
+    /// Opening or rebuilding found a tree summed in another digest group.
     #[error("the store's tree is summed in another digest group")]
     WrongGroup,
+
+    /// A rebuild was given a key spec different from the stored tree's.
+    /// Existing handles retain their spec, so rebuilding cannot change it.
+    #[error("the rebuild's key specification differs from the stored tree's")]
+    KeySpecMismatch,
 
     // The store's.
     /// The store couldn't read or write.
@@ -160,6 +166,17 @@ impl StoreError {
 
     /// Whether trying again may help.
     pub fn is_retryable(&self) -> bool { self.retryable }
+
+    /// Recover the underlying error if its type is `E`; otherwise return this
+    /// `StoreError` unchanged.
+    pub fn downcast<E: std::error::Error + 'static>(self) -> Result<E, Self> {
+        let Self { source, retryable } = self;
+
+        match source.downcast::<E>() {
+            Ok(cause) => Ok(*cause),
+            Err(source) => Err(Self { source, retryable }),
+        }
+    }
 }
 
 impl fmt::Display for StoreError {
@@ -172,3 +189,6 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.source.as_ref()) }
 }
+
+#[cfg(test)]
+mod tests;

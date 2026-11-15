@@ -10,4 +10,4 @@ mod statics;
 mod util;
 
 pub use bucket::IndexedDBBucket;
-pub use engine::{IndexedDBStorageEngine, IndexedDbTransaction};
+pub use engine::{IndexedDBStorageEngine, IndexedDbMapSnapshot, IndexedDbTransaction, MapError};

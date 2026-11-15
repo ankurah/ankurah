@@ -65,7 +65,7 @@ impl<I: MemberId, L: Payload, G: DigestGroup, P: PageGetter<I, L, G>> PageGetter
 /// reaches a bucket, the members within it, and neither stores nor keeps it:
 /// its store holds rows by key, so that a change to one member rewrites only
 /// that member's row and the rows of the nodes on its path
-/// ([`Row`](crate::Row)).
+/// ([`Row`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound(serialize = "I: Serialize, L: Serialize", deserialize = "I: Deserialize<'de>, L: Deserialize<'de>"))]
 pub enum Page<I, L, G: DigestGroup> {
@@ -116,8 +116,9 @@ pub enum ComparisonError<E> {
 
     /// A member was seen at two addresses during the comparison, so its two
     /// sides can't be paired: one of the trees changed while it was
-    /// compared, or the other tree holds the member twice. Comparing again
-    /// tells which: a change settles, and a member held twice stays.
+    /// compared, or the other tree holds the member twice. Retrying after
+    /// concurrent changes stop may succeed; repeated failures may indicate
+    /// duplicate members.
     #[error("a member was seen at two addresses during the comparison")]
     Unsettled {
         /// The member's id, as its bytes.

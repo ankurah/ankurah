@@ -31,6 +31,7 @@ pub mod retrieval;
 pub mod selection;
 pub mod session;
 pub mod storage;
+pub mod sync;
 pub mod system;
 pub mod task;
 #[cfg(any(test, feature = "test-helpers"))]

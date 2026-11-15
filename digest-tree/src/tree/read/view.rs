@@ -53,6 +53,10 @@ pub struct DigestTreeView<K, I, L, G: DigestGroup, S> {
     spans: Vec<Span>,
 }
 
+impl<K, I, L, G: DigestGroup, S> Clone for DigestTreeView<K, I, L, G, S> {
+    fn clone(&self) -> Self { Self { tree: self.tree.clone(), spans: self.spans.clone() } }
+}
+
 impl<K, I, L, G, S> DigestTreeView<K, I, L, G, S>
 where
     K: Clone + Send + Sync + 'static,

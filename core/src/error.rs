@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::connector::SendError;
 pub use crate::node::event_admissibility::InadmissibleEvent;
 pub use crate::schema::resolver::ComponentScopeError;
+use crate::storage::LockName;
 
 /// Why this node permanently stopped accepting work, not a rejected connection or operation.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -267,6 +268,11 @@ pub enum MutationError {
     /// names which one.
     #[error("commit refused: {0}")]
     CommitInvariant(&'static str),
+    /// A storage transaction requested a lock name that is not greater than
+    /// the previous one. Transactions acquire named locks once, in byte order,
+    /// to prevent cycles among those locks.
+    #[error("lock {name:?} asked for after {after:?}: a transaction takes each lock name once, in ascending order")]
+    LockOutOfOrder { name: LockName, after: LockName },
     /// An entity that was never created in this transaction and has no head to
     /// extend. Naming it is the point: the caller edited a view it obtained
     /// some way other than `Transaction::create`.
