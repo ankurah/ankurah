@@ -23,8 +23,11 @@ pub(crate) use overlay::Overlay;
 /// One tree's storage: an ordered map from row keys to rows, behind a cheap,
 /// cloneable handle whose clones share the same rows.
 ///
-/// A store holds exactly one tree. Keeping several trees apart is the
-/// implementer's job.
+/// A store binds reads and writes to one tree, so keys need no tree id and
+/// an unbounded range visits only that tree. This keeps storage namespaces
+/// out of the tree algorithms. Several stores may share a backend, cache,
+/// and outer transaction; each handle selects its tree within them.
+/// Keeping those trees apart is the implementer's job.
 ///
 /// # What a tree relies on
 ///
@@ -70,9 +73,9 @@ pub trait Store<K, V>: Clone + Send + Sync + 'static {
     /// is known, and takes in at [`landed`](Self::landed).
     type Pending: Send + 'static;
 
-    /// Begin a read that sees one committed state for all its rows: every
-    /// commit that completed before it began, and nothing of any commit that
-    /// hadn't.
+    /// Begin a read that sees one consistent committed state for all its rows.
+    /// Include every commit completed before this call began. Commits concurrent
+    /// with snapshot acquisition may be included, but never partially.
     fn begin_read(&self) -> impl Future<Output = Result<Self::Read, StoreError>> + Send;
 
     /// Whether `trx` is a transaction on this store's rows, rather than on
@@ -157,14 +160,15 @@ pub enum WriteItem<K, V> {
     Delete(K),
 }
 
-/// How a store that pages to disk should keep a row in memory.
+/// A hint for a store's cache policy. A store may evict any row to respect its
+/// memory budget, or keep no cache at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Residency {
-    /// Keep it in memory while the tree is open: the tree reads it on almost
+    /// Prefer keeping it while the tree is open: the tree reads it on almost
     /// every operation.
     Always,
 
-    /// Keep it while recently used.
+    /// Prefer keeping it while recently used.
     Recent,
 }
 
@@ -182,7 +186,7 @@ pub enum RowKey {
 }
 
 impl RowKey {
-    /// How a store that pages to disk should keep this row in memory.
+    /// The suggested cache policy for this row.
     pub fn residency(&self) -> Residency {
         match self {
             Self::Meta | Self::Node(_) => Residency::Always,

@@ -40,7 +40,7 @@ pub mod sql_builder;
 mod value;
 
 pub use connection::SqliteConnectionManager;
-pub use engine::{SqliteStorageEngine, SqliteTransaction};
+pub use engine::{SqliteMapSnapshot, SqliteStorageEngine, SqliteTransaction};
 pub use error::SqliteError;
 pub use id_bytes::register as register_id_bytes;
 pub use value::SqliteValue;

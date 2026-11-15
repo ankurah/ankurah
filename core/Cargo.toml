@@ -24,8 +24,8 @@ wasm = [
 uniffi = ["dep:uniffi", "ankurah-proto/uniffi"]
 default = []
 instrument = []
-# Enables test helper methods for adversarial testing (e.g., creating phantom entities)
-test-helpers = []
+# Adversarial test helpers and shared map/storage-adapter conformance suites.
+test-helpers = ["ankurah-digest-tree/test-support"]
 # Exposes narrow wrappers over the crate-internal event DAG engine
 # (`bench_support`) for the criterion benches in `benches/`. Never enabled by
 # the default build; keeps the DAG comparison/layering/ordering primitives
@@ -34,11 +34,12 @@ bench-internals = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive     = { path = "../derive", version = "=0.10.0" }
-ankql              = { path = "../ankql", version = "=0.10.0" }
-ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
-ankurah-proto      = { path = "../proto", version = "=0.10.0" }
-ankurah-signals    = { path = "../signals", version = "=0.10.0" }
+ankurah-derive      = { path = "../derive", version = "=0.10.0" }
+ankql               = { path = "../ankql", version = "=0.10.0" }
+ankurah-core-types  = { path = "../core-types", version = "=0.10.0" }
+ankurah-digest-tree = { path = "../digest-tree", version = "=0.10.0" }
+ankurah-proto       = { path = "../proto", version = "=0.10.0" }
+ankurah-signals     = { path = "../signals", version = "=0.10.0" }
 
 rand                 = { version = "0.8", features = ["small_rng"] }
 anyhow               = "1.0"
@@ -62,6 +63,7 @@ serde-wasm-bindgen   = { version = "0.6", optional = true }
 js-sys               = { version = "0.3", optional = true }
 send_wrapper         = { version = "0.6", optional = true }
 serde_json           = "1.0"
+sha2                 = "0.10.8"
 smallvec             = "1.15.0"
 itertools            = "0.14.0"
 indexmap             = "2.0"
@@ -72,6 +74,9 @@ uniffi               = { version = "0.29", optional = true, features = ["tokio"]
 [dev-dependencies]
 maplit    = "1.0"
 criterion = { version = "0.5", features = ["async_tokio"] }
+# The storage adapter's tests audit trees, sum the digests they expect, and run the
+# crate's store conformance suite on core's engine adapter.
+ankurah-digest-tree = { path = "../digest-tree", features = ["test-support"] }
 
 # Event DAG engine benchmarks (workstream E). harness = false because criterion
 # provides its own harness. required-features states what the source already

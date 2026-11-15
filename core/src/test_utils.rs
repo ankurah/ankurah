@@ -1,13 +1,21 @@
 use crate::error::{MutationError, RetrievalError};
-use crate::storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction};
+use crate::storage::{
+    transaction_call, CommittedEntityWrite, LockName, LockTable, MapRead, MapRows, MapWrite, StorageCommitOutcome, StorageCommitResult,
+    StorageEngine, StorageTransaction,
+};
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, ModelId};
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
 };
+
+mod maps;
+use maps::{MapReads, Maps, OpenSnapshot, TestMapSnapshot, TransactionMaps};
+
+mod tests;
 
 type Pause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
 
@@ -15,18 +23,46 @@ type Pause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<(
 #[derive(Default)]
 pub(crate) struct TestStorage {
     data: Mutex<TestData>,
+    locks: LockTable,
     pub hold_fetch: Mutex<BTreeMap<ModelId, Pause>>,
     pub hold_set_state: Mutex<Option<Pause>>,
     pub hold_commit: Mutex<Option<Pause>>,
     pub hold_after_commit: Mutex<Option<Pause>>,
+    /// Pauses the next map write part way, after the first of its writes.
+    pub hold_map_write: Mutex<Option<Pause>>,
+    /// Pauses a transaction's map call before it is answered: the call that
+    /// many map calls from now, counting from zero.
+    pub hold_map_call: Mutex<Option<(usize, Pause)>>,
     pub reject_state_read: Mutex<Option<EntityId>>,
     fail_next_commit: AtomicBool,
+    fail_next_map_write: AtomicBool,
+    fail_next_snapshot_read: Arc<AtomicBool>,
+
+    /// The most snapshots open at once, past which one fails to begin, as on
+    /// an engine whose snapshots each hold one of a bounded number of
+    /// connections: `None` for no bound.
+    pub most_open_snapshots: Mutex<Option<usize>>,
+
+    /// How many snapshots are open: each counts from its beginning until it
+    /// is dropped.
+    open_snapshots: Arc<AtomicUsize>,
+
+    /// Every map read that transactions and snapshots answer, while it
+    /// records them.
+    map_reads: MapReads,
 }
 
 #[derive(Default)]
 struct TestData {
     states: BTreeMap<EntityId, Attested<EntityState>>,
     events: BTreeMap<EventId, Attested<Event>>,
+
+    /// Every map's committed entries, shared with the snapshots begun on
+    /// them: a commit that changes them replaces them.
+    maps: Arc<Maps>,
+
+    /// How many times `delete_all` has emptied the storage.
+    resets: u64,
 }
 
 impl TestStorage {
@@ -34,22 +70,57 @@ impl TestStorage {
     pub fn set_state(&self, state: Attested<EntityState>) { self.data.lock().unwrap().states.insert(state.payload.entity_id, state); }
 
     pub fn fail_next_commit(&self) { self.fail_next_commit.store(true, Ordering::SeqCst); }
+
+    /// Fail the next map write part way, after the first of its writes.
+    pub fn fail_next_map_write(&self) { self.fail_next_map_write.store(true, Ordering::SeqCst); }
+
+    /// Fail the next read of a snapshot, as an engine fails one that finds
+    /// the state it reads moved: a write conflict, to retry with another
+    /// snapshot.
+    pub fn fail_next_snapshot_read(&self) { self.fail_next_snapshot_read.store(true, Ordering::SeqCst); }
+
+    /// Record every map read that transactions and snapshots answer from now
+    /// on, until [`recorded_map_reads`](Self::recorded_map_reads).
+    pub fn record_map_reads(&self) { *self.map_reads.lock().unwrap() = Some(Vec::new()); }
+
+    /// The map reads answered since [`record_map_reads`](Self::record_map_reads),
+    /// in order, and stop recording.
+    pub fn recorded_map_reads(&self) -> Vec<MapRead> { self.map_reads.lock().unwrap().take().expect("map reads were being recorded") }
 }
 
 pub(crate) struct TestStorageTransaction<'a> {
     storage: &'a TestStorage,
     states: Vec<(Clock, Attested<EntityState>)>,
     events: Vec<Attested<Event>>,
+    maps: TransactionMaps<'a>,
+
+    /// Set by `poison`, and by each map call from its start until it returns
+    /// `Ok`, so that a call that fails, or is dropped part way, leaves it set:
+    /// every later call and the commit then fail.
+    poisoned: bool,
+
+    /// The greatest lock name taken so far, which each map call's names
+    /// ascend past.
+    last_lock: Option<LockName>,
 }
 
 #[async_trait::async_trait]
 impl StorageTransaction for TestStorageTransaction<'_> {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
         self.events.extend_from_slice(events);
         Ok(())
     }
 
     async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
+        if self.maps.made_map_calls() {
+            return Err(MutationError::InvalidUpdate("state set after the transaction's first map call"));
+        }
         let hold = self.storage.hold_set_state.lock().unwrap().take();
         if let Some((entered, release)) = hold {
             entered.send(()).unwrap();
@@ -67,6 +138,9 @@ impl StorageTransaction for TestStorageTransaction<'_> {
     }
 
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
         let hold = self.storage.hold_commit.lock().unwrap().take();
         if let Some((entered, release)) = hold {
             entered.send(()).unwrap();
@@ -84,11 +158,26 @@ impl StorageTransaction for TestStorageTransaction<'_> {
         }
         Ok(result)
     }
+
+    async fn map_lock_and_read(&mut self, locks: &[LockName], reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> {
+        self.storage.before_map_call().await;
+        maps::record(&self.storage.map_reads, &reads);
+        transaction_call(&mut self.poisoned, &mut self.last_lock, locks, self.maps.lock_and_read(self.storage, locks, reads)).await
+    }
+
+    async fn map_write(&mut self, writes: Vec<MapWrite>) -> Result<(), MutationError> {
+        self.storage.before_map_call().await;
+        transaction_call(&mut self.poisoned, &mut self.last_lock, &[], self.maps.write(self.storage, writes)).await
+    }
+
+    fn poison(&mut self) { self.poisoned = true; }
 }
 
 impl TestStorageTransaction<'_> {
     fn commit_to_storage(self) -> Result<StorageCommitOutcome, MutationError> {
         let mut data = self.storage.data.lock().unwrap();
+        let mut maps = self.maps;
+        maps.check(&data)?;
         let observed: BTreeMap<_, _> = self
             .states
             .iter()
@@ -116,6 +205,7 @@ impl TestStorageTransaction<'_> {
         for event in self.events {
             data.events.insert(event.payload.id(), event);
         }
+        maps.land(&mut data.maps);
         Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities }))
     }
 }
@@ -124,8 +214,35 @@ impl TestStorageTransaction<'_> {
 impl StorageEngine for TestStorage {
     type Value = crate::value::Value;
     type Transaction<'a> = TestStorageTransaction<'a>;
+    type Snapshot = TestMapSnapshot;
 
-    fn transaction(&self) -> Self::Transaction<'_> { TestStorageTransaction { storage: self, states: Vec::new(), events: Vec::new() } }
+    fn transaction(&self) -> Self::Transaction<'_> {
+        TestStorageTransaction {
+            storage: self,
+            states: Vec::new(),
+            events: Vec::new(),
+            maps: TransactionMaps::new(&self.locks),
+            poisoned: false,
+            last_lock: None,
+        }
+    }
+
+    /// A snapshot holds the committed maps as it found them, so it waits on
+    /// no lock, and no commit waits on it.
+    async fn map_snapshot(&self, _locks: &[LockName]) -> Result<TestMapSnapshot, RetrievalError> {
+        let (open, now_open) = OpenSnapshot::begin(&self.open_snapshots);
+        if self.most_open_snapshots.lock().unwrap().is_some_and(|most| now_open > most) {
+            return Err(RetrievalError::storage("test storage holds no more snapshots open at once"));
+        }
+
+        let maps = self.data.lock().unwrap().maps.clone();
+        Ok(TestMapSnapshot {
+            maps,
+            fail_next_read: Arc::clone(&self.fail_next_snapshot_read),
+            reads: Arc::clone(&self.map_reads),
+            _open: open,
+        })
+    }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         if *self.reject_state_read.lock().unwrap() == Some(id) {
@@ -160,10 +277,10 @@ impl StorageEngine for TestStorage {
                 continue;
             }
             let entity = crate::entity::TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
-            if crate::selection::filter::evaluate_predicate(&entity, &predicate)
-                .map_err(|error| RetrievalError::Other(error.to_string()))?
-            {
-                matching.push(state);
+            match crate::selection::filter::evaluate_predicate(&entity, &predicate) {
+                Ok(true) => matching.push(state),
+                Ok(false) | Err(crate::selection::filter::Error::PropertyNotFound(_)) => {}
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(matching)
@@ -178,8 +295,11 @@ impl StorageEngine for TestStorage {
         Ok(self.data.lock().unwrap().events.values().filter(|event| event.payload.entity_id == id).cloned().collect())
     }
 
+    /// Counting the reset fails the later map calls and the commit of every
+    /// transaction that made map calls before it.
     async fn delete_all(&self) -> Result<bool, MutationError> {
-        *self.data.lock().unwrap() = TestData::default();
+        let mut data = self.data.lock().unwrap();
+        *data = TestData { resets: data.resets + 1, ..TestData::default() };
         Ok(true)
     }
 

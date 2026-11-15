@@ -1,6 +1,8 @@
 //! Test seams and direct access to internal handlers. Feature-gated; never
 //! compiled into a normal build.
 
+pub mod map_conformance;
+
 use crate::internal::prelude::*;
 use crate::schema::registration::RegistrationError;
 

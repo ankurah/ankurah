@@ -6,7 +6,7 @@
 //! views.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use ankurah_core_types::key_spec::KeySpec;
 
@@ -42,13 +42,17 @@ pub use ankurah_core_types::ScanDirection;
 /// its store keeps its commits and reads apart ([`Store`]).
 pub struct DigestTree<K, I, L, G: DigestGroup, S> {
     inner: Arc<Inner<K, S>>,
-    _members: MemberTypes<I, L, G>,
+    // Only rows contain these types. A function-return phantom does not own
+    // them or impose their Send/Sync bounds on the tree handle.
+    _members: PhantomData<fn() -> (I, L, G)>,
 }
 
-/// The member id, payload and group types a tree holds, which only its rows
-/// mention. A function returning them keeps the tree `Send` and `Sync`
-/// without owning any.
-type MemberTypes<I, L, G> = PhantomData<fn() -> (I, L, G)>;
+/// A reference to a tree that does not keep it alive. It can be upgraded while
+/// any tree handle, view, stream or transaction still owns the shared tree.
+pub struct WeakDigestTree<K, I, L, G: DigestGroup, S> {
+    inner: Weak<Inner<K, S>>,
+    _members: PhantomData<fn() -> (I, L, G)>,
+}
 
 struct Inner<K, S> {
     key_spec: KeySpec<K>,
@@ -57,6 +61,24 @@ struct Inner<K, S> {
 
 impl<K, I, L, G: DigestGroup, S> Clone for DigestTree<K, I, L, G, S> {
     fn clone(&self) -> Self { Self { inner: Arc::clone(&self.inner), _members: PhantomData } }
+}
+
+impl<K, I, L, G: DigestGroup, S> DigestTree<K, I, L, G, S> {
+    /// Observe this tree's shared lifetime without keeping it alive.
+    pub fn downgrade(&self) -> WeakDigestTree<K, I, L, G, S> {
+        WeakDigestTree { inner: Arc::downgrade(&self.inner), _members: PhantomData }
+    }
+}
+
+impl<K, I, L, G: DigestGroup, S> WeakDigestTree<K, I, L, G, S> {
+    /// An owning handle to the same tree, or `None` after its last owner drops.
+    pub fn upgrade(&self) -> Option<DigestTree<K, I, L, G, S>> {
+        self.inner.upgrade().map(|inner| DigestTree { inner, _members: PhantomData })
+    }
+}
+
+impl<K, I, L, G: DigestGroup, S> Clone for WeakDigestTree<K, I, L, G, S> {
+    fn clone(&self) -> Self { Self { inner: Weak::clone(&self.inner), _members: PhantomData } }
 }
 
 impl<K, I, L, G, S> DigestTree<K, I, L, G, S>

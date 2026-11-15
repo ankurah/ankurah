@@ -175,8 +175,13 @@ struct CountEventReads {
 impl StorageEngine for CountEventReads {
     type Value = <SledStorageEngine as StorageEngine>::Value;
     type Transaction<'a> = <SledStorageEngine as StorageEngine>::Transaction<'a>;
+    type Snapshot = <SledStorageEngine as StorageEngine>::Snapshot;
 
     fn transaction(&self) -> Self::Transaction<'_> { self.inner.transaction() }
+
+    async fn map_snapshot(&self, locks: &[ankurah::core::storage::LockName]) -> Result<Self::Snapshot, ankurah::error::RetrievalError> {
+        self.inner.map_snapshot(locks).await
+    }
 
     async fn get_state(&self, id: proto::EntityId) -> Result<proto::Attested<proto::EntityState>, ankurah::error::RetrievalError> {
         self.inner.get_state(id).await

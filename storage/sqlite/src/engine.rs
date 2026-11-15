@@ -11,7 +11,10 @@ use std::sync::Arc;
 
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::schema::CatalogResolver;
-use ankurah_core::storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction};
+use ankurah_core::storage::{
+    transaction_call, CommittedEntityWrite, LockName, MapRead, MapRows, MapWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine,
+    StorageTransaction,
+};
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
 use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
@@ -21,9 +24,12 @@ use crate::connection::{PooledConnection, SqliteConnectionManager};
 use crate::error::SqliteError;
 use crate::value::SqliteValue;
 
+mod maps;
 mod materialization;
 mod query;
 mod transaction;
+use maps::Maps;
+pub use maps::SqliteMapSnapshot;
 use materialization::{Materialization, PreparedMaterialization};
 pub use transaction::SqliteTransaction;
 
@@ -40,7 +46,11 @@ const COLUMN_MAP_TABLE: &str = "_ankurah_sqlite_column_map";
 pub(crate) const ENTITY_TABLE: &str = "_ankurah_entity";
 pub(crate) const EVENT_TABLE: &str = "_ankurah_event";
 pub(crate) const ENTITY_MODEL_TABLE: &str = "_ankurah_entity_model";
-const FIXED_STORAGE_TABLES: &[&str] = &[META_TABLE, MODEL_MAP_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE];
+/// Every ordered map's entries. A reset empties it rather than drop it: the
+/// engine creates it once, before its first map call.
+pub(crate) const MAP_TABLE: &str = "_ankurah_map";
+const FIXED_STORAGE_TABLES: &[&str] =
+    &[META_TABLE, MODEL_MAP_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE, MAP_TABLE];
 
 fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
 
@@ -71,6 +81,9 @@ pub struct SqliteStorageEngine {
     pool: bb8::Pool<SqliteConnectionManager>,
     /// Optional labels for first-use physical name assignment.
     resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
+    /// What the engine's map calls run on, and the writer turn its map
+    /// transactions take.
+    maps: Maps,
 }
 
 impl SqliteStorageEngine {
@@ -190,7 +203,12 @@ impl SqliteStorageEngine {
     /// `check_protocol_version`) so every construction path verifies
     /// the store it is about to serve.
     pub async fn new(pool: bb8::Pool<SqliteConnectionManager>) -> anyhow::Result<Self> {
-        let engine = Self { pool, materializations: SafeMap::new(), resolver: Arc::new(std::sync::RwLock::new(None)) };
+        let engine = Self {
+            maps: Maps::new(pool.clone()),
+            pool,
+            materializations: SafeMap::new(),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
+        };
         engine.check_protocol_version().await?;
         Ok(engine)
     }
@@ -343,8 +361,16 @@ impl SqliteStorageEngine {
 impl StorageEngine for SqliteStorageEngine {
     type Value = SqliteValue;
     type Transaction<'a> = SqliteTransaction<'a>;
+    type Snapshot = SqliteMapSnapshot;
 
     fn transaction(&self) -> Self::Transaction<'_> { SqliteTransaction::new(self) }
+
+    /// A read transaction on a connection of its own. In the engine's
+    /// write-ahead-log journal mode its reads never wait for a commit, so it
+    /// takes no lock: `locks` go unused.
+    async fn map_snapshot(&self, _locks: &[LockName]) -> Result<SqliteMapSnapshot, RetrievalError> {
+        Ok(SqliteMapSnapshot::begin(&self.maps).await?)
+    }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         let conn = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
@@ -410,6 +436,17 @@ impl StorageEngine for SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
         conn.with_connection(|c| {
+            // Emptying the maps waits, as every write does, for a map
+            // transaction that holds the database's write lock, as one does
+            // from its first map call to its end; past the busy timeout, the
+            // reset fails as busy. A transaction whose first map call is still
+            // queued on the writer turn holds no database lock yet; it and the
+            // reset run one after the other, in the order they take the write
+            // lock. Emptying comes first, so that what the reset drops
+            // includes the tables made by the commit of a transaction it
+            // waited for.
+            let emptied = maps::statements::empty(c)?;
+
             // Dynamic materializations are engine-owned only when named by the
             // durable model map. Arbitrary tables may belong to the embedding
             // application and must survive an Ankurah reset.
@@ -420,7 +457,7 @@ impl StorageEngine for SqliteStorageEngine {
             let mut owned: BTreeSet<String> = FIXED_STORAGE_TABLES
                 .iter()
                 .copied()
-                .filter(|name| *name != META_TABLE && existing.contains(*name))
+                .filter(|name| ![META_TABLE, MAP_TABLE].contains(name) && existing.contains(*name))
                 .map(str::to_owned)
                 .collect();
             if existing.contains(MODEL_MAP_TABLE) {
@@ -434,7 +471,7 @@ impl StorageEngine for SqliteStorageEngine {
             }
 
             if owned.is_empty() {
-                return Ok(false);
+                return Ok(emptied);
             }
 
             for table in owned {

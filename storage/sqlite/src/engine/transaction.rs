@@ -1,10 +1,25 @@
 use super::*;
+use maps::{calls, Lease};
 
-/// SQLite values prepared before acquiring the write transaction.
+/// SQLite values prepared for the write transaction.
 pub struct SqliteTransaction<'a> {
     engine: &'a SqliteStorageEngine,
     entities: Vec<EntityRow>,
     events: Vec<EventRow>,
+
+    /// The connection its first map call leased, with the engine's writer
+    /// turn and the native transaction begun there, held to the
+    /// transaction's end.
+    lease: Option<Lease>,
+
+    /// Set by `poison`, and by each map call from its start until it returns
+    /// `Ok`, so that a call that fails, or is dropped part way, leaves it set:
+    /// every later call and the commit then fail.
+    poisoned: bool,
+
+    /// The greatest lock name taken so far, which each map call's names
+    /// ascend past.
+    last_lock: Option<LockName>,
 }
 
 struct EntityRow {
@@ -55,17 +70,28 @@ pub(super) fn insert_events(conn: &Connection, events: &[EventRow]) -> Result<()
 }
 
 impl<'a> SqliteTransaction<'a> {
-    pub(super) fn new(engine: &'a SqliteStorageEngine) -> Self { Self { engine, entities: Vec::new(), events: Vec::new() } }
+    pub(super) fn new(engine: &'a SqliteStorageEngine) -> Self {
+        Self { engine, entities: Vec::new(), events: Vec::new(), lease: None, poisoned: false, last_lock: None }
+    }
 }
 
 #[async_trait]
 impl StorageTransaction for SqliteTransaction<'_> {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
         self.events.extend(encode_events(events)?);
         Ok(())
     }
 
     async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
+        }
+        if self.lease.is_some() {
+            return Err(MutationError::InvalidUpdate("state set after the transaction's first map call"));
+        }
         let entity_id = state.payload.entity_id;
         let index = self.entities.iter().position(|write| write.entity_id == entity_id);
         if index.is_some_and(|index| self.entities[index].head != *expected_head) {
@@ -102,97 +128,152 @@ impl StorageTransaction for SqliteTransaction<'_> {
     }
 
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError> {
-        if self.entities.is_empty() && self.events.is_empty() {
-            return Ok(StorageCommitOutcome::Committed(StorageCommitResult::default()));
+        if self.poisoned {
+            return Err(MutationError::TransactionFailed);
         }
-        let Self { engine, entities, events, .. } = self;
-        let conn = engine.pool.get().await.map_err(|error| MutationError::General(Box::new(SqliteError::Pool(error.to_string()))))?;
-        engine.ensure_shared_tables(&conn).await?;
-        conn.with_connection_mut(move |c| {
-            // BEGIN IMMEDIATE serializes writers before expectations
-            // are read, including concurrent first inserts.
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut ordered: Vec<(usize, &EntityRow)> = entities.iter().enumerate().collect();
-            ordered.sort_by_key(|(_, write)| write.entity_id);
+        let Self { engine, entities, events, lease, .. } = self;
+        let holds_records = !entities.is_empty() || !events.is_empty();
 
-            let mut observed = BTreeMap::new();
-            let mut conflict = false;
-            for (_, write) in &ordered {
-                let entity_id = write.entity_id;
-                let entity_key = entity_id.to_base64();
-                let current_row = tx
-                    .query_row(
-                        &format!(
-                            r#"SELECT "id", "state_buffer", "head", "attestations"
-                               FROM "{ENTITY_TABLE}" WHERE "id" = ?"#
-                        ),
-                        [&entity_key],
-                        raw_state_from_sqlite_row,
-                    )
-                    .optional()?;
-                let current = current_row
-                    .map(|row| {
-                        let memberships = memberships_from_sqlite_connection(&tx, &entity_key)?;
-                        decode_state_row(row, memberships)
+        match lease {
+            // A transaction that made map calls commits in the native
+            // transaction its first map call began, on its own connection,
+            // where it creates the tables it writes to: another connection
+            // would wait for its write lock.
+            Some(mut lease) => {
+                if holds_records {
+                    engine.ensure_shared_tables(lease.connection()).await?;
+                }
+
+                lease
+                    .run(move |connection| {
+                        let outcome = write_entity_rows(&entities, &events, connection)?;
+                        match outcome {
+                            StorageCommitOutcome::Conflict { .. } => connection.execute_batch("ROLLBACK")?,
+                            StorageCommitOutcome::Committed(_) => connection.execute_batch("COMMIT")?,
+                        }
+
+                        Ok(outcome)
                     })
-                    .transpose()?;
-                let current_head = current.as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default();
-                if current_head != write.expected_head {
-                    conflict = true;
-                }
-                observed.insert(entity_id, current);
-            }
-            if conflict {
-                tx.rollback()?;
-                return Ok(StorageCommitOutcome::Conflict { observed });
+                    .await
+                    .map_err(MutationError::from)
             }
 
-            for (_, write) in &ordered {
-                let entity_id = write.entity_id;
-                let entity_key = entity_id.to_base64();
-                let target = &write.memberships;
-                if observed[&entity_id].as_ref().is_some_and(|state| !state.payload.state.memberships.is_subset(target)) {
-                    return Err(SqliteError::CorruptRecord(format!(
-                        "canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported"
-                    )));
-                }
-                for model in target {
-                    tx.execute(
-                        &format!(
-                            r#"INSERT OR IGNORE INTO "{ENTITY_MODEL_TABLE}" ("entity_id", "model_key")
-                               VALUES (?, ?)"#
-                        ),
-                        rusqlite::params![&entity_key, bincode::serialize(model)?],
-                    )?;
-                }
-            }
+            None if !holds_records => Ok(StorageCommitOutcome::Committed(StorageCommitResult::default())),
 
-            insert_events(&tx, &events)?;
-            let mut committed = Vec::with_capacity(entities.len());
-            for (original_index, write) in ordered {
-                let entity_id = write.entity_id;
-                tx.execute(
-                    &format!(
-                        r#"INSERT INTO "{ENTITY_TABLE}" ("id", "state_buffer", "head", "attestations")
-                           VALUES (?, ?, ?, ?)
-                           ON CONFLICT ("id") DO UPDATE SET
-                               "state_buffer" = excluded."state_buffer",
-                               "head" = excluded."head",
-                               "attestations" = excluded."attestations""#
-                    ),
-                    rusqlite::params![&write.entity_key, &write.state_buffers, &serde_json::to_string(&write.head)?, &write.attestations,],
-                )?;
-                for projection in &write.materializations {
-                    projection.write(&tx)?;
-                }
-                committed.push((original_index, CommittedEntityWrite { entity_id, canonical_changed: write.expected_head != write.head }));
+            None => {
+                let conn =
+                    engine.pool.get().await.map_err(|error| MutationError::General(Box::new(SqliteError::Pool(error.to_string()))))?;
+                engine.ensure_shared_tables(&conn).await?;
+                conn.with_connection_mut(move |c| {
+                    // BEGIN IMMEDIATE serializes writers before expectations
+                    // are read, including concurrent first inserts.
+                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let outcome = write_entity_rows(&entities, &events, &tx)?;
+                    match outcome {
+                        StorageCommitOutcome::Conflict { .. } => tx.rollback()?,
+                        StorageCommitOutcome::Committed(_) => tx.commit()?,
+                    }
+
+                    Ok(outcome)
+                })
+                .await
+                .map_err(MutationError::from)
             }
-            committed.sort_by_key(|(index, _)| *index);
-            let entities = committed.into_iter().map(|(_, result)| result).collect();
-            tx.commit()?;
-            Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities }))
-        })
-        .await
-        .map_err(MutationError::from)
+        }
     }
+
+    async fn map_lock_and_read(&mut self, locks: &[LockName], reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> {
+        // The write lock the transaction holds from its first map call stands
+        // for every name.
+        transaction_call(&mut self.poisoned, &mut self.last_lock, locks, calls::read(&mut self.lease, &self.engine.maps, reads)).await
+    }
+
+    async fn map_write(&mut self, writes: Vec<MapWrite>) -> Result<(), MutationError> {
+        transaction_call(&mut self.poisoned, &mut self.last_lock, &[], calls::write(&mut self.lease, &self.engine.maps, writes)).await
+    }
+
+    fn poison(&mut self) { self.poisoned = true; }
+}
+
+/// Write the entity rows and events through `tx`, a connection whose native
+/// transaction holds the database's write lock, once every entity's expected
+/// head has been compared: the outcome to commit, or a conflict to roll back.
+fn write_entity_rows(entities: &[EntityRow], events: &[EventRow], tx: &Connection) -> Result<StorageCommitOutcome, SqliteError> {
+    let mut ordered: Vec<(usize, &EntityRow)> = entities.iter().enumerate().collect();
+    ordered.sort_by_key(|(_, write)| write.entity_id);
+
+    let mut observed = BTreeMap::new();
+    let mut conflict = false;
+    for (_, write) in &ordered {
+        let entity_id = write.entity_id;
+        let entity_key = entity_id.to_base64();
+        let current_row = tx
+            .query_row(
+                &format!(
+                    r#"SELECT "id", "state_buffer", "head", "attestations"
+                       FROM "{ENTITY_TABLE}" WHERE "id" = ?"#
+                ),
+                [&entity_key],
+                raw_state_from_sqlite_row,
+            )
+            .optional()?;
+        let current = current_row
+            .map(|row| {
+                let memberships = memberships_from_sqlite_connection(tx, &entity_key)?;
+                decode_state_row(row, memberships)
+            })
+            .transpose()?;
+        let current_head = current.as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default();
+        if current_head != write.expected_head {
+            conflict = true;
+        }
+        observed.insert(entity_id, current);
+    }
+    if conflict {
+        return Ok(StorageCommitOutcome::Conflict { observed });
+    }
+
+    for (_, write) in &ordered {
+        let entity_id = write.entity_id;
+        let entity_key = entity_id.to_base64();
+        let target = &write.memberships;
+        if observed[&entity_id].as_ref().is_some_and(|state| !state.payload.state.memberships.is_subset(target)) {
+            return Err(SqliteError::CorruptRecord(format!(
+                "canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported"
+            )));
+        }
+        for model in target {
+            tx.execute(
+                &format!(
+                    r#"INSERT OR IGNORE INTO "{ENTITY_MODEL_TABLE}" ("entity_id", "model_key")
+                       VALUES (?, ?)"#
+                ),
+                rusqlite::params![&entity_key, bincode::serialize(model)?],
+            )?;
+        }
+    }
+
+    insert_events(tx, events)?;
+    let mut committed = Vec::with_capacity(entities.len());
+    for (original_index, write) in ordered {
+        let entity_id = write.entity_id;
+        tx.execute(
+            &format!(
+                r#"INSERT INTO "{ENTITY_TABLE}" ("id", "state_buffer", "head", "attestations")
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT ("id") DO UPDATE SET
+                       "state_buffer" = excluded."state_buffer",
+                       "head" = excluded."head",
+                       "attestations" = excluded."attestations""#
+            ),
+            rusqlite::params![&write.entity_key, &write.state_buffers, &serde_json::to_string(&write.head)?, &write.attestations,],
+        )?;
+        for projection in &write.materializations {
+            projection.write(tx)?;
+        }
+        committed.push((original_index, CommittedEntityWrite { entity_id, canonical_changed: write.expected_head != write.head }));
+    }
+    committed.sort_by_key(|(index, _)| *index);
+    let entities = committed.into_iter().map(|(_, result)| result).collect();
+    Ok(StorageCommitOutcome::Committed(StorageCommitResult { entities }))
 }

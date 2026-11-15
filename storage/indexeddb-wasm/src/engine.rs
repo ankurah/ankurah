@@ -2,7 +2,10 @@ use ankurah_core::util::safemap::SafeMap;
 use ankurah_core::{
     error::{MutationError, RetrievalError},
     schema::CatalogResolver,
-    storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction},
+    storage::{
+        transaction_call, CommittedEntityWrite, LockName, LockTable, MapRead, MapRows, MapWrite, StorageCommitOutcome, StorageCommitResult,
+        StorageEngine, StorageTransaction,
+    },
 };
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, ModelId, State, SystemModel};
 use ankurah_storage_common::naming;
@@ -23,8 +26,10 @@ use crate::{
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub(crate) mod maps;
 pub(crate) mod query;
 mod transaction;
+pub use maps::{IndexedDbMapSnapshot, MapError};
 pub use transaction::IndexedDbTransaction;
 
 const MODEL_REGISTRATIONS_STORE: &str = "model_registrations";
@@ -107,6 +112,9 @@ pub struct IndexedDBStorageEngine {
     /// alive. (Wasm is single-threaded, but the trait signature requires these
     /// `Sync` types; `std::sync` works fine here.)
     resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
+    /// The lock names this engine's open storage transactions hold, which
+    /// keep this tab's transactions under one name one at a time.
+    map_locks: LockTable,
     #[cfg(debug_assertions)]
     /// Runtime test switch for disabling open-ended scan prefix guards.
     pub prefix_guard_disabled: std::sync::Arc<AtomicBool>,
@@ -120,6 +128,7 @@ impl IndexedDBStorageEngine {
             db,
             materializations: SafeMap::new(),
             resolver: Arc::new(RwLock::new(None)),
+            map_locks: LockTable::default(),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: std::sync::Arc::new(AtomicBool::new(false)),
         })
@@ -253,12 +262,40 @@ impl Drop for AbortUnfinishedTransaction {
     fn drop(&mut self) { let _ = self.0.abort(); }
 }
 
+/// Wait for `transaction` to complete, committing every request made in it,
+/// once no more are made: the failure that aborted it instead, if one did, as
+/// IndexedDB reported it. A request that fails aborts its transaction, so the
+/// abort carries its failure.
+async fn completed(transaction: &web_sys::IdbTransaction) -> Result<(), RetrievalError> {
+    match cb_future(transaction, "complete", "abort").await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(aborted(transaction)),
+    }
+}
+
+/// Why `transaction` aborted, once it has: the DOMException's name and
+/// message, or that it said nothing.
+fn aborted(transaction: &web_sys::IdbTransaction) -> RetrievalError {
+    let failure = match transaction.error() {
+        Some(exception) => format!("{}: {}", exception.name(), exception.message()),
+        None => "the transaction aborted without saying why".to_owned(),
+    };
+
+    RetrievalError::Other(format!("IndexedDB aborted a transaction: {failure}"))
+}
+
 #[async_trait]
 impl StorageEngine for IndexedDBStorageEngine {
     type Value = JsValue;
     type Transaction<'a> = IndexedDbTransaction<'a>;
+    type Snapshot = IndexedDbMapSnapshot;
 
     fn transaction(&self) -> Self::Transaction<'_> { IndexedDbTransaction::new(self) }
+
+    /// A snapshot that begins reading at its first read.
+    async fn map_snapshot(&self, locks: &[LockName]) -> Result<IndexedDbMapSnapshot, RetrievalError> {
+        Ok(IndexedDbMapSnapshot::new(self.db.clone(), locks))
+    }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { load_state(&self.db, id).await }
 
@@ -331,19 +368,32 @@ impl StorageEngine for IndexedDBStorageEngine {
             // or an interruption between per-store transactions would leave a
             // re-created materialization finding stale rows; a single transaction
             // commits the clears together or not at all.
+            // The maps' stores join the reset once a map call has made them.
+            // Every request is made before any is awaited, and the
+            // transaction is aborted if the reset fails, or is dropped while
+            // it still can be: so a reset lands whole or not at all, never
+            // the records' clears without the maps'.
+            let empties_maps = maps::has_object_stores(&db_connection);
             let store_names = js_sys::Array::new();
             for name in ["entities", "materializations", "events", "entity_models", "property_columns", MODEL_REGISTRATIONS_STORE] {
                 store_names.push(&name.into());
             }
+            if empties_maps {
+                for name in maps::STORES {
+                    store_names.push(&name.into());
+                }
+            }
             let transaction = db_connection
                 .transaction_with_str_sequence_and_mode(store_names.as_ref(), web_sys::IdbTransactionMode::Readwrite)
                 .require("create reset transaction")?;
+            let _abort = AbortUnfinishedTransaction(transaction.clone());
             for name in ["entities", "materializations", "events", "entity_models", "property_columns", MODEL_REGISTRATIONS_STORE] {
-                let store = transaction.object_store(name).require("get store for reset")?;
-                let request = store.clear().require("clear store")?;
-                cb_future(&request, "success", "error").await.require("await store clear")?;
+                transaction.object_store(name).require("get store for reset")?.clear().require("clear store")?;
             }
-            cb_future(&transaction, "complete", "error").await.require("complete reset transaction")?;
+            if empties_maps {
+                maps::reset(&transaction)?;
+            }
+            completed(&transaction).await?;
 
             // Return true since we cleared everything
             Ok(true)

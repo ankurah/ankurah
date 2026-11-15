@@ -87,6 +87,7 @@ ankurah = { path = "../../ankurah", features = [
     "test-helpers",
 ], version = "=0.10.0" }
 tracing-subscriber = "0.3"
+ankurah-digest-tree = { path = "../../digest-tree" }
 
     [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
     # Should we enable wasm-bindgen's debug assertions in its generated JS glue?

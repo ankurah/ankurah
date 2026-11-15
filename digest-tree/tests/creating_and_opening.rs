@@ -25,6 +25,42 @@ async fn a_tree_created_empty_opens_with_its_spec() {
     opened.audit().await.unwrap();
 }
 
+/// Weak references follow the tree's existing ownership, including derived
+/// reads and writes, without extending it themselves.
+#[tokio::test]
+async fn weak_references_follow_the_shared_tree_lifetime() {
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), ten_items());
+    let weak = tree.downgrade();
+    let another_weak = weak.clone();
+    let cloned = tree.clone();
+    drop(tree);
+    assert!(weak.upgrade().is_some());
+
+    let view = cloned.view();
+    drop(cloned);
+    assert!(weak.upgrade().is_some());
+    let cloned_view = view.clone();
+    drop(view);
+    assert!(weak.upgrade().is_some());
+
+    let stream = cloned_view.range(..).unwrap();
+    drop(cloned_view);
+    let transaction = weak.upgrade().unwrap().transaction();
+    drop(stream);
+    assert!(weak.upgrade().is_some());
+
+    let prepared = transaction.prepare().await;
+    assert!(weak.upgrade().is_some());
+    let store = prepared.tree().store().clone();
+    let mut owner_trx = store.begin().await;
+    let applied = prepared.apply(&mut owner_trx).await.unwrap();
+    assert!(weak.upgrade().is_some());
+    owner_trx.commit().await.unwrap();
+    applied.landed();
+    assert!(weak.upgrade().is_none());
+    assert!(another_weak.upgrade().is_none());
+}
+
 /// An owner that keeps a tree's rows beside its own records creates the tree
 /// in its own transaction: nothing of it is there until the owner commits,
 /// and then the tree has the rows a creation on a store of its own writes.

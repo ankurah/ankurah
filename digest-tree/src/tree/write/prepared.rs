@@ -1,4 +1,4 @@
-//! A transaction's commit: prepared without the store, applied through the
+//! A transaction's commit: prepared without storage I/O, applied through the
 //! transaction its owner lends it, and landed once that transaction commits.
 
 use super::commit::{self, Ready};
@@ -7,8 +7,9 @@ use crate::tree::DigestTree;
 use crate::{DigestGroup, Error, MemberId, Payload, ReadTrx, Row, RowKey, Store, StoreTrx};
 
 /// A transaction's changes, hashed and ready to apply in the owner's
-/// transaction. It has read nothing and holds nothing, so it may wait as long
-/// as its owner likes, and dropped, it changes nothing.
+/// transaction. It keeps the tree alive but has read nothing and holds no
+/// storage transaction, so it may wait as long as its owner likes. Dropped,
+/// it changes nothing.
 #[must_use = "a prepared commit writes nothing until it is applied"]
 pub struct Prepared<K, I, L, G: DigestGroup, S> {
     tree: DigestTree<K, I, L, G, S>,
@@ -48,16 +49,16 @@ where
     /// through `trx` in one read: an insert's slot must be empty, as must the
     /// slot an update moves its member to, or it is [`Error::AlreadyHeld`],
     /// and an update's or a removal's leaf must hold the version it names, or
-    /// it is [`Error::NotHeld`]. Either means the tree and its owner disagree,
-    /// so the commit writes nothing, and the owner rebuilds the tree. A
+    /// it is [`Error::NotHeld`]. Either refuses the proposed transition and
+    /// writes nothing; the owner decides how to reconcile the mismatch. A
     /// transaction on another store than the tree's is [`Error::OtherTree`],
     /// and writes nothing either.
     ///
     /// The commit works its rows out in memory, reading through `trx`, and
     /// then writes them through it in one batch, possibly empty: they land
-    /// when the owner commits `trx`, all of them or none. Nothing in memory
-    /// changes; once the owner's transaction has committed, the owner calls
-    /// [`Applied::landed`].
+    /// when the owner commits `trx`, all of them or none. This does not
+    /// publish this write's changes to the store's caches; after the owner's
+    /// transaction commits, the owner calls [`Applied::landed`].
     pub async fn apply(self, mut trx: S::Trx<'_>) -> Result<Applied<K, I, L, G, S>, Error> {
         if !self.tree.store().owns(&trx) {
             return Err(Error::OtherTree);
