@@ -1,18 +1,28 @@
 use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
-use crate::node::event_admissibility::check_genesis_membership;
+use crate::node::event_admissibility::{check_genesis_membership, check_imported_entity};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
-use crate::retrieval::{LocalEventGetter, LocalStateGetter};
+use crate::retrieval::{GetEvents, LocalEventGetter, LocalStateGetter};
 use crate::storage::StorageTransaction;
 use ankurah_proto::{Attested, EntityId, EntityState, Event};
 use ankurah_signals::{Peek, Signal};
 use indexmap::{map::Entry, IndexMap};
 
+/// What a remote transaction refuses beyond its policy's checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// A peer's committed transaction, which the policy alone decides.
+    Peer,
+    /// Events a node imports on its own authority, which may not touch the node's own system.
+    Import,
+}
+
 /// Apply received events through transaction-local forks and one atomic storage transaction.
 pub(crate) struct RemoteTransaction<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal> {
     node: &'a Node<SE, PA>,
     policy: &'a ContextPolicy<'a, PA, C>,
+    admission: Admission,
     storage: SE::Transaction<'a>,
     entities: TransactionEntities,
     state_getter: LocalStateGetter<SE>,
@@ -31,10 +41,11 @@ struct TransactionEntity {
 }
 
 impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> RemoteTransaction<'a, SE, PA, C> {
-    pub(crate) fn new(node: &'a Node<SE, PA>, policy: &'a ContextPolicy<'a, PA, C>) -> Self {
+    pub(crate) fn new(node: &'a Node<SE, PA>, policy: &'a ContextPolicy<'a, PA, C>, admission: Admission) -> Self {
         Self {
             node,
             policy,
+            admission,
             storage: node.storage.transaction(),
             entities: TransactionEntities { entries: IndexMap::new() },
             state_getter: LocalStateGetter::new(node.storage.clone()),
@@ -73,15 +84,26 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let mut event = event.clone();
         let before = &self.entities.entries[&entity.id()].before;
         let after = entity.read();
+        let admission = self.admission;
         entity
             .apply_events(&self.event_getter, std::slice::from_mut(&mut event), |event| {
+                if admission == Admission::Import {
+                    check_imported_entity(before)?;
+                    check_imported_entity(&after)?;
+                }
                 self.policy.check_write_event(self.node, before, &after, event)
             })
             .await?;
-        self.storage.add_events(std::slice::from_ref(&event)).await?;
-        let state = EntityState { entity_id: entity.id(), state: entity.to_state()? };
-        let attestation = self.policy.attest_state(self.node, &state);
-        self.storage.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+        // A stored event keeps its stored record, and an event the entity already holds leaves the
+        // stored state, attestation included, as it was.
+        if !self.event_getter.event_stored(&event.payload.id()).await? {
+            self.storage.add_events(std::slice::from_ref(&event)).await?;
+        }
+        if entity.head() != expected_head {
+            let state = EntityState { entity_id: entity.id(), state: entity.to_state()? };
+            let attestation = self.policy.attest_state(self.node, &state);
+            self.storage.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+        }
         self.failed = false;
         Ok(())
     }

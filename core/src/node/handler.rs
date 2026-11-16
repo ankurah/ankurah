@@ -3,7 +3,7 @@ use crate::{
     error::{MutationError, RetrievalError},
     policy::{AccessDenied, ContextPolicy, PolicyAgent},
     storage::{GetStateResult, StorageEngine},
-    transaction::remote::RemoteTransaction,
+    transaction::remote::{Admission, RemoteTransaction},
     util::{retry::retry_on, Iterable},
 };
 use ankql::ast::Predicate;
@@ -31,15 +31,16 @@ where
 
     debug!("{node} commiting transaction {id} with {} events", events.len());
     let policy = ContextPolicy::from_credentials(&node.policy_agent, cdata);
-    commit_events(node, &policy, &events).await?;
+    commit_events(node, &policy, Admission::Peer, &events).await?;
     Ok(NodeResponseBody::CommitComplete { id })
 }
 
-/// Apply events made elsewhere under `policy`'s write checks, and store them with the states they make
-/// in one storage transaction, retrying storage conflicts.
+/// Apply events made elsewhere under `policy`'s write checks and `admission`'s rules, and store them with
+/// the states they make in one storage transaction, retrying storage conflicts.
 pub(super) async fn commit_events<'a, SE, PA, C>(
     node: &'a Node<SE, PA>,
     policy: &'a ContextPolicy<'a, PA, C>,
+    admission: Admission,
     events: &[Attested<Event>],
 ) -> Result<(), MutationError>
 where
@@ -48,7 +49,7 @@ where
     C: Signal + Peek<Vec<PA::ContextData>>,
 {
     retry_on!(MutationError::WriteConflict, {
-        let mut trx = RemoteTransaction::new(node, policy);
+        let mut trx = RemoteTransaction::new(node, policy, admission);
         for event in events {
             trx.add_event(event).await?;
         }

@@ -150,7 +150,7 @@ async fn failed_add_event_poisons_the_transaction_even_if_the_error_is_caught() 
     )
     .into();
     let invalid: Attested<Event> = Event::genesis(node.system.root_id(), AuthorId::Unknown, OperationSet::default()).into();
-    let mut trx = crate::transaction::remote::RemoteTransaction::new(&node, &policy);
+    let mut trx = crate::transaction::remote::RemoteTransaction::new(&node, &policy, crate::transaction::remote::Admission::Peer);
     trx.add_event(&valid).await?;
     let id = valid.payload.entity_id;
     assert!(node.entities.get(&id).is_none());

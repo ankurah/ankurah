@@ -218,7 +218,7 @@ pub enum MutationError {
     NodeDropped(#[from] NodeDropped),
     #[error("node initialization is not complete")]
     NodeNotReady,
-    #[error("only a durable node stores events made elsewhere; this node is ephemeral")]
+    #[error("importing events requires a durable node")]
     NotDurable,
     #[error("the entity belongs to another node's system epoch")]
     ForeignEntity,

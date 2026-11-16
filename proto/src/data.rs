@@ -174,8 +174,10 @@ impl AsRef<Event> for Event {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum EventBody {
     Genesis {
-        /// The system root's entity id; `None` ONLY for the system root
-        /// entity itself, which has no system above it.
+        /// The id of the system root the entity was created under. `None` for
+        /// the root itself, which has no system above it, and for an entity
+        /// minted outside any node. A root is recognised by its membership and
+        /// item, never by this field.
         system: Option<EntityId>,
         /// Creator-random, drawn once when the event is minted. Two
         /// `create()` calls with identical payloads draw different nonces and
@@ -643,8 +645,8 @@ mod tests {
         assert_ne!(genesis, update);
     }
 
-    /// The system root's genesis (`None`) and a non-root genesis under any
-    /// system are distinct, and two systems give the same content two ids.
+    /// A genesis naming no system (`None`) and one under any system are
+    /// distinct, and two systems give the same content two ids.
     #[test]
     fn a_genesis_id_binds_its_system() {
         let nonce = [1u8; 32];
@@ -656,6 +658,18 @@ mod tests {
         let under_b = EventId::from_genesis_parts(&Some(EntityId::from_bytes([2u8; 32])), &nonce, timestamp, &author, &operations);
         assert_ne!(root, under_a);
         assert_ne!(under_a, under_b);
+    }
+
+    /// A genesis built from recorded parts carries exactly those parts and
+    /// names the entity id they derive, so a tool rebuilds the same event.
+    #[test]
+    fn a_genesis_from_parts_keeps_its_parts() {
+        let (nonce, timestamp, author, operations) = ([5u8; 32], 1_720_000_000_000u64, AuthorId::Unknown, operations());
+        let genesis = Event::genesis_from_parts(None, nonce, timestamp, author, operations.clone());
+        assert_eq!(genesis.body, EventBody::Genesis { system: None, nonce, timestamp, author, operations: operations.clone() });
+        assert_eq!(genesis.parent, Clock::default());
+        assert_eq!(genesis.id(), EventId::from_genesis_parts(&None, &nonce, timestamp, &author, &operations));
+        genesis.validate_structure().expect("the genesis names the entity its parts derive");
     }
 
     /// Changing the author changes the id, which is what makes the author

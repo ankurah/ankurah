@@ -358,10 +358,22 @@ fn populate<R: Registrant>(
 pub(super) fn resolve_local<R: Registrant>(catalog: &CatalogManager, registrant: &mut R) -> Result<(), RegistrationError> {
     validate(registrant)?;
     let unbound = || RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { label: registrant.label().to_string() });
-    let (label_model, model_row) = catalog.model_by_label(registrant.label())?.ok_or_else(unbound)?;
-    let model = match registrant.explicit_id() {
-        Some(id) => (label_model == id).then_some(id).ok_or_else(unbound)?,
-        None => (model_row.name == registrant.name()).then_some(label_model).ok_or_else(unbound)?,
+    let (model, model_row) = match registrant.explicit_id() {
+        // A pinned model is found by its id, whichever row the label index keeps for its label.
+        Some(id) => {
+            let row = catalog.model_by_id(&id)?.ok_or_else(unbound)?;
+            if row.label != registrant.label() {
+                return Err(unbound());
+            }
+            (id, row)
+        }
+        None => {
+            let (id, row) = catalog.model_by_label(registrant.label())?.ok_or_else(unbound)?;
+            if row.name != registrant.name() {
+                return Err(unbound());
+            }
+            (id, row)
+        }
     };
 
     let mut properties = Vec::with_capacity(registrant.properties().len());

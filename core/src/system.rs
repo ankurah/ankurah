@@ -87,8 +87,9 @@ where SE: StorageEngine + Send + Sync + 'static
 
     pub fn root(&self) -> Option<Attested<EntityState>> { self.0.root.read().unwrap().as_ref().map(|r| r.clone()) }
 
-    /// The system root's entity id, which every non-root genesis binds into
-    /// its own id. `None` until this node has created or adopted a system.
+    /// The system root's entity id, which every genesis this node mints binds into its own id; an
+    /// imported entity minted outside any node names no system. `None` until this node has created or
+    /// adopted a system.
     pub fn root_id(&self) -> Option<proto::EntityId> { self.0.root.read().unwrap().as_ref().map(|r| r.payload.entity_id) }
 
     pub fn items(&self) -> Vec<Entity> { self.0.items.read().unwrap().clone() }

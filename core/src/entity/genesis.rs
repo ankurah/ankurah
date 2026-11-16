@@ -27,3 +27,31 @@ impl GetEvents for NoHistory {
 
     async fn event_stored(&self, _: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::event_admissibility::InadmissibleEvent;
+    use ankurah_proto::{AuthorId, Clock, EntityId, Membership, ModelId, Operation, OperationSet};
+
+    /// A state comes from a genesis alone, and only from one that establishes a membership, as a node
+    /// requires of every genesis it stores.
+    #[tokio::test]
+    async fn only_a_genesis_with_a_membership_makes_a_state() {
+        let model = ModelId::EntityId(EntityId::from_bytes([1; 32]));
+        let member = Operation::Membership(Membership::Add(model));
+        let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![member.clone()]));
+        let made = genesis_state(&genesis).await.unwrap();
+        assert_eq!(made.entity_id, genesis.entity_id);
+        assert_eq!(made.state.head, Clock::singleton(&genesis));
+        assert_eq!(made.state.memberships, [model].into());
+
+        let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet(vec![member]));
+        assert!(matches!(genesis_state(&update).await, Err(MutationError::InvalidEvent)));
+        let unbound = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+        assert!(matches!(
+            genesis_state(&unbound).await,
+            Err(MutationError::InadmissibleEvent(InadmissibleEvent::MissingGenesisMembership))
+        ));
+    }
+}

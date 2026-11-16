@@ -6,6 +6,7 @@ use crate::test_utils::TestStorage;
 use ankurah_signals::Subscribe;
 
 mod commit;
+mod import;
 
 #[derive(Clone)]
 struct ClosedSender(proto::EntityId);

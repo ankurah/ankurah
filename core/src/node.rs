@@ -24,6 +24,7 @@ use crate::reactor::Reactor;
 use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter};
 use crate::schema::catalog::register::RegistrationAuth;
 use crate::system::SystemManager;
+use crate::transaction::remote::Admission;
 use crate::util::safemap::SafeMap;
 use crate::util::safeset::SafeSet;
 use crate::util::Iterable;
@@ -734,16 +735,24 @@ where
     /// Store events made outside this node, such as entities a tool minted from a record of their parts,
     /// the way a peer's committed transaction is stored, but on this node's own authority: NO POLICY
     /// AGENT CHECK RUNS, and catalog definitions are taken as registration takes them, which no
-    /// credential may write. The caller vouches for the events. This node derives every state itself,
-    /// and all of the events commit together or none does. Events it already stores change nothing.
+    /// credential may write. The caller vouches for the events. An event may not create or change an
+    /// entity of the node's own system, such as its root. This node derives every state itself, and all
+    /// of the events commit together or none does. An event it already holds changes nothing it stores.
     /// Give parents before their children. Only a durable node takes them, once its system root is ready.
+    ///
+    /// Import definitions before the application first binds a struct, since a fetch or a query binds
+    /// its structs too: a struct binds once per node, and one that finds no definition registers its own.
     pub async fn import_events(&self, events: &[proto::Attested<proto::Event>]) -> Result<(), MutationError> {
         if !self.durable {
             return Err(MutationError::NotDurable);
         }
         self.system.require_system_ready()?;
+        // Registration holds this lock from its catalog lookup through its commit, and the commit here
+        // updates the catalog before it returns, so a registration either finishes first or finds every
+        // imported definition.
+        let _allocator = self.catalog.allocator.lock().await;
         let policy = ContextPolicy::new(&self.policy_agent, ContextAuth::<Mut<Vec<PA::ContextData>>>::Privileged);
-        handler::commit_events(self, &policy, events).await
+        handler::commit_events(self, &policy, Admission::Import, events).await
     }
 
     /// Build a context over its credential source: bare ContextData, an
