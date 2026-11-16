@@ -94,12 +94,15 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
                 self.policy.check_write_event(self.node, before, &after, event)
             })
             .await?;
-        // A stored event keeps its stored record, and an event the entity already holds leaves the
-        // stored state, attestation included, as it was.
-        if !self.event_getter.event_stored(&event.payload.id()).await? {
+        // An import keeps a stored event's record, and leaves the stored state, attestation included, of an
+        // entity whose head the event does not move: a privileged import attests nothing, so rewriting
+        // either would drop what an earlier write stored. A peer's commit writes both, and its policy
+        // attests the state.
+        let import = self.admission == Admission::Import;
+        if !import || !self.event_getter.event_stored(&event.payload.id()).await? {
             self.storage.add_events(std::slice::from_ref(&event)).await?;
         }
-        if entity.head() != expected_head {
+        if !import || entity.head() != expected_head {
             let state = EntityState { entity_id: entity.id(), state: entity.to_state()? };
             let attestation = self.policy.attest_state(self.node, &state);
             self.storage.set_state(&expected_head, &Attested::opt(state, attestation)).await?;

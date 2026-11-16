@@ -1,19 +1,24 @@
 //! A durable node importing events made outside it: what an import refuses, what importing a held
-//! event again leaves alone, and how an import and a registration order around the catalog.
+//! event again leaves alone that a peer's commit of it writes, and how an import and a registration
+//! order around the catalog.
 
 use crate::{
-    error::{MutationError, RetrievalError},
+    entity::Entity,
+    error::{MutationError, RetrievalError, ValidationError},
     model::Model,
-    node::{event_admissibility::InadmissibleEvent, Node},
-    policy::{PermissiveAgent, DEFAULT_CONTEXT},
+    node::{event_admissibility::InadmissibleEvent, handler::commit_transaction, Node, NodeInner},
+    policy::{AccessDenied, DefaultContext, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT},
     property::backend::{LWWBackend, PropertyBackend},
-    schema::{ModelStructDescriptor, PerSystemOnceCell},
+    schema::{ModelStructDescriptor, PerSystemOnceCell, StructProperty},
     storage::StorageEngine,
     test_utils::TestStorage,
+    util::Iterable,
     value::Value,
 };
+use ankql::ast::{Predicate, Resolved};
 use ankurah_proto::{
-    Attestation, AttestationSet, Attested, AuthorId, Clock, EntityId, Event, Membership, ModelId, Operation, OperationSet, PropertyId,
+    self as proto, Attestation, AttestationSet, Attested, AuthorId, Clock, EntityId, EntityState, Event, Membership, ModelId, Operation,
+    OperationSet, PropertyId, TransactionId,
 };
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -32,6 +37,83 @@ async fn durable_node() -> anyhow::Result<(Arc<TestStorage>, TestNode)> {
     node.system.create().await?;
     node.wait_ready().await?;
     Ok((storage, node))
+}
+
+/// What [`StateAttester`] attests every state with.
+const ATTESTED: &[u8] = b"attested by the node's agent";
+
+/// An agent that permits every write and attests every state a write stores, so a test sees which
+/// writes store a state with its agent's attestation.
+#[derive(Clone)]
+struct StateAttester;
+
+#[async_trait::async_trait]
+impl PolicyAgent for StateAttester {
+    type ContextData = &'static DefaultContext;
+
+    fn sign_request<SE: StorageEngine, C: Iterable<Self::ContextData>>(
+        &self,
+        _: &NodeInner<SE, Self>,
+        _: &C,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, AccessDenied> {
+        Ok(vec![])
+    }
+
+    async fn check_request<SE: StorageEngine, A: Iterable<proto::AuthData> + Send + Sync>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &A,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, ValidationError> {
+        Ok(vec![])
+    }
+
+    fn check_write_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &Self::ContextData,
+        _: &Entity,
+        _: &Entity,
+        _: &Event,
+    ) -> Result<Option<Attestation>, AccessDenied> {
+        Ok(None)
+    }
+
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &Attested<Event>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<Attestation> {
+        Some(Attestation(ATTESTED.to_vec()))
+    }
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &Attested<EntityState>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn query_predicate<C: Iterable<Self::ContextData>>(&self, _: &C) -> Result<Predicate<Resolved>, AccessDenied> { Ok(Predicate::True) }
+
+    fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
 }
 
 fn member(byte: u8) -> Operation { Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([byte; 32])))) }
@@ -82,8 +164,9 @@ async fn an_import_neither_brings_a_root_nor_changes_the_nodes_own() -> anyhow::
     Ok(())
 }
 
-/// A node that already holds an imported event changes nothing it stores: the later state stays, and so
-/// does the attestation a later write stored with it, which a privileged import could not reproduce.
+/// A node that already holds an imported event changes nothing it stores: the stored event keeps the
+/// attestation it first arrived with, the later state stays, and so does the attestation a later write
+/// stored with it, which a privileged import could not reproduce.
 #[tokio::test]
 async fn importing_a_held_genesis_again_leaves_the_stored_record_alone() -> anyhow::Result<()> {
     let (storage, node) = durable_node().await?;
@@ -91,15 +174,34 @@ async fn importing_a_held_genesis_again_leaves_the_stored_record_alone() -> anyh
     let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![member(1), set(property, "first")?]));
     let update =
         Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet(vec![set(property, "later")?]));
-    node.import_events(&[genesis.clone().into(), update.into()]).await?;
+    let attested = Attested::opt(genesis.clone(), Some(Attestation(b"carried by the first import".to_vec())));
+    node.import_events(&[attested.clone(), update.into()]).await?;
 
     let mut stored = storage.get_state(genesis.entity_id).await?;
     stored.attestations = AttestationSet(vec![Attestation(b"attested by a later write".to_vec())]);
     storage.set_state(stored.clone());
 
     node.import_events(&[genesis.clone().into()]).await?;
+    assert_eq!(storage.get_events(vec![genesis.id()]).await?, vec![attested], "the stored event keeps its attestation");
     assert_eq!(storage.get_state(genesis.entity_id).await?, stored, "the later state and its attestation are kept");
-    assert_eq!(storage.dump_entity_events(genesis.entity_id).await?.len(), 2);
+    Ok(())
+}
+
+/// An import stores a state with no attestation, since it commits on the node's own authority. A peer
+/// that then commits the same event has the state written again and attested by the node's agent, as
+/// every peer commit has: only an import leaves the state of an entity it already holds alone.
+#[tokio::test]
+async fn a_peer_commit_of_an_imported_event_stores_the_state_its_agent_attests() -> anyhow::Result<()> {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), StateAttester);
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![member(1)]));
+    node.import_events(&[genesis.clone().into()]).await?;
+    assert_eq!(storage.get_state(genesis.entity_id).await?.attestations, AttestationSet(vec![]), "an import attests nothing");
+
+    commit_transaction(&node, &DEFAULT_CONTEXT, TransactionId::new(), vec![genesis.clone().into()]).await?;
+    assert_eq!(storage.get_state(genesis.entity_id).await?.attestations, AttestationSet(vec![Attestation(ATTESTED.to_vec())]));
     Ok(())
 }
 
@@ -138,23 +240,21 @@ async fn a_registration_waits_for_an_import_in_flight() -> anyhow::Result<()> {
     assert!(b.catalog.allocator.try_lock().is_err(), "the import holds the catalog's allocator while it commits");
 
     let context = b.context_async(DEFAULT_CONTEXT).await?;
-    let registration = tokio::spawn(async move { context.resolve_model_id::<ImportedRecord>().await });
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    assert!(!registration.is_finished(), "the registration waits while the import commits");
+    let registration = context.resolve_model_id::<ImportedRecord>();
+    tokio::pin!(registration);
+    assert!(futures::poll!(&mut registration).is_pending(), "the registration waits while the import commits");
 
     release.send(()).unwrap();
     import.await??;
-    assert_eq!(registration.await??, ModelId::EntityId(model), "the registration binds to the imported definition");
+    assert_eq!(registration.await?, ModelId::EntityId(model), "the registration binds to the imported definition");
     let labelled = b.catalog.model_labels().into_iter().filter(|(_, label)| label == ImportedRecord::descriptor().label).count();
     assert_eq!(labelled, 1, "b registers no definition of its own");
     Ok(())
 }
 
-/// A model pinned by id binds to that row even when another row holds the same label and the catalog's
-/// label index keeps the other one, as when a store imports a minted definition of a label it already
-/// registered. Binding needs no registration, so a context with no write credential can bind too.
+/// A model pinned by id binds, with every property, to that row through local resolution, even when
+/// another row holds the same label and the catalog's label index keeps the other one, as when a store
+/// imports a minted definition of a label it already registered.
 #[tokio::test]
 async fn a_pinned_model_binds_by_its_id_beside_another_row_under_its_label() -> anyhow::Result<()> {
     let (a_storage, a) = durable_node().await?;
@@ -169,10 +269,14 @@ async fn a_pinned_model_binds_by_its_id_beside_another_row_under_its_label() -> 
     assert_ne!(pinned, indexed, "the label index keeps the other row");
 
     let schema = ImportedRecord::descriptor();
+    // Fresh resolution cells: the compiled struct's own cells already hold b's first binding.
+    let properties: &'static [StructProperty] = Box::leak(
+        schema.properties.iter().map(|property| StructProperty { resolved: PerSystemOnceCell::per_epoch(), ..*property }).collect(),
+    );
     let descriptor: &'static ModelStructDescriptor = Box::leak(Box::new(ModelStructDescriptor {
         label: schema.label,
         name: schema.name,
-        properties: schema.properties,
+        properties,
         system: None,
         explicit_id: Some(Box::leak(pinned.to_base64().into_boxed_str())),
         build_id: [0; 16],
@@ -181,6 +285,10 @@ async fn a_pinned_model_binds_by_its_id_beside_another_row_under_its_label() -> 
     let epoch = b.system.system_epoch().unwrap();
     b.catalog.resolve_local(&mut descriptor.registrant(epoch))?;
     assert_eq!(descriptor.resolved.get(epoch)?, ModelId::EntityId(pinned));
+    for property in properties {
+        let (expected, _) = b.catalog.property_by_name(&pinned, property.name)?.unwrap();
+        assert_eq!(property.resolved.get(epoch)?, PropertyId::EntityId(expected), "{} binds under the pinned model", property.name);
+    }
     Ok(())
 }
 
