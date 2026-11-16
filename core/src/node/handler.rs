@@ -8,6 +8,7 @@ use crate::{
 };
 use ankql::ast::Predicate;
 use ankurah_proto::{Attested, EntityId, Event, EventId, NodeResponseBody, State, TransactionId};
+use ankurah_signals::{Peek, Signal};
 use anyhow::anyhow;
 use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,14 +31,29 @@ where
 
     debug!("{node} commiting transaction {id} with {} events", events.len());
     let policy = ContextPolicy::from_credentials(&node.policy_agent, cdata);
+    commit_events(node, &policy, &events).await?;
+    Ok(NodeResponseBody::CommitComplete { id })
+}
+
+/// Apply events made elsewhere under `policy`'s write checks, and store them with the states they make
+/// in one storage transaction, retrying storage conflicts.
+pub(super) async fn commit_events<'a, SE, PA, C>(
+    node: &'a Node<SE, PA>,
+    policy: &'a ContextPolicy<'a, PA, C>,
+    events: &[Attested<Event>],
+) -> Result<(), MutationError>
+where
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent,
+    C: Signal + Peek<Vec<PA::ContextData>>,
+{
     retry_on!(MutationError::WriteConflict, {
-        let mut trx = RemoteTransaction::new(node, &policy);
-        for event in &events {
+        let mut trx = RemoteTransaction::new(node, policy);
+        for event in events {
             trx.add_event(event).await?;
         }
         trx.commit().await
-    })?;
-    Ok(NodeResponseBody::CommitComplete { id })
+    })
 }
 
 /// Return the requested events these credentials may read, checking each against its entity's state.

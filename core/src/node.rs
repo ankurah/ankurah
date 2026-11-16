@@ -731,6 +731,21 @@ where
     /// Return the resident entity if a live handle keeps it in memory.
     pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
 
+    /// Store events made outside this node, such as entities a tool minted from a record of their parts,
+    /// the way a peer's committed transaction is stored, but on this node's own authority: NO POLICY
+    /// AGENT CHECK RUNS, and catalog definitions are taken as registration takes them, which no
+    /// credential may write. The caller vouches for the events. This node derives every state itself,
+    /// and all of the events commit together or none does. Events it already stores change nothing.
+    /// Give parents before their children. Only a durable node takes them, once its system root is ready.
+    pub async fn import_events(&self, events: &[proto::Attested<proto::Event>]) -> Result<(), MutationError> {
+        if !self.durable {
+            return Err(MutationError::NotDurable);
+        }
+        self.system.require_system_ready()?;
+        let policy = ContextPolicy::new(&self.policy_agent, ContextAuth::<Mut<Vec<PA::ContextData>>>::Privileged);
+        handler::commit_events(self, &policy, events).await
+    }
+
     /// Build a context over its credential source: bare ContextData, an
     /// existing session handle, or a whole [`SessionSet`] —
     /// attached to the node's registry at construction.

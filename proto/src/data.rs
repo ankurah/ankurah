@@ -224,8 +224,18 @@ impl Event {
     /// timestamp, and derive the entity id from the whole of it. The id is
     /// the return value's `entity_id`.
     pub fn genesis(system: Option<EntityId>, author: AuthorId, operations: OperationSet) -> Self {
-        let nonce = draw_nonce();
-        let timestamp = crate::time::unix_ms_now();
+        Self::genesis_from_parts(system, draw_nonce(), crate::time::unix_ms_now(), author, operations)
+    }
+
+    /// The genesis made of these parts, naming the entity id they derive. The same parts make the
+    /// same event, so a tool can rebuild an entity minted elsewhere from a record of its parts.
+    pub fn genesis_from_parts(
+        system: Option<EntityId>,
+        nonce: [u8; 32],
+        timestamp: u64,
+        author: AuthorId,
+        operations: OperationSet,
+    ) -> Self {
         let entity_id: EntityId = EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations).into();
         Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { system, nonce, timestamp, author, operations } }
     }
