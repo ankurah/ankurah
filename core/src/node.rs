@@ -731,6 +731,26 @@ where
     /// Return the resident entity if a live handle keeps it in memory.
     pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
 
+    /// Store events created outside this durable node, committing all of them or none.
+    /// The node uses its own authority without policy checks; the caller must authorize the events.
+    /// Supply parents before their children. Importing an event again leaves its entity unchanged.
+    pub async fn import_events(&self, events: &[proto::Attested<proto::Event>]) -> Result<(), MutationError> {
+        if !self.durable {
+            return Err(MutationError::NotDurable);
+        }
+        self.system.require_system_ready()?;
+        // Prevent registration from creating duplicate definitions while the import updates the catalog.
+        let _allocator = self.catalog.allocator.lock().await;
+        let policy = ContextPolicy::new(&self.policy_agent, ContextAuth::<Mut<Vec<PA::ContextData>>>::Privileged);
+        crate::util::retry::retry_on!(MutationError::WriteConflict, {
+            let mut trx = crate::transaction::remote::RemoteTransaction::new(self, &policy);
+            for event in events {
+                trx.add_event(event).await?;
+            }
+            trx.commit().await
+        })
+    }
+
     /// Build a context over its credential source: bare ContextData, an
     /// existing session handle, or a whole [`SessionSet`] —
     /// attached to the node's registry at construction.

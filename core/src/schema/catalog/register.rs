@@ -108,13 +108,7 @@ where
     match result {
         Err(RegistrationError::NoDurablePeer(label)) => match resolve_local(catalog, registrant) {
             Ok(()) => Ok(()),
-            Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => {
-                if catalog.model_by_label(&label)?.is_some() {
-                    Err(RegistrationError::UnconfirmedSchema(label))
-                } else {
-                    Err(RegistrationError::NoDurablePeer(label))
-                }
-            }
+            Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => Err(RegistrationError::NoDurablePeer(label)),
             Err(error) => Err(error),
         },
         other => other,
@@ -146,9 +140,6 @@ where
     let (model_id, model_row) = match explicit_id {
         Some(id) => {
             let row = catalog.model_by_id(&id)?.ok_or(RegistrationError::ExplicitModelIdNotFound { model: id })?;
-            if row.label != label {
-                return Err(RegistrationError::ExplicitModelIdMismatch { model: id, found_label: row.label, label: label.clone() });
-            }
             plan.existing.push(id);
             (id, row)
         }
@@ -358,10 +349,9 @@ fn populate<R: Registrant>(
 pub(super) fn resolve_local<R: Registrant>(catalog: &CatalogManager, registrant: &mut R) -> Result<(), RegistrationError> {
     validate(registrant)?;
     let unbound = || RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { label: registrant.label().to_string() });
-    let (label_model, model_row) = catalog.model_by_label(registrant.label())?.ok_or_else(unbound)?;
-    let model = match registrant.explicit_id() {
-        Some(id) => (label_model == id).then_some(id).ok_or_else(unbound)?,
-        None => (model_row.name == registrant.name()).then_some(label_model).ok_or_else(unbound)?,
+    let (model, model_row) = match registrant.explicit_id() {
+        Some(id) => (id, catalog.model_by_id(&id)?.ok_or_else(unbound)?),
+        None => catalog.model_by_label(registrant.label())?.filter(|(_, row)| row.name == registrant.name()).ok_or_else(unbound)?,
     };
 
     let mut properties = Vec::with_capacity(registrant.properties().len());
