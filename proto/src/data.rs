@@ -174,8 +174,7 @@ impl AsRef<Event> for Event {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum EventBody {
     Genesis {
-        /// The system root's entity id; `None` ONLY for the system root
-        /// entity itself, which has no system above it.
+        /// The system root's entity id, or `None` for the root itself or an entity created outside a node.
         system: Option<EntityId>,
         /// Creator-random, drawn once when the event is minted. Two
         /// `create()` calls with identical payloads draw different nonces and
@@ -226,6 +225,14 @@ impl Event {
     pub fn genesis(system: Option<EntityId>, author: AuthorId, operations: OperationSet) -> Self {
         let nonce = draw_nonce();
         let timestamp = crate::time::unix_ms_now();
+        let entity_id: EntityId = EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations).into();
+        Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { system, nonce, timestamp, author, operations } }
+    }
+
+    /// Build an entity's genesis from recorded parts, without a system or author.
+    /// The same nonce, timestamp, and operations produce the same event and entity id.
+    pub fn genesis_from_parts(nonce: [u8; 32], timestamp: u64, operations: OperationSet) -> Self {
+        let (system, author) = (None, AuthorId::Unknown);
         let entity_id: EntityId = EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations).into();
         Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { system, nonce, timestamp, author, operations } }
     }

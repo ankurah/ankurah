@@ -432,7 +432,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
         let err =
             trx.create(&Gadget { name: "offline".into() }).await.expect_err("offline create into an unregistered collection must fail");
         let msg = err.to_string();
-        assert!(msg.contains("never been registered") && msg.contains("'gadget'"), "actionable strict error, got: {msg}");
+        assert!(msg.contains("is not registered on this node") && msg.contains("'gadget'"), "actionable strict error, got: {msg}");
     }
     assert!(resolve_by_collection(&server, "gadget", "name").is_none(), "nothing reached the durable");
     assert!(!schema_registered(&client, Gadget::descriptor()), "a strict failure must leave the descriptor unresolved");
@@ -446,7 +446,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
             .create(&wrong_explicit_widget::Widget { label: "wrong-model".into(), size: 2 })
             .await
             .expect_err("offline fallback must validate the compiled explicit model id");
-        assert!(err.to_string().contains("unconfirmed"), "expected an exact-binding failure, got: {err}");
+        assert!(err.to_string().contains("is not registered on this node"), "expected an exact-binding failure, got: {err}");
     }
 
     // The fully and compatibly bound Widget shape keeps writing offline (no
@@ -501,7 +501,7 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
         .create(&offline_v2::Evolving { label: "known".into(), added: 1 })
         .await
         .expect_err("an unavailable reassertion must not emit an unregistered field as Name residue");
-    assert!(error.to_string().contains("unconfirmed"), "expected a schema confirmation failure, got: {error}");
+    assert!(error.to_string().contains("is not registered on this node"), "expected a schema confirmation failure, got: {error}");
 
     Ok(())
 }
@@ -636,7 +636,7 @@ async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
     let err =
         ctx.fetch::<ContraptionView>("state = 'x'").await.expect_err("offline fetch over a never-registered collection must fail loud");
     let msg = err.to_string();
-    assert!(msg.contains("never been registered") && msg.contains("contraption"), "loud error naming the collection, got: {msg}");
+    assert!(msg.contains("is not registered on this node") && msg.contains("contraption"), "loud error naming the collection, got: {msg}");
     assert!(!schema_registered(&client, Contraption::descriptor()), "a failed first-use registration must leave the descriptor unresolved");
 
     Ok(())

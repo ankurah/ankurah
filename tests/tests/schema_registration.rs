@@ -608,8 +608,9 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
     // Binding an id that does not exist never mints.
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(EntityId::random()), vec![])).await?, "does not exist");
 
-    // Binding a different collection to album's model entity is a mismatch.
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("albumx", Some(album_model), vec![])).await?, "binder declares");
+    // A binding by id succeeds whatever label it declares.
+    let by_id = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, bind("albumx", Some(album_model), vec![])).await?);
+    assert_eq!(by_id.id, album_model);
 
     // A matching binding succeeds, and a property in the same request
     // resolves under the BOUND model id.

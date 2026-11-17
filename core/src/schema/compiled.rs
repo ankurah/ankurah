@@ -131,13 +131,7 @@ impl Registrant for DescriptorRegistrant {
 
     fn properties(&self) -> impl ExactSizeIterator<Item = &Self::Property> { self.schema.properties.iter() }
 
-    fn set_model(&mut self, id: EntityId, model: SysModelRow) -> Result<(), RegistrationError> {
-        if model.label != self.schema.label
-            || self.schema.explicit_id.is_none() && model.name != self.schema.name
-            || self.schema.explicit_id.is_some_and(|explicit| parse_explicit_id(explicit) != id)
-        {
-            return Err(self.incomplete());
-        }
+    fn set_model(&mut self, id: EntityId, _model: SysModelRow) -> Result<(), RegistrationError> {
         self.model = Some(id);
         Ok(())
     }

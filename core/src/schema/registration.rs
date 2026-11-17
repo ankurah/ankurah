@@ -19,20 +19,11 @@ pub enum RegistrationError {
     SystemNotReady,
     /// Strict offline registration could not consult an allocator.
     #[error(
-        "collection '{0}' has never been registered on this node and no durable peer is connected; \
+        "collection '{0}' is not registered on this node as this binary declares it, and no durable peer is connected; \
          connect to the system once first"
     )]
     NoDurablePeer(
         /// The source-level collection label that could not be registered.
-        String,
-    ),
-    /// A known model's complete compiled shape could not be confirmed offline.
-    #[error(
-        "collection '{0}' is registered, but this binary's schema for it is unconfirmed \
-         and no durable peer is connected; connect to the system once first"
-    )]
-    UnconfirmedSchema(
-        /// The source-level collection label whose binding is unconfirmed.
         String,
     ),
     /// A descriptor attempted to claim the protected system namespace.
@@ -55,16 +46,6 @@ pub enum RegistrationError {
     ExplicitModelIdNotFound {
         /// The requested model entity.
         model: EntityId,
-    },
-    /// An explicit model binding conflicts with the catalog's model label.
-    #[error("explicit model id {model} is bound to label '{found_label}'; binder declares '{label}'")]
-    ExplicitModelIdMismatch {
-        /// The explicitly bound model entity.
-        model: EntityId,
-        /// The model label already stored in the catalog.
-        found_label: String,
-        /// The model label declared by the requester.
-        label: String,
     },
     /// A declaration conflicts with an existing property's canonical backend or type.
     #[error(
