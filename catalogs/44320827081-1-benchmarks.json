@@ -1,0 +1,34 @@
+{
+  "observed": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "status": "registered",
+      "target": "event_dag",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "package": "ankurah-tests",
+      "status": "registered",
+      "target": "lane_perf",
+      "workloads": []
+    }
+  ],
+  "registered": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "status": "registered",
+      "target": "event_dag",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "package": "ankurah-tests",
+      "status": "registered",
+      "target": "lane_perf",
+      "workloads": []
+    }
+  ]
+}
