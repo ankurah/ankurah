@@ -13,6 +13,7 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
     // Setup: Durable D, Ephemeral E connected
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
@@ -74,6 +75,7 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
 async fn test_durable_writes_ephemeral_observes() -> Result<()> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
@@ -123,6 +125,7 @@ async fn test_durable_writes_ephemeral_observes() -> Result<()> {
 async fn test_durable_vs_ephemeral_concurrent_write() -> Result<()> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
@@ -200,6 +203,7 @@ async fn test_durable_vs_ephemeral_concurrent_write() -> Result<()> {
 async fn test_late_arriving_branch() -> Result<()> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;

@@ -42,8 +42,7 @@ async fn test_websocket_client_server_fetch() -> Result<()> {
 
     info!("Client connected successfully");
 
-    // Give time for initial data sync - fetch still needs sleeps for now unfortunately. We can probably find a better way to do this though
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    client_node.wait_ready().await?;
 
     // Get client context
     let client_ctx = client_node.context(c)?;

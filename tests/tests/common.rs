@@ -648,6 +648,7 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     let server_storage = Arc::new(SledStorageEngine::new_test()?);
     let server_node = Node::new_durable(server_storage, PermissiveAgent::new());
     server_node.system.create().await?;
+    server_node.wait_ready().await?;
 
     let mut rng = rand::thread_rng();
 
