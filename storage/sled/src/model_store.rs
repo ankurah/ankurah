@@ -129,7 +129,7 @@ impl SledModelStoreInner {
         mut bounds: KeyBounds,
         scan_direction: ScanDirection,
         remaining_predicate: Predicate<EngineColumns>,
-        order_by_spill: OrderByComponents,
+        mut order_by_spill: OrderByComponents,
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         use ankurah_core::{
@@ -142,6 +142,16 @@ impl SledModelStoreInner {
             if keypart.key == "id" {
                 keypart.value_type = ValueType::EntityId;
             }
+        }
+        // The planner uses String when an ORDER BY property's type is unknown.
+        // Those index bytes can put 10 before 5. Keep the candidate index, but
+        // compare actual values in the sort/top-K stage before applying LIMIT.
+        if order_by_spill
+            .presort
+            .iter()
+            .any(|order| index_spec.keyparts.iter().any(|part| part.key == order.path.column && part.value_type == ValueType::String))
+        {
+            order_by_spill.spill = std::mem::take(&mut order_by_spill.presort).into_iter().chain(order_by_spill.spill).collect();
         }
         let column = crate::materialization::MATERIALIZATION_COLUMN.to_owned();
         let membership = Endpoint::incl(Value::String(self.model_id.to_string()));
@@ -479,5 +489,57 @@ mod tests {
         commit_canonical_state(&engine, Clock::default(), state.clone()).await;
         let stored = engine.get_state(entity).await.unwrap().payload.state;
         assert_eq!(stored.head, state.payload.state.head);
+    }
+
+    #[tokio::test]
+    async fn order_only_keys_compare_actual_types_after_updates() {
+        use ankql::ast::{OrderByItem, OrderDirection, Selection};
+
+        for strings in [false, true] {
+            let engine = crate::SledStorageEngine::new_test().unwrap();
+            let model = ModelId::EntityId(entity_id(101));
+            let property = PropertyId::EntityId(entity_id(201));
+            let make = |byte, number, seed| {
+                let backend = LWWBackend::new();
+                let value = if strings { Value::String(format!("{number}")) } else { Value::I64(number) };
+                backend.set(property, Some(value));
+                let event = ankurah_core::test_helpers::commit_backend(&backend, seed).unwrap();
+                Attested::opt(
+                    EntityState {
+                        entity_id: entity_id(byte),
+                        state: State {
+                            state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer().unwrap())])),
+                            memberships: [model].into_iter().collect(),
+                            head: Clock::singleton(&event),
+                        },
+                    },
+                    None,
+                )
+            };
+            let first = make(1, 30, 1);
+            let second = make(2, 10, 2);
+            commit_canonical_state(&engine, Clock::default(), first.clone()).await;
+            commit_canonical_state(&engine, Clock::default(), second).await;
+            let mut selection = Selection {
+                predicate: Predicate::MemberOf(model),
+                order_by: Some(vec![OrderByItem { path: property.into(), direction: OrderDirection::Asc }]),
+                limit: Some(1),
+            };
+            assert_eq!(engine.fetch_states(&selection).await.unwrap()[0].payload.entity_id, entity_id(2));
+            commit_canonical_state(&engine, first.payload.state.head, make(1, 5, 3)).await;
+            for (direction, expected) in
+                [(OrderDirection::Asc, if strings { 2 } else { 1 }), (OrderDirection::Desc, if strings { 1 } else { 2 })]
+            {
+                selection.order_by.as_mut().unwrap()[0].direction = direction;
+                for limit in [Some(1), None] {
+                    selection.limit = limit;
+                    assert_eq!(
+                        engine.fetch_states(&selection).await.unwrap()[0].payload.entity_id,
+                        entity_id(expected),
+                        "strings={strings}, selection={selection:?}"
+                    );
+                }
+            }
+        }
     }
 }
