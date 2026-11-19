@@ -5,22 +5,29 @@ use ankurah_core::error::RetrievalError;
 use ankurah_core::selection::ordering::OrderBoundary;
 use ankurah_proto::{Attested, EntityId, EntityState, StateFragment};
 use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::StateSelection};
+use tokio::sync::OwnedRwLockReadGuard;
 
 use crate::{database::Database, error::sled_error};
 
 /// Join materialization keys before loading state. The one-materialization
 /// indexed path stays in SledModelStore.
-pub(super) async fn fetch(database: Arc<Database>, selection: Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-    fetch_after(database, selection, None).await
+pub(super) async fn fetch(
+    database: Arc<Database>,
+    selection: Selection<Resolved>,
+    reset: OwnedRwLockReadGuard<()>,
+) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    fetch_after(database, selection, None, reset).await
 }
 
 pub(super) async fn fetch_after(
     database: Arc<Database>,
     selection: Selection<Resolved>,
     boundary: Option<&OrderBoundary>,
+    reset: OwnedRwLockReadGuard<()>,
 ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
     let boundary = boundary.cloned();
     tokio::task::spawn_blocking(move || {
+        let _reset = reset;
         let mut selected = StateSelection::new(&selection).after(boundary.as_ref())?;
         let plan = MaterializationPlan::new(&selection);
         let mut materializations = std::collections::BTreeMap::new();

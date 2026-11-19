@@ -454,7 +454,6 @@ where
         let server_challenge =
             handshake.server_challenge.ok_or_else(|| anyhow!("server {} sent its presence before its challenge", inner.server_url))?;
 
-        // Advertise our system only after admission, so an old cached root cannot preempt adoption.
         let presence = proto::Message::Presence(inner.node.presence(Dialing, &server_challenge).await.map_err(PeerConnectionError::from)?);
         sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
 

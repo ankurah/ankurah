@@ -278,7 +278,7 @@ impl PolicyAgent for JwtAgent {
         plan: &RegistrationPlan,
     ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         let context = ankurah::Context::new_weak(node, JwtContext::system());
-        let Some(epoch) = node.system.system_epoch() else { return Ok(None) };
+        let epoch = node.epoch();
         if crate::graph::bind_models(&node.catalog, epoch).is_err() {
             return Ok(None);
         }

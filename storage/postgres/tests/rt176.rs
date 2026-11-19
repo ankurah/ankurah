@@ -22,7 +22,6 @@ async fn postgres_get_state_returns_entity_not_found() -> Result<()> {
 
     let storage_engine = Arc::new(storage_engine);
     let node = Node::new_durable(storage_engine.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     let context = node.context_async(c).await?;
 
     // Generate a random entity ID that definitely doesn't exist

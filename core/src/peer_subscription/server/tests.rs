@@ -24,7 +24,6 @@ impl PeerSender for Sender {
 
 async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, ankql::ast::Selection<Resolved>)> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let peer = crate::test_utils::connect_peer(&node, &crate::node::NodeKey::generate(), false, Sender).await?;
     Ok((node, peer, Predicate::MemberOf(proto::ModelId::EntityId(proto::EntityId::random())).into()))

@@ -14,21 +14,18 @@ pub enum RegistrationError {
     /// Registration was attempted on a node without durable storage.
     #[error("registration executes on durable nodes; this node is ephemeral")]
     NotDurable,
-    /// The node has not established a system root or catalog epoch.
-    #[error("system is not ready")]
-    SystemNotReady,
     /// Strict offline registration could not consult an allocator.
     #[error(
         "collection '{0}' is not registered on this node as this binary declares it, and no durable peer is connected; \
-         connect to the system once first"
+         connect to a durable peer once first"
     )]
     NoDurablePeer(
         /// The source-level collection label that could not be registered.
         String,
     ),
-    /// A descriptor attempted to claim the protected system namespace.
+    /// A descriptor attempted to claim the protected catalog namespace.
     #[error(
-        "collection '{0}' starts with the reserved prefix '{prefix}'; the system and catalog collections are never registered through this executor",
+        "collection '{0}' starts with the reserved prefix '{prefix}'; reserved collections are never registered through this executor",
         prefix = crate::schema::RESERVED_COLLECTION_PREFIX
     )]
     ReservedCollection(

@@ -57,12 +57,7 @@ impl Drop for RestoreWebSockets {
 /// A presence with a zeroed signature for handshake tests. `HeldAdmission` skips signature verification.
 fn unsigned_presence(key: [u8; 32], durable: bool) -> proto::SignedPresence {
     proto::SignedPresence {
-        presence: proto::Presence {
-            key: proto::PublicKey::Ed25519(key),
-            durable,
-            system_root: None,
-            protocol_version: proto::PROTOCOL_VERSION,
-        },
+        presence: proto::Presence { key: proto::PublicKey::Ed25519(key), durable, protocol_version: proto::PROTOCOL_VERSION },
         signature: proto::Signature::Ed25519 { r: [0; 32], s: [0; 32] },
     }
 }
@@ -86,7 +81,7 @@ impl NodeComms for HeldAdmission {
     async fn presence(&self, _: proto::ConnectionSide, _: &proto::Challenge) -> Result<proto::SignedPresence, NodeHaltReason> {
         let release = self.0.release_presence.lock().unwrap().take().unwrap();
         self.0.presence_started.set(true);
-        release.await.map_err(|_| NodeHaltReason::SystemLoad("presence cancelled".into()))?;
+        release.await.map_err(|_| NodeHaltReason::KeypairLookup("presence cancelled".into()))?;
         Ok(unsigned_presence(self.id().unwrap().to_bytes(), false))
     }
     async fn register_peer(
@@ -98,7 +93,7 @@ impl NodeComms for HeldAdmission {
     ) -> Result<ConnectionId, PeerConnectionError> {
         let release = self.0.release.lock().unwrap().take().unwrap();
         self.0.started.set(true);
-        release.await.map_err(|_| PeerConnectionError::MissingSystem)?;
+        release.await.map_err(|_| PeerConnectionError::UnprovenKey)?;
         self.0.published.set(true);
         Ok(ConnectionId(0))
     }
@@ -145,7 +140,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 release: Mutex::new(Some(receiver)),
                 presence_started: Mut::new(false),
                 release_presence: Mutex::new(Some(presence_receiver)),
-                node_state: Mut::new(NodeState::Uninitialized),
+                node_state: Mut::new(NodeState::Startup),
             }));
             let client = Arc::new(ClientInner {
                 server_url: "ws://mock.invalid".into(),
@@ -158,8 +153,6 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 }),
                 reconnect_delay: RefCell::new(0),
             });
-            assert!(client.run.get());
-            node.0.node_state.set(NodeState::Startup);
             assert!(client.run.get());
             node.0.node_state.set(NodeState::Running);
             let handle = WebsocketClient { inner: client.clone() };
@@ -210,7 +203,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
 
             if close_before_admission || close_before_presence {
                 match stop {
-                    Stop::Halt => node.0.node_state.set(NodeState::Halted(NodeHaltReason::SystemLoad("fixture".into()))),
+                    Stop::Halt => node.0.node_state.set(NodeState::Halted(NodeHaltReason::CatalogLoad("fixture".into()))),
                     Stop::Close => close_from_server(socket),
                     Stop::Drop => {
                         let connection = client.connection.borrow_mut().take();
@@ -236,10 +229,10 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 if !halt {
                     assert!(futures::poll!(&mut ready).is_pending(), "ready must wait through a transport error");
                     if close_before_admission {
-                        let cause = PeerConnectionError::MissingSystem;
+                        let cause = PeerConnectionError::UnprovenKey;
                         client.state.set(ConnectionState::Error { message: cause.to_string(), cause: Some(cause) });
                     } else {
-                        node.0.node_state.set(NodeState::Halted(NodeHaltReason::SystemLoad("fixture".into())));
+                        node.0.node_state.set(NodeState::Halted(NodeHaltReason::CatalogLoad("fixture".into())));
                         state
                             .wait_for(|state| {
                                 matches!(state, ConnectionState::Error { cause: Some(PeerConnectionError::NodeHalted(_)), .. })
@@ -265,7 +258,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                     assert!(!node.0.published.value(), "dropping the connection owner must deregister an idle peer");
                 }
                 if halt {
-                    node.0.node_state.set(NodeState::Halted(NodeHaltReason::SystemLoad("fixture".into())));
+                    node.0.node_state.set(NodeState::Halted(NodeHaltReason::CatalogLoad("fixture".into())));
                     state
                         .wait_for(|state| matches!(state, ConnectionState::Error { cause: Some(PeerConnectionError::NodeHalted(_)), .. }))
                         .await;

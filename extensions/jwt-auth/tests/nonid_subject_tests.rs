@@ -214,7 +214,6 @@ async fn test_non_id_subject_does_not_authorize_or_block_other_credentials() -> 
     let keys = common::test_keys();
     let agent = agent_with(OWNER_SCOPE_CONFIG, &keys);
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let root = node.context_async(JwtContext::system()).await?;

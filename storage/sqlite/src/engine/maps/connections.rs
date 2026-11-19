@@ -89,7 +89,8 @@ impl Connections {
 
     /// Keep `connection`, which holds no transaction, for the next map call,
     /// unless as many are kept already, in which case it closes.
-    fn put_back(&self, connection: PooledConnection) {
+    fn put_back(&self, mut connection: PooledConnection) {
+        connection.release_reset();
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         if kept.len() < KEPT_CONNECTIONS {
             kept.push(connection);
@@ -117,7 +118,10 @@ impl Connections {
 impl Lease {
     /// Hold the engine's writer turn until the connection's transaction has
     /// ended.
-    pub(super) fn hold(&mut self, turn: OwnedMutexGuard<()>) { self.turn = Some(turn); }
+    pub(super) async fn hold(&mut self, turn: OwnedMutexGuard<()>) {
+        self.connection.as_mut().expect("a lease holds its connection until dropped").hold_reset().await;
+        self.turn = Some(turn);
+    }
 
     /// The connection, for a call of the engine's own to run in its
     /// transaction.
@@ -192,7 +196,7 @@ mod tests {
             let turn = Arc::new(tokio::sync::Mutex::new(()));
 
             let mut lease = connections.lease().await?;
-            lease.hold(Arc::clone(&turn).lock_owned().await);
+            lease.hold(Arc::clone(&turn).lock_owned().await).await;
 
             let (release, released) = mpsc::channel::<()>();
             occupied.spawn_blocking(move || released.recv());

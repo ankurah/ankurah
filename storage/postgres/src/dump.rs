@@ -25,8 +25,8 @@ impl StorageDump for Postgres {
     type DumpStream = BoxDumpStream;
 
     async fn dump(&self) -> Result<Self::DumpStream, RetrievalError> {
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&mut client).await.map_err(RetrievalError::storage)?;
         let cursor = PostgresDumpCursor {
             pool: self.pool.clone(),
             phase: DumpPhase::Events,

@@ -3,7 +3,7 @@ use crate::{
     error::{MutationError, RetrievalError, StateError},
     model::View,
     property::PropertyError,
-    schema::SystemEpoch,
+    schema::NodeEpoch,
     value::Value,
 };
 use ankurah_proto::{Clock, EntityId, EntityState as ProtoEntityState, ModelId, PropertyId, State};
@@ -37,15 +37,15 @@ impl Entity {
         }
     }
 
-    pub fn system_epoch(&self) -> SystemEpoch {
+    pub fn node_epoch(&self) -> NodeEpoch {
         match &self.0 {
-            Handle::Resident(entity) => entity.system_epoch(),
-            Handle::Proxy(proxy) => proxy.system_epoch,
+            Handle::Resident(entity) => entity.node_epoch(),
+            Handle::Proxy(proxy) => proxy.node_epoch,
         }
     }
 
-    pub(crate) fn check_epoch(&self, expected: SystemEpoch) -> Result<(), MutationError> {
-        if self.system_epoch() != expected {
+    pub(crate) fn check_epoch(&self, expected: NodeEpoch) -> Result<(), MutationError> {
+        if self.node_epoch() != expected {
             return Err(MutationError::ForeignEntity);
         }
         Ok(())
@@ -162,11 +162,11 @@ pub(crate) struct EntityInner {
 }
 
 impl EntityInner {
-    pub(super) fn system_epoch(&self) -> SystemEpoch { self.registry.system_epoch() }
+    pub(super) fn node_epoch(&self) -> NodeEpoch { self.registry.node_epoch() }
 }
 
 impl std::fmt::Debug for EntityInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EntityInner").field("id", &self.id).field("state", &self.state).field("system_epoch", &self.system_epoch()).finish()
+        f.debug_struct("EntityInner").field("id", &self.id).field("state", &self.state).field("node_epoch", &self.node_epoch()).finish()
     }
 }

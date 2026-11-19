@@ -12,16 +12,14 @@ use crate::storage::LockName;
 /// Why this node permanently stopped accepting work, not a rejected connection or operation.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum NodeHaltReason {
-    #[error("failed to reconstruct the local system: {0}")]
-    SystemLoad(String),
     #[error("failed to reconstruct the local catalog: {0}")]
     CatalogLoad(String),
     #[error("failed to initialize policy: {0}")]
     PolicyAgentStartFailed(String),
     #[error("failed to look up the node's keypair: {0}")]
     KeypairLookup(String),
-    #[error("system replacement requires a new node (current {current}, proposed {proposed})")]
-    SystemReplacement { current: EntityId, proposed: EntityId },
+    #[error("the node was reset")]
+    Reset,
 }
 
 #[derive(Error, Debug)]
@@ -172,8 +170,6 @@ pub enum RequestError {
     PeerNotConnected,
     #[error("Connection lost")]
     ConnectionLost,
-    #[error("System not ready")]
-    SystemNotReady,
     #[error("Server error: {0}")]
     ServerError(String),
     #[error("Send error: {0}")]
@@ -227,7 +223,7 @@ pub enum MutationError {
     NodeNotReady,
     #[error("This operation requires a durable node")]
     NotDurable,
-    #[error("the entity belongs to another node's system epoch")]
+    #[error("the entity belongs to another node's epoch")]
     ForeignEntity,
     #[error("node halted: {0}")]
     NodeHalted(#[from] NodeHaltReason),
@@ -263,12 +259,6 @@ pub enum MutationError {
     EventStructure(ankurah_proto::EventStructureError),
     #[error("inadmissible event: {0}")]
     InadmissibleEvent(InadmissibleEvent),
-    /// The node does not know its system root, so it cannot derive an entity
-    /// id: a non-root genesis binds the root into its own id. A caller that
-    /// reaches this on an ephemeral node can retry once the handshake with a
-    /// durable peer has established the system.
-    #[error("the node does not know its system root yet")]
-    SystemNotReady,
     /// A commit-path invariant about an event's provenance, as opposed to
     /// [`MutationError::EventStructure`], which is about its shape. The string
     /// names which one.

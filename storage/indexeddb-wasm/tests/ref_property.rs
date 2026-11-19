@@ -37,7 +37,6 @@ async fn setup_context() -> Result<(Context, String), anyhow::Error> {
     let db_name = format!("test_ref_{}", ulid::Ulid::new());
     let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
-    node.system.create().await?;
     Ok((node.context_async(DEFAULT_CONTEXT).await.unwrap(), db_name))
 }
 

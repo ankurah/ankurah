@@ -30,7 +30,10 @@ use ankurah_proto::{self as proto};
 use ankurah_signals::Wait;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 /// Trait for entities that can be used in reactor notifications
@@ -85,7 +88,8 @@ struct ReactorInner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     /// Prevent query installation or clearing from interleaving with change dispatch's
     /// watcher lookup, result updates, and watcher maintenance. The map locks protect
     /// individual accesses, not that sequence. Fetch and gap-fill I/O stay outside this lock.
-    notify_lock: tokio::sync::Mutex<()>,
+    notify_lock: Arc<tokio::sync::Mutex<()>>,
+    closed: AtomicBool,
     #[cfg(test)]
     publication_pause: Mutex<Option<(proto::ModelId, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
 }
@@ -103,7 +107,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let reactor = Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
             watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
-            notify_lock: tokio::sync::Mutex::new(()),
+            notify_lock: Arc::new(tokio::sync::Mutex::new(())),
+            closed: AtomicBool::new(false),
             #[cfg(test)]
             publication_pause: Mutex::new(None),
         }));
@@ -147,9 +152,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Create a new subscription container
     pub fn subscribe(&self) -> ReactorSubscription<E, Ev> {
         let broadcast = ankurah_signals::broadcast::Broadcast::new();
-        let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone());
+        let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone(), self.0.notify_lock.clone());
         let subscription_id = subscription.id();
-        self.0.subscriptions.lock().unwrap().insert(subscription_id, subscription);
+        let mut subscriptions = self.0.subscriptions.lock().unwrap();
+        if !self.0.closed.load(Ordering::Acquire) {
+            subscriptions.insert(subscription_id, subscription);
+        }
         ReactorSubscription(Arc::new(ReactorSubInner { subscription_id, reactor: self.clone(), broadcast }))
     }
 
@@ -288,18 +296,25 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
+        let previous = self.subscription(subscription_id).and_then(|subscription| subscription.query_revision(query_id));
         let included_entities = node.fetch_entities_from_local(&selection).await?;
         if !pre_notify_hook.is_current(version) {
             return Ok(());
         }
 
         let notify = self.0.notify_lock.lock().await;
+        anyhow::ensure!(!self.0.closed.load(Ordering::Acquire), "reactor is closed");
         let subscription = {
             let subscriptions = self.0.subscriptions.lock().unwrap();
             subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
         };
 
-        if !pre_notify_hook.is_current(version) {
+        let unchanged = match (&previous, subscription.query_revision(query_id)) {
+            (None, None) => true,
+            (Some(previous), Some(current)) => Arc::ptr_eq(previous, &current),
+            _ => false,
+        };
+        if !unchanged || !pre_notify_hook.is_current(version) {
             return Ok(());
         }
 
@@ -307,11 +322,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         let mut reactor_update_items = Vec::new();
         subscription.update_query(query_id, selection.clone(), included_entities, version, &mut reactor_update_items)?;
+        let Some(revision) = subscription.query_revision(query_id) else { return Ok(()) };
 
         drop(notify);
         subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
         let _notify = self.0.notify_lock.lock().await;
-        if !pre_notify_hook.is_current(version) {
+        if self.0.closed.load(Ordering::Acquire) || !subscription.is_current(query_id, &revision) || !pre_notify_hook.is_current(version) {
             return Ok(());
         }
 
@@ -329,6 +345,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Notify subscriptions about an entity change
     pub async fn notify_change<C: ChangeNotification<Entity = E, Event = Ev>>(&self, changes: Vec<C>) {
         let _notify_guard = self.0.notify_lock.lock().await;
+        if self.0.closed.load(Ordering::Acquire) {
+            return;
+        }
         let changes: Arc<Vec<C>> = Arc::from(changes);
 
         tracing::debug!("Reactor.notify_change({} changes)", changes.len());
@@ -359,16 +378,21 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         }
     }
 
-    /// Clear current subscription results and watchers when the owner stops running.
+    /// Permanently close publication, clearing subscription results and watchers.
+    /// Returning is a barrier for asynchronous fetch and gap-fill completions.
     pub(crate) async fn close(&self) {
         let _notify = self.0.notify_lock.lock().await;
+        let subscriptions = {
+            let mut subscriptions = self.0.subscriptions.lock().unwrap();
+            self.0.closed.store(true, Ordering::Release);
+            std::mem::take(&mut *subscriptions)
+        };
         {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             watcher_set.clear();
         }
 
-        let subscriptions: Vec<_> = self.0.subscriptions.lock().unwrap().values().cloned().collect();
-        for subscription in subscriptions {
+        for subscription in subscriptions.into_values() {
             subscription.close();
         }
     }
@@ -395,6 +419,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 #[cfg(test)]
 mod tests {
+    mod lifecycle;
+
     #[tokio::test]
     async fn node_halt_does_not_wait_for_result_clearing() {
         use crate::{
@@ -403,13 +429,13 @@ mod tests {
             test_utils::TestStorage,
         };
         let node = Node::new_durable(std::sync::Arc::new(TestStorage::default()), PermissiveAgent::new());
-        node.system.create().await.unwrap();
+        node.wait_ready().await.unwrap();
         let query =
             node.context_async(DEFAULT_CONTEXT).await.unwrap().query_wait::<crate::schema::catalog::SysModelRowView>("true").await.unwrap();
         assert!(query.loaded());
 
         let notify = node.reactor.0.notify_lock.lock().await;
-        node.system.halt(crate::error::NodeHaltReason::SystemLoad("fixture".into()));
+        node.lifecycle.halt(crate::error::NodeHaltReason::CatalogLoad("fixture".into()));
         assert!(node.state().value().halt_reason().is_some());
         assert!(node.check_ready().is_err());
         assert!(query.loaded(), "clearing must wait for the publication lock");
@@ -763,10 +789,10 @@ mod tests {
         assert_eq!(resultset.len(), 0);
         assert!(!resultset.is_loaded());
         changes();
-        install(sel("status = 'done'"), 3).await.unwrap();
-        assert_eq!(reactor.subscription(subscription.id()).unwrap().queries_len(), 1);
-        assert!(resultset.contains_key(&done.id));
-        assert_eq!(changes().len(), 1);
+        assert!(install(sel("status = 'done'"), 3).await.is_err());
+        assert!(reactor.subscription(subscription.id()).is_none());
+        assert_eq!(resultset.len(), 0);
+        assert!(changes().is_empty());
     }
 
     // TODO: Add more test cases:

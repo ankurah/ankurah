@@ -26,8 +26,8 @@ async fn competing_initial_builds(tag: &str) -> anyhow::Result<()> {
     let pool = bb8::Pool::builder().max_size(2).build(connection).await?;
     let first = Arc::new(Postgres::new(pool.clone()).await?);
     let second = Arc::new(Postgres::new(pool).await?);
-    let inspector = first.pool.dedicated_connection().await?;
-    first.ensure_shared_tables(&inspector).await?;
+    let mut inspector = first.pool.dedicated_connection().await?;
+    first.ensure_shared_tables(&mut inspector).await?;
     drop(first.map_snapshot(&[]).await?);
     inspector
         .execute(

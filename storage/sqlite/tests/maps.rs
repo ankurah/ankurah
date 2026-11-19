@@ -5,9 +5,6 @@
 //! transaction makes every other writer wait, and SQLite runs none of the
 //! cases of an engine that locks by name.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use ankurah::core::error::RetrievalError;
 use ankurah::core::storage::{MapId, MapRead, MapRows, MapSnapshot, MapWrite, StorageEngine, StorageTransaction};
 use ankurah::core::test_helpers::map_conformance::{
@@ -16,7 +13,7 @@ use ankurah::core::test_helpers::map_conformance::{
 };
 use ankurah::proto::Clock;
 use ankurah_storage_sqlite::{SqliteConnectionManager, SqliteStorageEngine};
-use tokio::sync::Notify;
+use futures_util::FutureExt;
 use tokio::time::timeout;
 
 /// Runs each case on an engine over a database file of its own.
@@ -58,36 +55,25 @@ async fn a_reset_answers_whether_it_deleted_anything_the_maps_entries_among_it()
 /// though the commit made the records' tables.
 #[tokio::test]
 async fn a_reset_waiting_for_an_open_map_transaction_removes_its_records_with_its_map_writes() -> anyhow::Result<()> {
-    static WAITING: Notify = Notify::const_new();
-
-    /// The reset's busy handler: it tells the test the reset waits, and tries
-    /// again a moment later, for as long as it takes. The moment paces the
-    /// tries, and decides nothing.
-    fn waiting(_tries: i32) -> bool {
-        WAITING.notify_one();
-        std::thread::sleep(Duration::from_millis(1));
-        true
-    }
-
     let directory = tempfile::tempdir()?;
-    // One connection, so the busy handler installed below is the reset's.
-    let pool = bb8::Pool::builder().max_size(1).build(SqliteConnectionManager::file(directory.path().join("maps.sqlite"))).await?;
-    let engine = Arc::new(SqliteStorageEngine::new(pool).await?);
-    engine.pool().get().await?.with_connection(|connection| Ok(connection.busy_handler(Some(waiting))?)).await?;
+    // No asynchronous connection validation: polling reset reaches its
+    // admission gate, where it waits before entering SQLite's busy handler.
+    let pool = bb8::Pool::builder()
+        .max_size(1)
+        .test_on_check_out(false)
+        .build(SqliteConnectionManager::file(directory.path().join("maps.sqlite")))
+        .await?;
+    let engine = SqliteStorageEngine::new(pool).await?;
 
     let (state, _) = entity!(1);
     let mut open = engine.transaction();
     open.set_state(&Clock::default(), &state).await?;
     open.map_write(vec![MapWrite::Put { map: MapId::new("m"), key: b"a".to_vec(), value: vec![1] }]).await?;
 
-    let resetting = tokio::spawn({
-        let engine = Arc::clone(&engine);
-        async move { engine.delete_all().await }
-    });
-
-    timeout(HANG, WAITING.notified()).await?;
-    open.commit().await?.committed()?;
-    assert!(timeout(HANG, resetting).await???, "the reset deleted what the commit landed");
+    let mut resetting = Box::pin(engine.delete_all());
+    assert!(resetting.as_mut().now_or_never().is_none(), "reset waits for the open writer");
+    timeout(HANG, open.commit()).await??.committed()?;
+    assert!(timeout(HANG, resetting).await??, "the reset deleted what the commit landed");
 
     let found = engine.get_state(state.payload.entity_id).await;
     assert!(matches!(found, Err(RetrievalError::EntityNotFound(_))), "the entity's records are gone: {found:?}");

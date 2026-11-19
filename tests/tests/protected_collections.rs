@@ -16,7 +16,7 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
+    client.wait_ready().await.unwrap();
 
     for collection in PROTECTED {
         let model = ankurah::core::schema::system_model_id(collection).expect("protected collection has a system model");
@@ -51,7 +51,7 @@ async fn direct_remote_commit_refuses_a_protected_batch_before_writing_any_event
     let context = server.context(DEFAULT_CONTEXT)?;
     let model = context.resolve_model_id::<Album>().await?;
     let ordinary = proto::Event::genesis(
-        server.system.root_id(),
+        None,
         proto::AuthorId::Unknown,
         proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
     );
@@ -60,7 +60,7 @@ async fn direct_remote_commit_refuses_a_protected_batch_before_writing_any_event
     for protected in PROTECTED {
         let protected_model = ankurah::core::schema::system_model_id(protected).unwrap();
         let protected_event = proto::Event::genesis(
-            server.system.root_id(),
+            None,
             proto::AuthorId::Unknown,
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(protected_model))]),
         );

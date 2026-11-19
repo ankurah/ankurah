@@ -30,7 +30,7 @@ pub struct RefPredMessage {
 
 async fn setup() -> Result<Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     Ok(node.context_async(DEFAULT_CONTEXT).await?)
 }
 

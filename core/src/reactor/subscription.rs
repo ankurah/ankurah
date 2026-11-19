@@ -89,6 +89,8 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         source: Arc<dyn crate::reactor::LocalEntitySource>,
         version: u32,
     ) -> anyhow::Result<Vec<crate::entity::Entity>> {
+        let notify = self.0.reactor.0.notify_lock.lock().await;
+        anyhow::ensure!(!self.0.reactor.0.closed.load(std::sync::atomic::Ordering::Acquire), "reactor is closed");
         let subscription = self
             .0
             .reactor
@@ -98,9 +100,13 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         let resultset = subscription.register_or_get_query(query_id, gap_fetcher, source);
 
         let mut all_entities = subscription.update_query(query_id, selection.clone(), included_entities, version, &mut ())?;
+        let revision = subscription.query_revision(query_id).ok_or_else(|| anyhow::anyhow!("query was removed"))?;
 
+        drop(notify);
         subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
 
+        let _notify = self.0.reactor.0.notify_lock.lock().await;
+        anyhow::ensure!(subscription.is_current(query_id, &revision), "query was closed or replaced");
         resultset.set_loaded(true);
 
         Ok(all_entities)

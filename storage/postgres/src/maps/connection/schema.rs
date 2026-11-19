@@ -16,7 +16,7 @@ use futures_util::future::try_join_all;
 use tokio_postgres::{Client, Statement};
 
 use crate::maps::MapError;
-use crate::{acquire_ddl_lock, release_ddl_lock, MAP_TABLE};
+use crate::{acquire_ddl_lock, reset_fenced_transaction, MAP_TABLE};
 
 /// Create the table on `client`, if it doesn't exist yet, under the engine's
 /// lock on its DDL, since `IF NOT EXISTS` doesn't keep two sessions creating
@@ -27,8 +27,10 @@ use crate::{acquire_ddl_lock, release_ddl_lock, MAP_TABLE};
 /// PostgreSQL would move it out of line into the table's TOAST table, where
 /// every read of it costs another lookup: `toast_tuple_target` keeps entries
 /// of up to 8 KB in the table itself.
-pub(crate) async fn create_table(client: &Client) -> Result<(), StateError> {
-    let lock_key = acquire_ddl_lock(client, MAP_TABLE).await?;
+pub(crate) async fn create_table(client: &mut Client) -> Result<(), StateError> {
+    let transaction = reset_fenced_transaction(client).await?;
+    let client = transaction.client();
+    acquire_ddl_lock(&transaction, MAP_TABLE).await?;
 
     let created = client
         .batch_execute(&format!(
@@ -41,18 +43,18 @@ pub(crate) async fn create_table(client: &Client) -> Result<(), StateError> {
         ))
         .await;
 
-    release_ddl_lock(client, lock_key).await?;
-    created.map_err(|error| StateError::DDLError(Box::new(error)))
+    created.map_err(|error| StateError::DDLError(Box::new(error)))?;
+    transaction.commit().await.map_err(|error| StateError::DDLError(Box::new(error)))
 }
 
-/// The reset lock, which `delete_all` takes exclusively and every map
-/// transaction takes shared at its first map call, each until it ends: a
-/// reset waits for the map transactions under way, and none begins while it
-/// runs. It is one key, "ak_r" and "eset" in ASCII, in the space of advisory
-/// locks keyed by two numbers, which no lock name's key shares.
+/// The reset lock, which `delete_all` takes exclusively and every write or
+/// preparation transaction takes shared until it ends. A map transaction
+/// takes its share at the first map call. It is one key, "ak_r" and "eset"
+/// in ASCII, in the space of advisory locks keyed by two numbers, which no
+/// lock name's key shares.
 const RESET_LOCK: (i32, i32) = (0x616b_5f72, 0x6573_6574);
 
-/// A map transaction's share of the reset lock.
+/// A write or preparation transaction's share of the reset lock.
 pub(crate) fn share_reset_lock() -> String {
     let (class, object) = RESET_LOCK;
     format!("SELECT pg_advisory_xact_lock_shared({class}, {object})")

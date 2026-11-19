@@ -12,7 +12,6 @@ use std::sync::Arc;
 async fn test_two_ephemeral_independent_writes() -> Result<()> {
     // Setup: Durable D, Ephemeral E1, E2 all connected
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
     durable.wait_ready().await?;
 
     let ephemeral1 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
@@ -94,7 +93,6 @@ async fn test_two_ephemeral_independent_writes() -> Result<()> {
 #[tokio::test]
 async fn test_two_ephemeral_same_property_conflict() -> Result<()> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
     durable.wait_ready().await?;
 
     let ephemeral1 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
@@ -163,7 +161,6 @@ async fn test_two_ephemeral_same_property_conflict() -> Result<()> {
 #[tokio::test]
 async fn test_three_ephemeral_three_way_race() -> Result<()> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
     durable.wait_ready().await?;
 
     let ephemeral1 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

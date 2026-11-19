@@ -8,7 +8,6 @@ async fn local_query_activation_retries_snapshot_conflicts_without_retaining_a_d
     for recover in [false, true] {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-        node.system.create().await?;
         node.wait_ready().await?;
         storage.reject_state_finish.store(true, std::sync::atomic::Ordering::SeqCst);
         let context = node.context(DEFAULT_CONTEXT)?;
@@ -43,7 +42,6 @@ async fn cancelled_commits_leave_views_unavailable_until_storage_is_reconciled()
     for committed in [false, true] {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-        node.system.create().await?;
         node.wait_ready().await?;
         node.set_tree_write_behind(WriteBehind { max_changes: usize::MAX, max_delay: Duration::from_secs(3600) });
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([91; 32]));
@@ -51,7 +49,7 @@ async fn cancelled_commits_leave_views_unavailable_until_storage_is_reconciled()
         assert_eq!(view.count(..).await?, 0);
 
         let event = proto::Event::genesis(
-            node.system.root_id(),
+            None,
             proto::AuthorId::Unknown,
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
         );
@@ -91,7 +89,6 @@ async fn cancelled_commits_leave_views_unavailable_until_storage_is_reconciled()
 async fn in_flight_maintenance_does_not_keep_the_node_alive() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let (entered, entering) = oneshot::channel();
     let (_release, released) = oneshot::channel();
@@ -113,7 +110,6 @@ async fn in_flight_maintenance_does_not_keep_the_node_alive() -> anyhow::Result<
 #[tokio::test]
 async fn a_live_query_retains_its_digest_tree_after_idle_eviction() -> anyhow::Result<()> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let context = node.context(DEFAULT_CONTEXT)?;
     let selection: ankql::ast::Selection<_> = Predicate::MemberOf(proto::ModelId::EntityId(proto::EntityId::from_bytes([92; 32]))).into();

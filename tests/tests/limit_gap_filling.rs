@@ -26,7 +26,7 @@ async fn ordered_queries_use_validated_bindings_before_catalog_subscription_deli
         hold.store(true, Ordering::SeqCst);
         create_albums(&server_ctx, 2020..=2024).await?;
         client_ctx.resolve_model_id::<Album>().await?;
-        let property = Album::descriptor().field_by_name("year").unwrap().resolved.get(client.system.system_epoch().unwrap())?;
+        let property = Album::descriptor().field_by_name("year").unwrap().resolved.get(client.epoch())?;
         let proto::PropertyId::EntityId(property) = property else { unreachable!() };
         assert!(matches!(client.storage.get_state(property).await, Err(ankurah::core::error::RetrievalError::EntityNotFound(_))));
 

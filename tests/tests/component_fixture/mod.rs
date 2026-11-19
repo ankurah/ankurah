@@ -79,7 +79,6 @@ impl Fixture {
         assert_eq!(forged.properties[0].to_base64(), PROJECT);
         ankurah_tests::catalog_forge::plant(&storage, &forged).await?;
         let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-        node.system.create().await?;
         node.wait_ready().await?;
         let ctx = node.context_async(DEFAULT_CONTEXT).await?;
         ctx.resolve_model_id::<Closure>().await?;
@@ -177,5 +176,5 @@ impl Fixture {
 }
 
 pub fn stage<M: Model>(entity: &LocalTrxEntity, component: &M, model: ModelId) -> Result<(), PropertyError> {
-    component.initialize_new_entity(entity, model, entity.system_epoch())
+    component.initialize_new_entity(entity, model, entity.node_epoch())
 }

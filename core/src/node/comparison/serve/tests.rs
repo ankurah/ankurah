@@ -29,7 +29,6 @@ async fn fixture_with_key(
 ) -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, Selection<Resolved>)> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let peer = crate::test_utils::connect_peer(&node, key, false, Sender).await?;
     let model = ModelId::EntityId(EntityId::from_bytes([70; 32]));

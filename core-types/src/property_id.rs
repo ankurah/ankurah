@@ -9,7 +9,7 @@ use crate::{DecodeError, EntityId};
 /// bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::IntoStaticStr)]
 pub enum SystemProperty {
-    /// The system configuration item key.
+    /// Reserved legacy system-configuration item key; retained for stored data.
     Item,
     /// The registered model's source-level label.
     Label,

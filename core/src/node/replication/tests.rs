@@ -19,7 +19,6 @@ impl PeerSender for Sender {
 
 async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, NodeId, mpsc::UnboundedReceiver<proto::NodeMessage>)> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let key = crate::node::NodeKey::generate();
     let peer = key.public_key().node_id();

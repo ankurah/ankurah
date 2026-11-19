@@ -20,7 +20,7 @@ pub(crate) struct MapLocks {
     /// commit under it as it lands.
     readers: ByName<RwLock<()>>,
 
-    /// Shared by map transactions and snapshots, exclusive to a reset.
+    /// Shared by map transactions, snapshots and native writes, exclusive to a reset.
     reset: Arc<RwLock<()>>,
 
     /// Held by each commit with map writes while it lands.
@@ -83,10 +83,13 @@ impl MapLocks {
 
     /// Wait until no reset is under way, or waiting, then share the reset
     /// lock.
-    pub(super) async fn share_reset(&self) -> OwnedRwLockReadGuard<()> { Arc::clone(&self.reset).read_owned().await }
+    pub(in crate::engine) async fn share_reset(&self) -> OwnedRwLockReadGuard<()> { Arc::clone(&self.reset).read_owned().await }
 
-    /// Wait until every map transaction and snapshot sharing the reset lock
-    /// has ended, then hold it exclusively.
+    /// The stable gate for individual query calls made by a retained state snapshot.
+    pub(in crate::engine) fn reset_lock(&self) -> Arc<RwLock<()>> { self.reset.clone() }
+
+    /// Wait until every transaction, snapshot and native write sharing the
+    /// reset lock has ended, then hold it exclusively.
     pub(crate) async fn hold_reset(&self) -> RwLockWriteGuard<'_, ()> { self.reset.write().await }
 }
 

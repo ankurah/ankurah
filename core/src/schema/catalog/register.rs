@@ -19,7 +19,7 @@ pub(crate) enum RegistrationAuth<CD> {
 }
 
 /// A property's declaration within a model, before catalog resolution.
-pub(crate) trait RegistrantProperty {
+pub(crate) trait RegistrantProperty: Sync {
     /// Correlates this declaration with its entry in the registration response.
     fn build_id(&self) -> [u8; 16];
     /// The requested property name within the model.
@@ -37,7 +37,7 @@ pub(crate) trait RegistrantProperty {
 }
 
 /// A model declaration and an accumulator for its resolved catalog rows.
-pub(crate) trait Registrant {
+pub(crate) trait Registrant: Send {
     type Property: RegistrantProperty;
 
     /// Per-build declaration identity carried in the registration request.
@@ -49,7 +49,7 @@ pub(crate) trait Registrant {
     /// An existing model to bind by identity; explicit binding never creates a model.
     fn explicit_id(&self) -> Option<EntityId>;
     /// Property declarations in the order used by `set_property`.
-    fn properties(&self) -> impl ExactSizeIterator<Item = &Self::Property>;
+    fn properties(&self) -> impl ExactSizeIterator<Item = &Self::Property> + Send;
     /// Accumulate the resolved model identity and row.
     fn set_model(&mut self, id: EntityId, model: SysModelRow) -> Result<(), RegistrationError>;
     /// Accumulate a property's identity, row, and membership at its declaration index.
@@ -78,41 +78,42 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     R: Registrant,
 {
-    // A failed catalog load halts the node without ever marking the catalog ready.
-    tokio::select! {
-        () = catalog.wait_ready() => {}
-        reason = node.system.wait_halted() => return Err(reason.into()),
-    }
-    node.system.check_not_halted()?;
-    match resolve_local(catalog, registrant) {
-        Ok(()) => return Ok(()),
-        Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => {}
-        Err(error) => return Err(error),
-    }
+    node.lifecycle
+        .while_running(async {
+            catalog.wait_ready().await;
+            match resolve_local(catalog, registrant) {
+                Ok(()) => return Ok(()),
+                Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => {}
+                Err(error) => return Err(error),
+            }
 
-    let principal = match auth {
-        RegistrationAuth::Credential(credential) => Some(credential),
-        RegistrationAuth::Unavailable(source) => {
-            return Err(RegistrationError::PolicyDenied { collection: registrant.label().to_string(), source });
-        }
-        RegistrationAuth::Privileged => None,
-    };
-    let result = if node.durable {
-        register(catalog, node, principal.as_ref(), registrant).await
-    } else {
-        match principal.as_ref() {
-            Some(principal) => register_remote(node, principal, registrant).await,
-            None => Err(RegistrationError::NotDurable),
-        }
-    };
-    match result {
-        Err(RegistrationError::NoDurablePeer(label)) => match resolve_local(catalog, registrant) {
-            Ok(()) => Ok(()),
-            Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => Err(RegistrationError::NoDurablePeer(label)),
-            Err(error) => Err(error),
-        },
-        other => other,
-    }
+            let principal = match auth {
+                RegistrationAuth::Credential(credential) => Some(credential),
+                RegistrationAuth::Unavailable(source) => {
+                    return Err(RegistrationError::PolicyDenied { collection: registrant.label().to_string(), source });
+                }
+                RegistrationAuth::Privileged => None,
+            };
+            let result = if node.durable {
+                register(catalog, node, principal.as_ref(), registrant).await
+            } else {
+                match principal.as_ref() {
+                    Some(principal) => register_remote(node, principal, registrant).await,
+                    None => Err(RegistrationError::NotDurable),
+                }
+            };
+            match result {
+                Err(RegistrationError::NoDurablePeer(label)) => match resolve_local(catalog, registrant) {
+                    Ok(()) => Ok(()),
+                    Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => {
+                        Err(RegistrationError::NoDurablePeer(label))
+                    }
+                    Err(error) => Err(error),
+                },
+                other => other,
+            }
+        })
+        .await
 }
 
 /// Upsert the declaration on a durable node in one transaction, then populate the registrant.

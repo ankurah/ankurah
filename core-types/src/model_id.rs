@@ -7,7 +7,7 @@ use crate::EntityId;
 /// contract; append variants, never reorder them without a protocol bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::IntoStaticStr)]
 pub enum SystemModel {
-    /// The singleton system-configuration model.
+    /// Reserved legacy system-configuration identity; retained for stored data.
     System,
     /// Catalog entities that define registered models.
     Model,

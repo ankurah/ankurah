@@ -69,7 +69,6 @@ where
             let presence = node1.presence(Dialing, &challenge).await?;
             node2.register_peer(Accepting, &challenge, presence, Box::new(LocalProcessSender { sender: node1_tx })).await
         };
-        // Let an ephemeral node adopt before advertising its own system to the durable node.
         let (connection1, connection2) = if node1.durable && !node2.durable {
             let connection2 = register_node2.await?;
             match register_node1.await {

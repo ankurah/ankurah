@@ -127,7 +127,7 @@ impl Snapshot {
             query: None,
             incarnation: String::new(),
         };
-        engine.ensure_shared_tables(&snapshot.client).await.map_err(RetrievalError::storage)?;
+        engine.ensure_shared_tables(&mut snapshot.client).await.map_err(RetrievalError::storage)?;
         // Planning may prepare materializations and their columns. Do that
         // before opening the fixed read view or holding its relation locks.
         // Capture coverage before planning: a later canonical commit can add

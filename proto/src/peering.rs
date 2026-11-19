@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     id::NodeId,
     key::{PublicKey, Signature},
-    Attested, EntityState,
 };
 
 /// The wire protocol version this binary speaks.
@@ -68,7 +67,6 @@ pub struct Presence {
     /// The public key for verifying the presence signature and deriving the node id.
     pub key: PublicKey,
     pub durable: bool,
-    pub system_root: Option<Attested<EntityState>>,
     /// See [`PROTOCOL_VERSION`].
     pub protocol_version: u32,
 }
@@ -111,21 +109,7 @@ impl SignedPresence {
 
 impl std::fmt::Display for Presence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.system_root {
-            Some(r) => {
-                write!(
-                    f,
-                    "Presence[{}: durable {} proto v{} system_root: {}]",
-                    self.node_id().to_base64_short(),
-                    self.durable,
-                    self.protocol_version,
-                    r.payload
-                )
-            }
-            None => {
-                write!(f, "Presence[{}: durable {} proto v{}]", self.node_id().to_base64_short(), self.durable, self.protocol_version)
-            }
-        }
+        write!(f, "Presence[{}: durable {} proto v{}]", self.node_id().to_base64_short(), self.durable, self.protocol_version)
     }
 }
 
@@ -150,18 +134,12 @@ impl std::error::Error for PresenceRejection {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::EntityId;
     use ed25519_dalek::Signer;
 
     fn key(seed: u8) -> ed25519_dalek::SigningKey { ed25519_dalek::SigningKey::from_bytes(&[seed; 32]) }
 
     fn presence(key: &ed25519_dalek::SigningKey) -> Presence {
-        Presence {
-            key: PublicKey::Ed25519(key.verifying_key().to_bytes()),
-            durable: true,
-            system_root: None,
-            protocol_version: PROTOCOL_VERSION,
-        }
+        Presence { key: PublicKey::Ed25519(key.verifying_key().to_bytes()), durable: true, protocol_version: PROTOCOL_VERSION }
     }
 
     fn sign_with(key: &ed25519_dalek::SigningKey) -> impl FnOnce(&[u8]) -> Signature + '_ {
@@ -197,12 +175,9 @@ mod tests {
         assert!(!presence(&key(1)).sign(side, &challenge, sign_with(&key(2))).answers(side, &challenge));
 
         let signed = presence(&key(1)).sign(side, &challenge, sign_with(&key(1)));
-        let changes: [fn(&mut Presence); 4] = [
+        let changes: [fn(&mut Presence); 3] = [
             |presence| presence.key = PublicKey::Ed25519(key(2).verifying_key().to_bytes()),
             |presence| presence.durable = false,
-            |presence| {
-                presence.system_root = Some(Attested::opt(EntityState { entity_id: EntityId::random(), state: Default::default() }, None))
-            },
             |presence| presence.protocol_version += 1,
         ];
         for (index, change) in changes.into_iter().enumerate() {

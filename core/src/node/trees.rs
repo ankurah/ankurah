@@ -31,15 +31,16 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     }
 
     /// Persist this node's pending digest-tree maintenance.
-    pub async fn flush_trees(&self) -> Result<(), RetrievalError> {
-        self.system.check_not_halted()?;
-        self.trees.flush().await
-    }
+    pub async fn flush_trees(&self) -> Result<(), RetrievalError> { self.lifecycle.while_running(self.trees.flush()).await }
 
     pub(crate) async fn digest_tree(&self, selection: Selection<Resolved>) -> Result<Box<dyn Send + Sync>, RetrievalError> {
-        let view = self.trees.view(selection).await?;
-        self.tree_maintenance.notify_one();
-        Ok(Box::new(view))
+        self.lifecycle
+            .while_running(async {
+                let view = self.trees.view(selection).await?;
+                self.tree_maintenance.notify_one();
+                Ok(Box::new(view) as Box<dyn Send + Sync>)
+            })
+            .await
     }
 
     /// Capture an already scoped Selection without refilling its LIMIT when
@@ -49,30 +50,34 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         selection: Selection<Resolved>,
         credentials: &Vec<PA::ContextData>,
     ) -> Result<(ComparisonTree<SE>, ComparisonTree<SE>, Predicate<Resolved>), RetrievalError> {
-        let allowed = self.comparison_discovery(&selection, credentials)?;
-        let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
-        let mut budget = AuthorizationBudget::new(self.policy_agent.comparison_limits(credentials));
-        let mut authorize = |id, state: &State| {
-            budget.inspect(state)?;
-            if !discovery_allows(id, state, &allowed)? {
-                return Ok(false);
-            }
-            match policy.check_read_state(&id, state) {
-                Ok(()) => Ok(true),
-                Err(AccessDenied::ByPolicy(_) | AccessDenied::ModelDenied(_)) => Ok(false),
-                Err(error) => Err(error.into()),
-            }
-        };
-        let proven = self.policy_agent.state_reads_follow_predicate(credentials) && implies(&selection.predicate, &allowed);
-        let (owner, capture) = self.trees.capture_for_comparison(selection.clone(), (!proven).then_some(&mut authorize)).await?;
-        // Policy can change independently of entity commits while a scan awaits storage.
-        if self.comparison_discovery(&selection, credentials)? != allowed
-            || (proven && !self.policy_agent.state_reads_follow_predicate(credentials))
-        {
-            return Err(RetrievalError::storage(ComparisonFailure::AuthorizationChanged));
-        }
-        self.tree_maintenance.notify_one();
-        Ok((owner, capture, allowed))
+        self.lifecycle
+            .while_running(async {
+                let allowed = self.comparison_discovery(&selection, credentials)?;
+                let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
+                let mut budget = AuthorizationBudget::new(self.policy_agent.comparison_limits(credentials));
+                let mut authorize = |id, state: &State| {
+                    budget.inspect(state)?;
+                    if !discovery_allows(id, state, &allowed)? {
+                        return Ok(false);
+                    }
+                    match policy.check_read_state(&id, state) {
+                        Ok(()) => Ok(true),
+                        Err(AccessDenied::ByPolicy(_) | AccessDenied::ModelDenied(_)) => Ok(false),
+                        Err(error) => Err(error.into()),
+                    }
+                };
+                let proven = self.policy_agent.state_reads_follow_predicate(credentials) && implies(&selection.predicate, &allowed);
+                let (owner, capture) = self.trees.capture_for_comparison(selection.clone(), (!proven).then_some(&mut authorize)).await?;
+                // Policy can change independently of entity commits while a scan awaits storage.
+                if self.comparison_discovery(&selection, credentials)? != allowed
+                    || (proven && !self.policy_agent.state_reads_follow_predicate(credentials))
+                {
+                    return Err(RetrievalError::storage(ComparisonFailure::AuthorizationChanged));
+                }
+                self.tree_maintenance.notify_one();
+                Ok((owner, capture, allowed))
+            })
+            .await
     }
 
     /// Prove authority at a fresh canonical read boundary before disclosing a
@@ -87,96 +92,100 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         original_discovery: &Predicate<Resolved>,
         charge: &(dyn Fn(usize) -> Result<(), RetrievalError> + Send + Sync),
     ) -> Result<(), RetrievalError> {
-        let changed = || RetrievalError::storage(ComparisonFailure::AuthorizationChanged);
-        let allowed = self.comparison_discovery(selection, credentials).map_err(|_| changed())?;
-        if allowed != *original_discovery {
-            return Err(changed());
-        }
-        let catalog = crate::schema::is_catalog_read(&selection.predicate);
-        let proven = self.policy_agent.state_reads_follow_predicate(credentials) && implies(&selection.predicate, &allowed);
-        if proven && allowed == Predicate::True && !catalog {
-            return Ok(());
-        }
-
-        if proven {
-            // An unchanged grant can stop covering a member when its state changes.
-            // Compare against a fresh scoped tree: equal subtrees need no state reads,
-            // and changed heads at the same address still prove current membership.
-            // An old-only address also covers moves and LIMIT exits; restarting is
-            // conservative and avoids retaining an independent member index.
-            charge(1)?;
-            let (_owner, current) = self.trees.capture_for_comparison(selection.clone(), None).await?;
-            let batch = NonZeroUsize::new(self.policy_agent.comparison_limits(credentials).max_spans.min(256))
-                .ok_or_else(|| RetrievalError::storage(ComparisonFailure::LimitExceeded))?;
-            let getter = AuthorizationPages { view: current.view(), charge };
-            let mut comparison = captured.compare(getter, batch);
-            while let Some(differences) = comparison.next_batch().await.map_err(|error| match error {
-                ComparisonError::Getter(error) => error,
-                ComparisonError::View(error) => tree_failure(error),
-                _ => RetrievalError::storage(ComparisonFailure::Restart),
-            })? {
-                charge(differences.len())?;
-                if differences.iter().any(|difference| difference.ours.is_some() && difference.theirs.is_none()) {
-                    return Err(RetrievalError::storage(ComparisonFailure::Restart));
+        self.lifecycle
+            .while_running(async {
+                let changed = || RetrievalError::storage(ComparisonFailure::AuthorizationChanged);
+                let allowed = self.comparison_discovery(selection, credentials).map_err(|_| changed())?;
+                if allowed != *original_discovery {
+                    return Err(changed());
                 }
-            }
-            if self.comparison_discovery(selection, credentials).map_err(|_| changed())? != allowed
-                || !self.policy_agent.state_reads_follow_predicate(credentials)
-            {
-                return Err(changed());
-            }
-            return Ok(());
-        }
-
-        let mut budget = AuthorizationBudget::new(self.policy_agent.comparison_limits(credentials));
-        let mut snapshot = self.storage.state_snapshot(StateScan::Changes(None)).await?;
-        let mut members = captured.range(..).map_err(RetrievalError::storage)?;
-        let mut canonical = Vec::new();
-        loop {
-            let mut ids = Vec::new();
-            while ids.len() < 256 {
-                let Some(member) = members.try_next().await.map_err(RetrievalError::storage)? else { break };
-                ids.push(member.id.0);
-            }
-            if ids.is_empty() {
-                break;
-            }
-            charge(ids.len())?;
-            let states = snapshot.get_states(&ids).await?;
-            if states.len() != ids.len() {
-                return Err(crate::sync::Error::AnswerMisfit.into());
-            }
-            for (id, state) in ids.into_iter().zip(states) {
-                let state = state.ok_or_else(changed)?;
-                if state.payload.entity_id != id {
-                    return Err(crate::sync::Error::AnswerMisfit.into());
+                let catalog = crate::schema::is_catalog_read(&selection.predicate);
+                let proven = self.policy_agent.state_reads_follow_predicate(credentials) && implies(&selection.predicate, &allowed);
+                if proven && allowed == Predicate::True && !catalog {
+                    return Ok(());
                 }
-                let before = budget.bytes;
-                budget.inspect(&state.payload.state)?;
-                charge((budget.bytes - before).div_ceil(1024))?;
-                canonical.push((id, state.payload.state));
-            }
-        }
-        snapshot.finish().await?;
-        if self.comparison_discovery(selection, credentials).map_err(|_| changed())? != allowed {
-            return Err(changed());
-        }
-        let limits = self.policy_agent.comparison_limits(credentials);
-        if budget.members > limits.max_capture_members || budget.bytes > limits.max_capture_bytes {
-            return Err(RetrievalError::storage(ComparisonFailure::LimitExceeded));
-        }
-        // No await follows these checks: revocation while reading a later batch or
-        // finishing the snapshot must also apply to members read earlier.
-        let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
-        for (id, state) in canonical {
-            if !discovery_allows(id, &state, &allowed)?
-                || (catalog && !discovery_allows(id, &state, &selection.predicate)?)
-                || policy.check_read_state(&id, &state).is_err()
-            {
-                return Err(changed());
-            }
-        }
-        Ok(())
+
+                if proven {
+                    // An unchanged grant can stop covering a member when its state changes.
+                    // Compare against a fresh scoped tree: equal subtrees need no state reads,
+                    // and changed heads at the same address still prove current membership.
+                    // An old-only address also covers moves and LIMIT exits; restarting is
+                    // conservative and avoids retaining an independent member index.
+                    charge(1)?;
+                    let (_owner, current) = self.trees.capture_for_comparison(selection.clone(), None).await?;
+                    let batch = NonZeroUsize::new(self.policy_agent.comparison_limits(credentials).max_spans.min(256))
+                        .ok_or_else(|| RetrievalError::storage(ComparisonFailure::LimitExceeded))?;
+                    let getter = AuthorizationPages { view: current.view(), charge };
+                    let mut comparison = captured.compare(getter, batch);
+                    while let Some(differences) = comparison.next_batch().await.map_err(|error| match error {
+                        ComparisonError::Getter(error) => error,
+                        ComparisonError::View(error) => tree_failure(error),
+                        _ => RetrievalError::storage(ComparisonFailure::Restart),
+                    })? {
+                        charge(differences.len())?;
+                        if differences.iter().any(|difference| difference.ours.is_some() && difference.theirs.is_none()) {
+                            return Err(RetrievalError::storage(ComparisonFailure::Restart));
+                        }
+                    }
+                    if self.comparison_discovery(selection, credentials).map_err(|_| changed())? != allowed
+                        || !self.policy_agent.state_reads_follow_predicate(credentials)
+                    {
+                        return Err(changed());
+                    }
+                    return Ok(());
+                }
+
+                let mut budget = AuthorizationBudget::new(self.policy_agent.comparison_limits(credentials));
+                let mut snapshot = self.storage.state_snapshot(StateScan::Changes(None)).await?;
+                let mut members = captured.range(..).map_err(RetrievalError::storage)?;
+                let mut canonical = Vec::new();
+                loop {
+                    let mut ids = Vec::new();
+                    while ids.len() < 256 {
+                        let Some(member) = members.try_next().await.map_err(RetrievalError::storage)? else { break };
+                        ids.push(member.id.0);
+                    }
+                    if ids.is_empty() {
+                        break;
+                    }
+                    charge(ids.len())?;
+                    let states = snapshot.get_states(&ids).await?;
+                    if states.len() != ids.len() {
+                        return Err(crate::sync::Error::AnswerMisfit.into());
+                    }
+                    for (id, state) in ids.into_iter().zip(states) {
+                        let state = state.ok_or_else(changed)?;
+                        if state.payload.entity_id != id {
+                            return Err(crate::sync::Error::AnswerMisfit.into());
+                        }
+                        let before = budget.bytes;
+                        budget.inspect(&state.payload.state)?;
+                        charge((budget.bytes - before).div_ceil(1024))?;
+                        canonical.push((id, state.payload.state));
+                    }
+                }
+                snapshot.finish().await?;
+                if self.comparison_discovery(selection, credentials).map_err(|_| changed())? != allowed {
+                    return Err(changed());
+                }
+                let limits = self.policy_agent.comparison_limits(credentials);
+                if budget.members > limits.max_capture_members || budget.bytes > limits.max_capture_bytes {
+                    return Err(RetrievalError::storage(ComparisonFailure::LimitExceeded));
+                }
+                // No await follows these checks: revocation while reading a later batch or
+                // finishing the snapshot must also apply to members read earlier.
+                let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
+                for (id, state) in canonical {
+                    if !discovery_allows(id, &state, &allowed)?
+                        || (catalog && !discovery_allows(id, &state, &selection.predicate)?)
+                        || policy.check_read_state(&id, &state).is_err()
+                    {
+                        return Err(changed());
+                    }
+                }
+                Ok(())
+            })
+            .await
     }
 
     pub(super) fn comparison_discovery(
@@ -201,6 +210,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     pub(super) fn start_tree_maintenance(&self) {
         let trees = std::sync::Arc::downgrade(&self.trees);
         let changed = self.tree_maintenance.clone();
+        let lifecycle = self.lifecycle.clone();
         let run = self.run.clone();
         crate::task::spawn(async move {
             loop {
@@ -231,6 +241,10 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 loop {
                     let maintain = async {
                         let Some(trees) = trees.upgrade() else { return Ok(()) };
+                        let _operation = match lifecycle.admit() {
+                            Ok(operation) => operation,
+                            Err(_) => return Ok(()),
+                        };
                         trees.maintain().await
                     };
                     let result = tokio::select! {

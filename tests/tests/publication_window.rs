@@ -82,7 +82,7 @@ async fn read_during_publication(
     tokio::time::sleep(Duration::from_millis(100)).await;
     let expression = format!("name = '{name}'");
     let (query, views) = if matches!(interleave, Interleave::Hydrate) {
-        let model = Album::descriptor().model_id(node.system.system_epoch().unwrap())?;
+        let model = Album::descriptor().model_id(node.epoch())?;
         let selection = node.catalog.resolve_selection(&model, ankql::parser::parse_selection(&expression)?)?.and_member_of(model);
         let entities = node.fetch_entities_from_local(&selection).await?;
         assert!(changes.lock().unwrap().is_empty(), "hydration must happen before the original query hears publication");
@@ -107,7 +107,7 @@ async fn read_during_publication(
 /// What the original query hears of a creation, with the chosen read interleaved.
 async fn heard(writer: Writer, interleave: Interleave) -> Result<Heard> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
     ephemeral.wait_ready().await?;
@@ -138,7 +138,7 @@ async fn heard(writer: Writer, interleave: Interleave) -> Result<Heard> {
 /// What the original query hears of an edit, with the chosen read interleaved.
 async fn heard_edit(writer: Writer, interleave: Interleave) -> Result<Heard> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
     ephemeral.wait_ready().await?;

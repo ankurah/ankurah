@@ -1,7 +1,7 @@
 //! Durable model and property identities.
 //!
 //! Catalog entities persist the schema; compiled descriptors cache its IDs
-//! per system epoch so names are resolved before storage or evaluation.
+//! per node epoch so names are resolved before storage or evaluation.
 
 pub mod catalog;
 pub mod cell;
@@ -10,7 +10,7 @@ pub mod registration;
 pub use crate::storage::CatalogResolver;
 pub use catalog::resolver;
 
-pub use cell::{PerSystemOnceCell, SystemEpoch, UninitializedCell};
+pub use cell::{NodeEpoch, PerNodeOnceCell, UninitializedCell};
 pub use compiled::{ModelStructDescriptor, StructProperty};
 
 use ankurah_proto::{ModelId, SystemModel};
@@ -58,7 +58,7 @@ pub fn is_reserved_model(model: &ModelId) -> bool { matches!(model, ModelId::Sys
 
 pub fn system_model_id(label: &str) -> Option<ModelId> {
     let model = match label {
-        crate::system::SYSTEM_COLLECTION_ID => SystemModel::System,
+        "_ankurah_system" => SystemModel::System,
         MODEL_COLLECTION_ID => SystemModel::Model,
         PROPERTY_COLLECTION_ID => SystemModel::Property,
         MODEL_PROPERTY_COLLECTION_ID => SystemModel::ModelProperty,
@@ -69,7 +69,7 @@ pub fn system_model_id(label: &str) -> Option<ModelId> {
 
 pub const fn system_model_label(model: SystemModel) -> &'static str {
     match model {
-        SystemModel::System => crate::system::SYSTEM_COLLECTION_ID,
+        SystemModel::System => "_ankurah_system",
         SystemModel::Model => MODEL_COLLECTION_ID,
         SystemModel::Property => PROPERTY_COLLECTION_ID,
         SystemModel::ModelProperty => MODEL_PROPERTY_COLLECTION_ID,
@@ -83,7 +83,7 @@ mod model_mapping_tests {
     #[test]
     fn every_system_model_maps_to_the_current_storage_key_and_back() {
         let pairs = [
-            (SystemModel::System, crate::system::SYSTEM_COLLECTION_ID),
+            (SystemModel::System, "_ankurah_system"),
             (SystemModel::Model, MODEL_COLLECTION_ID),
             (SystemModel::Property, PROPERTY_COLLECTION_ID),
             (SystemModel::ModelProperty, MODEL_PROPERTY_COLLECTION_ID),

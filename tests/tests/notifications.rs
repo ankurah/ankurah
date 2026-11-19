@@ -11,7 +11,6 @@ use std::sync::Arc;
 #[tokio::test]
 async fn test_one_notification_per_change() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
     server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
@@ -70,7 +69,6 @@ async fn test_one_notification_per_change() -> Result<()> {
 #[tokio::test]
 async fn test_causal_notification_order() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
     server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
@@ -130,7 +128,6 @@ async fn test_causal_notification_order() -> Result<()> {
 #[tokio::test]
 async fn test_multi_subscriber_consistency() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
     server.wait_ready().await?;
 
     let client1 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
@@ -212,7 +209,6 @@ async fn test_multi_subscriber_consistency() -> Result<()> {
 #[tokio::test]
 async fn test_subscription_add_notification() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
     server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 

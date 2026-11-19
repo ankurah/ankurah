@@ -148,23 +148,14 @@ impl StorageTransaction for PostgresTransaction<'_> {
         let Self { engine, entities, events, lease, pending, .. } = self;
         let holds_records = !entities.is_empty() || !events.is_empty();
 
-        // The shared tables are ensured outside the commit's native
-        // transaction: DDL inside it would land only with it, after the DDL
-        // lock that keeps two sessions from creating one table at once was
-        // released.
         let mut pooled;
         let native = match lease {
-            Some(lease) => {
-                if holds_records {
-                    engine.ensure_shared_tables_aside().await?;
-                }
-                NativeTransaction::Held { lease, pending }
-            }
+            Some(lease) => NativeTransaction::Held { lease, pending },
             None if !holds_records => return Ok(StorageCommitOutcome::Committed(StorageCommitResult::default())),
             None => {
                 pooled = engine.pool.get().await.map_err(|error| MutationError::General(Box::new(error)))?;
-                engine.ensure_shared_tables(&pooled).await?;
-                NativeTransaction::Begun(pooled.transaction().await.map_err(|error| MutationError::UpdateFailed(Box::new(error)))?)
+                engine.ensure_shared_tables(&mut pooled).await?;
+                NativeTransaction::Begun(reset_fenced_transaction(&mut pooled).await?)
             }
         };
 
@@ -174,22 +165,22 @@ impl StorageTransaction for PostgresTransaction<'_> {
     }
 
     async fn map_lock_and_read(&mut self, locks: &[LockName], reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> {
-        transaction_call(
-            &mut self.poisoned,
-            &mut self.last_lock,
-            locks,
-            calls::lock_and_read(&mut self.lease, &mut self.pending, &self.engine.maps, locks, reads),
-        )
+        transaction_call(&mut self.poisoned, &mut self.last_lock, locks, async {
+            if self.lease.is_none() {
+                self.engine.prepare_shared_tables().await?;
+            }
+            calls::lock_and_read(&mut self.lease, &mut self.pending, &self.engine.maps, locks, reads).await
+        })
         .await
     }
 
     async fn map_write(&mut self, writes: Vec<MapWrite>) -> Result<(), MutationError> {
-        transaction_call(
-            &mut self.poisoned,
-            &mut self.last_lock,
-            &[],
-            calls::write(&mut self.lease, &mut self.pending, &self.engine.maps, writes),
-        )
+        transaction_call(&mut self.poisoned, &mut self.last_lock, &[], async {
+            if self.lease.is_none() {
+                self.engine.prepare_shared_tables().await?;
+            }
+            calls::write(&mut self.lease, &mut self.pending, &self.engine.maps, writes).await
+        })
         .await
     }
 

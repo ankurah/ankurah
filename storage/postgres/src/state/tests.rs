@@ -393,9 +393,9 @@ async fn selection_planning_retries_only_for_newly_visible_states(engine: &Postg
     // that advances transaction IDs without changing canonical state.
     for (late_writer, publish_state) in [(false, true), (true, true), (true, false)] {
         engine.delete_all().await?;
-        let blocker = engine.pool.dedicated_connection().await?;
+        let mut blocker = engine.pool.dedicated_connection().await?;
         let inspector = engine.pool.dedicated_connection().await?;
-        engine.ensure_shared_tables(&blocker).await?;
+        engine.ensure_shared_tables(&mut blocker).await?;
         let model = ModelId::EntityId(EntityId::from_bytes([111; 32]));
         let mut entity = state(77, 1);
         entity.payload.state.memberships.insert(model);

@@ -194,6 +194,7 @@ where
                 // tests/tests/adversarial_wire.rs, and membership
                 // admissibility at BFS time is identity-02's.
                 let event = answering_event(peer_events, event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))?;
+                let _operation = self.node.lifecycle.admit()?;
                 let mut transaction = self.node.storage.transaction();
                 transaction.add_events(std::slice::from_ref(&event)).await?;
                 transaction.commit().await?.committed()?;

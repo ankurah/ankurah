@@ -72,7 +72,7 @@ async fn armed_child_pg_node(crash: CrashPoint) -> Result<(Node<PgCrashEngine, P
     let engine = Arc::new(CrashStorageEngine::new(pg, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     ankurah_tests::catalog_forge::plant(engine.as_ref(), album_forge()).await?;
-    node.system.create().await?;
+    node.wait_ready().await?;
     seed_album_catalog(&node)?;
     node.wait_ready().await?;
     engine.arm();

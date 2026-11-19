@@ -135,7 +135,7 @@ impl Query {
 
     pub async fn states(self, engine: &Postgres) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let mut client = engine.pool.get().await.map_err(RetrievalError::storage)?;
-        engine.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        engine.ensure_shared_tables(&mut client).await.map_err(RetrievalError::storage)?;
         let snapshot = read_snapshot(&mut client).await?;
         self.states_in(&snapshot).await
     }

@@ -62,10 +62,15 @@ impl SledModelStore {
     pub(crate) async fn fetch_states(
         &self,
         selection: &ankql::ast::Selection<Resolved>,
+        reset: tokio::sync::OwnedRwLockReadGuard<()>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let inner = self.0.clone();
         let selection = selection.clone();
-        Ok(task::spawn_blocking(move || inner.fetch_states_blocking(selection)).await??)
+        Ok(task::spawn_blocking(move || {
+            let _reset = reset;
+            inner.fetch_states_blocking(selection)
+        })
+        .await??)
     }
 }
 

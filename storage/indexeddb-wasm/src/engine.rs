@@ -368,6 +368,7 @@ impl StorageEngine for IndexedDBStorageEngine {
     fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { *self.resolver.write().unwrap() = Some(resolver); }
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
+        let _reset = self.db.hold_reset().await;
         self.materializations.clear();
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {

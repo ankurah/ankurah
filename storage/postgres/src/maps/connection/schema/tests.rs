@@ -45,8 +45,8 @@ async fn an_entry_of_a_few_kilobytes_stays_in_the_table() -> anyhow::Result<()> 
 #[tokio::test]
 async fn no_statement_reads_the_table_whole_to_find_a_maps_entries() -> anyhow::Result<()> {
     let server = Server::start().await?;
-    let client = connect(&server).await?;
-    create_table(&client).await?;
+    let mut client = connect(&server).await?;
+    create_table(&mut client).await?;
     fill(&client).await?;
 
     // Clearing a map reads all its entries, which for the large map is

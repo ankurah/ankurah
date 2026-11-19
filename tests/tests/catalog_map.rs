@@ -39,7 +39,7 @@ async fn connected_pair(
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
+    client.wait_ready().await?;
     Ok((server, client, conn))
 }
 
@@ -100,7 +100,6 @@ async fn durable_map_resolves_after_reconstruction() -> anyhow::Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let model_id = {
         let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-        node.system.create().await?;
         node.wait_ready().await?;
         let model_id = node.context_async(DEFAULT_CONTEXT).await.unwrap().resolve_model_id::<Album>().await?;
         wait_resolve(&node, "album", "name").await.expect("catalog should resolve the registered model");
@@ -145,7 +144,6 @@ async fn an_answered_ephemeral_carries_the_catalog_it_never_registered() -> anyh
 
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     client.wait_ready().await?;
 
     assert_eq!(client.catalog.model_id_for("album").unwrap(), Some(model), "an answered catalog carries what the durable holds");
@@ -208,12 +206,9 @@ async fn catalog_projection_does_not_retain_node() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn uninitialized_durable_does_not_retain_catalog_manager() -> anyhow::Result<()> {
+async fn starting_durable_does_not_retain_catalog_manager() -> anyhow::Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-    tokio::time::timeout(Duration::from_secs(1), node.system.wait_loaded()).await.expect("empty durable storage must finish loading")?;
-    assert!(!node.system.is_system_ready());
-    assert!(node.system.root().is_none());
 
     let weak = node.weak();
     drop(node);

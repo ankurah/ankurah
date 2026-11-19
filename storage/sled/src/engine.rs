@@ -22,6 +22,8 @@ use crate::{
 
 mod maps;
 mod query;
+#[cfg(test)]
+mod reset_tests;
 pub(crate) mod state;
 mod transaction;
 use maps::MapLocks;
@@ -144,14 +146,17 @@ impl StorageEngine for SledStorageEngine {
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let selection = ankql::selection::deterministic_order(selection);
         let plan = ankurah_storage_common::materialization_plan::MaterializationPlan::new(&selection);
+        // Queries can open materialization trees or create/backfill indexes.
+        // Their native workers keep this stable gate across database resets.
+        let reset = self.map_locks.share_reset().await;
         if let Some((model, selection)) = plan.indexed_materialization() {
             return match self.materialization(&model)? {
-                Some(materialization) => materialization.fetch_states(&selection).await,
+                Some(materialization) => materialization.fetch_states(&selection, reset).await,
                 None => Ok(Vec::new()),
             };
         }
         let database = self.database.lock().unwrap().clone();
-        query::fetch(database, selection.into_owned()).await
+        query::fetch(database, selection.into_owned(), reset).await
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {

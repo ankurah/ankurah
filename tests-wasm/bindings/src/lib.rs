@@ -67,7 +67,7 @@ pub async fn create_test_context(db_name: &str) -> Result<Context, JsValue> {
 
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
 
-    node.system.create().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+    node.wait_ready().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     node.context_async(DEFAULT_CONTEXT).await.map_err(|e| JsValue::from_str(&e.to_string()))
 }

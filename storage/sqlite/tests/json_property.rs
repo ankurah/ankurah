@@ -71,7 +71,7 @@ pub struct Track {
 async fn test_json_property_storage_and_simple_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create a track with JSON licensing data
@@ -117,7 +117,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
 
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create tracks with different licensing territories
@@ -161,7 +161,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
 async fn test_json_path_query_numeric_comparison() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     {
@@ -192,7 +192,7 @@ async fn test_json_path_query_numeric_comparison() -> Result<()> {
 async fn test_json_path_nested_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     {
@@ -233,7 +233,7 @@ async fn test_json_path_nested_query() -> Result<()> {
 async fn test_json_path_combined_with_regular_field() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     {
@@ -257,7 +257,7 @@ async fn test_json_path_combined_with_regular_field() -> Result<()> {
 async fn test_json_path_query_with_or() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     {
@@ -284,7 +284,7 @@ async fn test_json_path_query_with_or() -> Result<()> {
 async fn test_json_path_query_numeric_ordering() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     {

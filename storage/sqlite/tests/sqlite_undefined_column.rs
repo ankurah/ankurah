@@ -26,7 +26,7 @@ pub struct Task {
 async fn test_undefined_column_in_where() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Query for tasks with status filter - but no tasks exist yet, so the column doesn't exist
@@ -42,7 +42,7 @@ async fn test_undefined_column_in_where() -> Result<()> {
 async fn test_undefined_column_in_order_by() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Query with ORDER BY on a column that doesn't exist yet
@@ -57,7 +57,7 @@ async fn test_undefined_column_in_order_by() -> Result<()> {
 async fn test_undefined_columns_where_and_order_by() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Both "status" (WHERE) and "created" (ORDER BY) don't exist
@@ -73,7 +73,7 @@ async fn test_undefined_columns_where_and_order_by() -> Result<()> {
 async fn test_columns_exist_after_write() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // First, create a task - this should create the columns
@@ -95,7 +95,7 @@ async fn test_columns_exist_after_write() -> Result<()> {
 async fn test_cache_refresh_after_column_creation() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Query before any data - columns don't exist, should get empty results

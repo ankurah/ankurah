@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 
 use crate::error::SqliteError;
 
@@ -15,14 +15,16 @@ pub struct SqliteConnectionManager {
     path: PathBuf,
     /// Each connection also holds the directory, because it can outlive its manager.
     directory: Option<Arc<TempDir>>,
+    /// Shared by native calls, exclusive to a reset across every connection.
+    reset: Arc<RwLock<()>>,
 }
 
 impl SqliteConnectionManager {
-    pub fn file(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), directory: None } }
+    pub fn file(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), directory: None, reset: Arc::default() } }
 
     /// A manager for a new database file in `directory`.
     pub(crate) fn temporary(directory: TempDir) -> Self {
-        Self { path: directory.path().join("ankurah.sqlite"), directory: Some(Arc::new(directory)) }
+        Self { path: directory.path().join("ankurah.sqlite"), directory: Some(Arc::new(directory)), reset: Arc::default() }
     }
 
     fn create_connection(&self) -> Result<PooledConnection, SqliteError> {
@@ -40,7 +42,7 @@ impl SqliteConnectionManager {
         crate::id_bytes::register(&conn)?;
         crate::order_keys::register(&conn)?;
 
-        Ok(PooledConnection::new(conn, self.directory.clone()))
+        Ok(PooledConnection::new(conn, self.directory.clone(), self.reset.clone()))
     }
 }
 
@@ -59,12 +61,35 @@ struct OpenConnection {
 /// runtime's blocking threads.
 pub struct PooledConnection {
     inner: Arc<Mutex<OpenConnection>>,
+    reset: Arc<RwLock<()>>,
+    /// A map writer keeps this between calls, including cancellation cleanup.
+    reset_guard: Option<Arc<OwnedRwLockReadGuard<()>>>,
 }
 
 impl PooledConnection {
     /// Wrap `conn` and the temporary directory of its database, if it has one.
-    fn new(conn: Connection, directory: Option<Arc<TempDir>>) -> Self {
-        Self { inner: Arc::new(Mutex::new(OpenConnection { connection: conn, _directory: directory })) }
+    fn new(conn: Connection, directory: Option<Arc<TempDir>>, reset: Arc<RwLock<()>>) -> Self {
+        Self { inner: Arc::new(Mutex::new(OpenConnection { connection: conn, _directory: directory })), reset, reset_guard: None }
+    }
+
+    /// Keep reset protection across an entire native writer transaction.
+    pub(crate) async fn hold_reset(&mut self) { self.reset_guard = Some(Arc::new(self.reset.clone().read_owned().await)); }
+
+    pub(crate) fn release_reset(&mut self) { self.reset_guard = None; }
+
+    /// Drain native calls on all connections, then run the reset exclusively.
+    /// The blocking closure owns the guard even if its caller is cancelled.
+    pub(crate) async fn reset<F, T>(&self, f: F) -> Result<T, SqliteError>
+    where
+        F: FnOnce(&mut Connection) -> Result<T, SqliteError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let reset = self.reset.clone().write_owned().await;
+        self.run_protected(move |connection| {
+            let _reset = reset;
+            f(connection)
+        })
+        .await
     }
 
     /// Execute a function with the connection, as [`run`](Self::run) runs it.
@@ -98,13 +123,29 @@ impl PooledConnection {
         F: FnOnce(&mut Connection) -> Result<T, SqliteError> + Send + 'static,
         T: Send + 'static,
     {
+        let reset = match &self.reset_guard {
+            Some(held) => held.clone(),
+            None => Arc::new(self.reset.clone().read_owned().await),
+        };
+        self.run_protected(move |connection| {
+            let _reset = reset;
+            f(connection)
+        })
+        .await
+    }
+
+    async fn run_protected<F, T>(&self, f: F) -> Result<T, SqliteError>
+    where
+        F: FnOnce(&mut Connection) -> Result<T, SqliteError> + Send + 'static,
+        T: Send + 'static,
+    {
         let mut guard = self.inner.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || f(&mut guard.connection)).await.map_err(|e| SqliteError::TaskJoin(e.to_string()))?
     }
 }
 
 impl Clone for PooledConnection {
-    fn clone(&self) -> Self { Self { inner: self.inner.clone() } }
+    fn clone(&self) -> Self { Self { inner: self.inner.clone(), reset: self.reset.clone(), reset_guard: self.reset_guard.clone() } }
 }
 
 impl bb8::ManageConnection for SqliteConnectionManager {
@@ -113,7 +154,15 @@ impl bb8::ManageConnection for SqliteConnectionManager {
 
     fn connect(&self) -> impl std::future::Future<Output = Result<Self::Connection, Self::Error>> + Send {
         let manager = self.clone();
-        async move { tokio::task::spawn_blocking(move || manager.create_connection()).await.map_err(|e| SqliteError::TaskJoin(e.to_string()))? }
+        async move {
+            let reset = manager.reset.clone().read_owned().await;
+            tokio::task::spawn_blocking(move || {
+                let _reset = reset;
+                manager.create_connection()
+            })
+            .await
+            .map_err(|e| SqliteError::TaskJoin(e.to_string()))?
+        }
     }
 
     #[allow(refining_impl_trait)]
@@ -145,7 +194,7 @@ mod tests {
         let (occupied, free) = (one_blocking_thread()?, one_blocking_thread()?);
 
         free.block_on(async {
-            let connection = PooledConnection::new(Connection::open_in_memory()?, None);
+            let connection = PooledConnection::new(Connection::open_in_memory()?, None, Arc::default());
             connection
                 .with_connection(|connection| Ok(connection.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1)")?))
                 .await?;

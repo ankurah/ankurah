@@ -39,7 +39,7 @@ async fn run<T: Send + 'static>(
         None => {
             let turn = Arc::clone(&maps.turn).lock_owned().await;
             let mut leased = maps.lease().await?;
-            leased.hold(turn);
+            leased.hold(turn).await;
             lease.insert(leased)
         }
     };

@@ -87,12 +87,12 @@
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create server and client nodes
 //!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
-//!     server.system.create().await?;
+//!     server.wait_ready().await?;
 //!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
 //!
 //!     // Connect nodes using local process connection
 //!     let _conn = LocalProcessConnection::new(&server, &client).await?;
-//!     client.system.wait_system_ready().await; // Wait for the client to join the server "system"
+//!     client.wait_ready().await; // Wait for the client to join the server "system"
 //!
 //!     // Get contexts for the server and client
 //!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT)?;

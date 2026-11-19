@@ -101,7 +101,7 @@ fn bench_single_writer_commit(c: &mut Criterion) {
         b.iter_custom(|iters| {
             rt.block_on(async move {
                 let node = durable();
-                node.system.create().await.unwrap();
+                node.wait_ready().await.unwrap();
                 let ctx = node.context_async(CTX).await.unwrap();
 
                 // Seed one entity to edit repeatedly.
@@ -150,10 +150,10 @@ fn bench_commit_to_subscriber_latency(c: &mut Criterion) {
         b.iter_custom(|iters| {
             rt.block_on(async move {
                 let server = durable();
-                server.system.create().await.unwrap();
+                server.wait_ready().await.unwrap();
                 let client = ephemeral();
                 let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                client.system.wait_system_ready().await.unwrap();
+                client.wait_ready().await.unwrap();
 
                 let server_ctx = server.context_async(CTX).await.unwrap();
                 let client_ctx = client.context_async(CTX).await.unwrap();
@@ -252,7 +252,7 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
                     for _ in 0..iters {
                         // --- Setup (excluded): server with a depth-deep chain. ---
                         let server = durable();
-                        server.system.create().await.unwrap();
+                        server.wait_ready().await.unwrap();
                         let server_ctx = server.context_async(CTX).await.unwrap();
                         let doc = {
                             let trx = server_ctx.begin();
@@ -271,7 +271,7 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
                         // Fresh client, connected but holding nothing.
                         let client = ephemeral();
                         let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        client.system.wait_system_ready().await.unwrap();
+                        client.wait_ready().await.unwrap();
                         let client_ctx = client.context_async(CTX).await.unwrap();
 
                         // --- Measured: the first fetch (StateSnapshot served). ---
@@ -333,7 +333,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         // --- Setup (excluded): entity known to the client at a
                         // soon-to-be-stale head. ---
                         let server = durable();
-                        server.system.create().await.unwrap();
+                        server.wait_ready().await.unwrap();
                         let server_ctx = server.context_async(CTX).await.unwrap();
                         let doc = {
                             let trx = server_ctx.begin();
@@ -346,7 +346,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
 
                         let client = ephemeral();
                         let conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        client.system.wait_system_ready().await.unwrap();
+                        client.wait_ready().await.unwrap();
                         let client_ctx = client.context_async(CTX).await.unwrap();
 
                         // First fetch: persists the entity locally at the current
@@ -416,7 +416,7 @@ fn bench_subscription_establishment(c: &mut Criterion) {
                     for _ in 0..iters {
                         // --- Setup (excluded): server with N resident entities. ---
                         let server = durable();
-                        server.system.create().await.unwrap();
+                        server.wait_ready().await.unwrap();
                         let server_ctx = server.context_async(CTX).await.unwrap();
                         {
                             let trx = server_ctx.begin();
@@ -428,7 +428,7 @@ fn bench_subscription_establishment(c: &mut Criterion) {
 
                         let client = ephemeral();
                         let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        client.system.wait_system_ready().await.unwrap();
+                        client.wait_ready().await.unwrap();
                         let client_ctx = client.context_async(CTX).await.unwrap();
 
                         // --- Measured: establish + initialize a broad live query. ---

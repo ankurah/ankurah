@@ -57,6 +57,9 @@ impl TransactionMaps {
     /// What the transaction's commit lands in the maps, with every lock it
     /// holds and, where there are map writes, those their landing takes.
     pub(crate) async fn landing(mut self, engine: &SledStorageEngine) -> MapLanding {
+        // Even an entity/event-only commit may outlive its awaiter once
+        // dispatched to a blocking thread. Reset waits for that work too.
+        self.share_reset(engine).await;
         let changes = self.pending.take();
         let landing_locks = match changes.is_empty() {
             true => None,

@@ -8,14 +8,6 @@ use crate::{policy::PolicyAgent, storage::StorageEngine, Node, NodeState};
 pub enum PeerConnectionError {
     #[error("{0}")]
     Protocol(#[from] proto::PresenceRejection),
-    #[error("peer belongs to a different system (current {current}, offered {offered})")]
-    SystemMismatch { current: proto::EntityId, offered: proto::EntityId },
-    #[error("durable peer did not advertise a system")]
-    MissingSystem,
-    #[error("invalid system: {0}")]
-    InvalidSystem(String),
-    #[error("failed to wipe local storage for system replacement: {0}")]
-    SystemReset(String),
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
     #[error("peer did not prove that it holds the key of its presence")]
@@ -61,7 +53,7 @@ pub trait NodeComms: Send + Sync {
     /// The node's id, or `None` while the node is unkeyed.
     fn id(&self) -> Option<proto::NodeId>;
     /// A signed presence for the peer's `challenge`, using this node's `side` of the connection.
-    /// The node waits for its keypair, and for system storage to load so its presence includes any stored system root.
+    /// The node waits for its keypair; catalog readiness is independent of authentication.
     async fn presence(
         &self,
         side: proto::ConnectionSide,

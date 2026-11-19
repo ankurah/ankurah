@@ -13,7 +13,7 @@ use std::{
 use tokio_postgres::{types::ToSql, GenericClient};
 use tracing::{debug, error, info, warn};
 
-use super::{acquire_ddl_lock, error_kind, release_ddl_lock, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES};
+use super::{acquire_ddl_lock, error_kind, reset_fenced_transaction, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES};
 use crate::value::PGValue;
 
 #[derive(Clone, Debug)]
@@ -117,13 +117,13 @@ impl Materialization {
             property_columns: Arc::new(RwLock::new(BTreeMap::new())),
         };
 
-        let lock_key = acquire_ddl_lock(&client, bucket.table()).await?;
+        let transaction = reset_fenced_transaction(&mut client).await?;
+        let client = transaction.client();
+        acquire_ddl_lock(&transaction, bucket.table()).await?;
         let result = async {
-            bucket.create_materialization_table(&mut client).await?;
-            let map_lock = acquire_ddl_lock(&client, COLUMN_MAP_TABLE).await?;
-            let map_result = bucket.create_column_map_table(&client).await;
-            release_ddl_lock(&client, map_lock).await?;
-            map_result?;
+            bucket.create_materialization_table(client).await?;
+            acquire_ddl_lock(&transaction, COLUMN_MAP_TABLE).await?;
+            bucket.create_column_map_table(client).await?;
 
             let id_pin_key = property_key_text(&PropertyId::Id);
             client
@@ -137,13 +137,13 @@ impl Materialization {
                 )
                 .await
                 .map_err(|error| StateError::DDLError(Box::new(error)))?;
-            bucket.rebuild_columns_cache(&mut client).await?;
+            bucket.rebuild_columns_cache(client).await?;
             bucket.load_column_map(&client).await?;
             Ok::<_, StateError>(())
         }
         .await;
-        release_ddl_lock(&client, lock_key).await?;
         result.map_err(RetrievalError::storage)?;
+        transaction.commit().await.map_err(RetrievalError::storage)?;
         Ok(bucket)
     }
 
@@ -296,8 +296,9 @@ impl Materialization {
                 }
             };
 
-            let client = self.pool.get().await.map_err(|error| MutationError::General(error.into()))?;
-            let inserted = client
+            let mut client = self.pool.get().await.map_err(|error| MutationError::General(error.into()))?;
+            let transaction = reset_fenced_transaction(&mut client).await?;
+            let inserted = transaction
                 .execute(
                     r#"INSERT INTO "_ankurah_postgres_column_map" ("model_key", "property_key", "column_name") VALUES ($1, $2, $3)
                        ON CONFLICT ("model_key", "property_key") DO NOTHING"#,
@@ -308,7 +309,7 @@ impl Materialization {
                 Ok(_) => {
                     // Read back the winner: covers both "we inserted" and "a
                     // concurrent writer beat us on the same property key".
-                    let row = client
+                    let row = transaction
                         .query_one(
                             r#"SELECT "column_name" FROM "_ankurah_postgres_column_map" WHERE "model_key" = $1 AND "property_key" = $2"#,
                             &[&self.model_key, &property_key],
@@ -316,10 +317,12 @@ impl Materialization {
                         .await
                         .map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
                     let winner: String = row.get(0);
+                    transaction.commit().await.map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
                     self.property_columns.write().unwrap().insert(property_id.clone(), winner.clone());
                     return Ok(winner);
                 }
                 Err(err) if error_kind(&err) == ErrorKind::UniqueViolation => {
+                    transaction.rollback().await.map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
                     // An assignment already owns this column name durably.
                     // Refresh the taken-set either way.
                     self.load_column_map(&client).await.map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
@@ -366,7 +369,7 @@ impl Materialization {
     }
 
     /// Rebuild the cache of columns in the table.
-    pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
+    pub async fn rebuild_columns_cache(&self, client: &tokio_postgres::Client) -> Result<(), StateError> {
         debug!("Materialization({}).rebuild_columns_cache", self.materialization_table_name);
         let column_query =
             r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_catalog = $1 AND table_name = $2;"#
@@ -408,7 +411,7 @@ impl Materialization {
     /// Create this model's projection table. Canonical state is stored only in
     /// [`super::ENTITY_TABLE`]; materializations contain the entity id and projected
     /// property columns used for model-scoped querying.
-    pub async fn create_materialization_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
+    pub async fn create_materialization_table(&self, client: &tokio_postgres::Client) -> Result<(), StateError> {
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"(
                 "id" character(43) PRIMARY KEY
@@ -438,7 +441,7 @@ impl Materialization {
 
     pub async fn add_missing_columns(
         &self,
-        client: &mut tokio_postgres::Client,
+        pooled: &mut tokio_postgres::Client,
         missing: Vec<(String, &'static str)>, // column name, datatype
     ) -> Result<(), StateError> {
         if missing.is_empty() {
@@ -446,7 +449,9 @@ impl Materialization {
         }
 
         // Serialize DDL operations for this materialization.
-        let lock_key = acquire_ddl_lock(client, self.materialization_table_name.as_str()).await?;
+        let transaction = reset_fenced_transaction(pooled).await?;
+        let client = transaction.client();
+        acquire_ddl_lock(&transaction, self.materialization_table_name.as_str()).await?;
 
         let result = async {
             // Re-check columns after acquiring lock (another session may have added them)
@@ -465,22 +470,19 @@ impl Materialization {
                             } else {
                                 warn!("Error adding column {} to table {}: {:?}", column, self.table(), err);
                             }
-                            self.rebuild_columns_cache(client).await?;
                             return Err(StateError::DDLError(Box::new(err)));
                         }
                     }
                 }
             }
 
-            self.rebuild_columns_cache(client).await?;
             Ok(())
         }
         .await;
 
-        // Always release the lock
-        release_ddl_lock(client, lock_key).await?;
-
-        result
+        result?;
+        transaction.commit().await.map_err(|error| StateError::DDLError(Box::new(error)))?;
+        self.rebuild_columns_cache(pooled).await
     }
 }
 

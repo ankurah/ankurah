@@ -130,7 +130,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         if !self.durable {
             return Err(MutationError::NotDurable.into());
         }
-        self.system.check_not_halted()?;
+        self.lifecycle.check_not_halted()?;
         let sessions = sessions.into();
         self.sessions.attach(&sessions);
         let progress = Arc::new(Progress {
@@ -149,7 +149,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
             let _session_watch = session_watch;
             let stopped = || {
                 weak.upgrade()
-                    .and_then(|node| node.system.check_not_halted().err())
+                    .and_then(|node| node.lifecycle.check_not_halted().err())
                     .map(RetrievalError::from)
                     .unwrap_or_else(|| NodeDropped.into())
             };

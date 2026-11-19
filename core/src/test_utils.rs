@@ -28,6 +28,8 @@ pub(crate) struct TestStorage {
     pub hold_fetch: Mutex<BTreeMap<ModelId, Pause>>,
     pub hold_set_state: Mutex<Option<Pause>>,
     pub hold_commit: Mutex<Option<Pause>>,
+    pub hold_reset: Mutex<Option<Pause>>,
+    pub fail_reset: AtomicBool,
     pub hold_after_commit: Mutex<Option<Pause>>,
     /// Pause a canonical-state snapshot after capturing its read boundary.
     pub hold_state_snapshot: Mutex<Option<Pause>>,
@@ -362,6 +364,14 @@ impl StorageEngine for TestStorage {
     /// Counting the reset fails the later map calls and the commit of every
     /// transaction that made map calls before it.
     async fn delete_all(&self) -> Result<bool, MutationError> {
+        let hold = self.hold_reset.lock().unwrap().take();
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            release.await.unwrap();
+        }
+        if self.fail_reset.swap(false, Ordering::SeqCst) {
+            return Err(MutationError::WriteConflict);
+        }
         let mut data = self.data.lock().unwrap();
         *data = TestData { resets: data.resets + 1, ..TestData::default() };
         Ok(true)
@@ -393,12 +403,7 @@ where
     PA: crate::policy::PolicyAgent,
 {
     let challenge = ankurah_proto::Challenge::random();
-    let presence = ankurah_proto::Presence {
-        key: key.public_key(),
-        durable,
-        system_root: if durable { node.system.root() } else { None },
-        protocol_version: ankurah_proto::PROTOCOL_VERSION,
-    };
+    let presence = ankurah_proto::Presence { key: key.public_key(), durable, protocol_version: ankurah_proto::PROTOCOL_VERSION };
     Ok(node
         .register_peer(
             ankurah_proto::ConnectionSide::Accepting,

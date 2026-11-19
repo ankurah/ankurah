@@ -27,7 +27,6 @@ async fn fixture_with_key(
     key: &NodeKey,
 ) -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, mpsc::Receiver<proto::NodeMessage>)> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let (sent, messages) = mpsc::channel();
     let peer = connect_peer(&node, key, false, Sender(sent)).await?;
@@ -436,7 +435,6 @@ impl PeerSender for Forward {
 async fn dropping_a_query_during_comparison_never_reinstalls_its_remote_subscription() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
     let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    server.system.create().await?;
     server.wait_ready().await?;
     let client = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let gate = Arc::new(QueryGate::default());

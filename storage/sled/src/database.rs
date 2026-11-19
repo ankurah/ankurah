@@ -94,6 +94,7 @@ impl Database {
     }
 
     /// Open an existing materialization without creating a tree for an unknown model.
+    /// Callers hold the engine's reset permit across the existence check and open.
     pub(crate) fn materialization(&self, model: &ModelId) -> Result<Option<sled::Tree>, RetrievalError> {
         let name = model_tree_name(model);
         if !self.db.tree_names().iter().any(|existing| existing.as_ref() == name.as_bytes()) {

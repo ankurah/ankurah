@@ -458,7 +458,6 @@ pub fn years(query: &LiveQuery<AlbumView>) -> Vec<String> { query.peek().iter().
 #[allow(unused)]
 pub async fn durable_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAgent>, anyhow::Error> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     Ok(node)
 }
@@ -634,7 +633,6 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     // Create and initialize server node
     let server_storage = Arc::new(SledStorageEngine::new_test()?);
     let server_node = Node::new_durable(server_storage, PermissiveAgent::new());
-    server_node.system.create().await?;
     server_node.wait_ready().await?;
 
     let mut rng = rand::thread_rng();
@@ -710,6 +708,6 @@ where
     SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
     PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
 {
-    let epoch = node.system.system_epoch().expect("a ready system");
+    let epoch = node.epoch();
     schema.field_by_name(name).expect("a compiled field").resolved.get(epoch).expect("field resolved under the current epoch")
 }

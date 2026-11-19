@@ -10,7 +10,7 @@ use crate::common::TestWatcher;
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await?;
 
     // Create some initial entities
@@ -70,7 +70,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create a new node
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await?;
 
     let watcher = TestWatcher::changeset();
@@ -155,7 +155,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
 #[tokio::test]
 async fn resultset_vs_livequery_signal_semantics() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await?;
 
     // Create initial entities

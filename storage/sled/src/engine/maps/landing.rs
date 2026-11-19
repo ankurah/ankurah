@@ -116,20 +116,21 @@ mod tests {
         Ok(())
     }
 
-    /// A commit of a transaction that made no map call takes neither the turn
-    /// to land nor the reset lock: it lands while another commit holds the
-    /// turn and a reset holds the maps.
+    /// Entity-only commits share reset protection but take no map landing turn.
     #[tokio::test]
-    async fn a_commit_without_map_calls_takes_neither_the_turn_to_land_nor_the_reset_lock() -> anyhow::Result<()> {
+    async fn a_commit_without_map_calls_waits_for_reset_but_not_the_map_landing_turn() -> anyhow::Result<()> {
         let engine = SledStorageEngine::new_test()?;
         let (state, event) = entity!(1);
         let _turn = engine.map_locks.land_under(&[]).await;
-        let _reset = engine.map_locks.hold_reset().await;
+        let reset = engine.map_locks.hold_reset().await;
 
         let mut trx = engine.transaction();
         trx.add_events(&[event]).await?;
         trx.set_state(&Clock::default(), &state).await?;
-        timeout(HANG, trx.commit()).await??.committed()?;
+        let mut commit = pin!(trx.commit());
+        assert!(commit.as_mut().now_or_never().is_none(), "the commit waits for reset");
+        drop(reset);
+        timeout(HANG, commit).await??.committed()?;
         Ok(())
     }
 }

@@ -5,7 +5,7 @@ use super::{
 use crate::{
     error::{MutationError, RetrievalError},
     retrieval::{GetEvents, GetState},
-    schema::SystemEpoch,
+    schema::NodeEpoch,
 };
 use ankurah_proto::{EntityId, State};
 use std::{
@@ -18,7 +18,7 @@ use std::{
 pub(super) struct Registration(WeakEntitySet);
 
 impl Registration {
-    pub(super) fn system_epoch(&self) -> SystemEpoch { self.0.system_epoch }
+    pub(super) fn node_epoch(&self) -> NodeEpoch { self.0.node_epoch }
 }
 
 /// The node's resident entities: at most one live `EntityInner` per entity ID.
@@ -29,17 +29,17 @@ impl Registration {
 ///
 /// Only committed state enters: `get_or_retrieve` and `with_state` load entities from storage or a
 /// peer's answer, and `publish_new` registers a creation once its storage transaction commits.
-/// Pending creations stay outside. Every resident entity takes the set's system epoch.
+/// Pending creations stay outside. Every resident entity takes the set's node epoch.
 #[derive(Clone)]
 pub struct WeakEntitySet {
     entities: Arc<RwLock<BTreeMap<EntityId, Weak<EntityInner>>>>,
-    system_epoch: SystemEpoch,
+    node_epoch: NodeEpoch,
 }
 
 impl WeakEntitySet {
-    pub(crate) fn new(system_epoch: SystemEpoch) -> Self { Self { entities: Arc::new(RwLock::new(BTreeMap::new())), system_epoch } }
+    pub(crate) fn new(node_epoch: NodeEpoch) -> Self { Self { entities: Arc::new(RwLock::new(BTreeMap::new())), node_epoch } }
 
-    pub(crate) fn system_epoch(&self) -> SystemEpoch { self.system_epoch }
+    pub(crate) fn node_epoch(&self) -> NodeEpoch { self.node_epoch }
 
     pub fn get(&self, id: &EntityId) -> Option<Entity> { self.entities.read().unwrap().get(id)?.upgrade().map(Entity::from_resident) }
 
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn resident_and_temporary_values_preserve_property_ids_and_missing_values() -> anyhow::Result<()> {
-        let entities = WeakEntitySet::new(SystemEpoch::allocate());
+        let entities = WeakEntitySet::new(NodeEpoch::allocate());
         let state = EntityState::empty();
         let backend = state.get_backend::<LWWBackend>()?;
         let expected = BTreeMap::from([
@@ -158,14 +158,14 @@ mod tests {
 
     #[test]
     fn forks_retain_their_resident_and_nodes_keep_independent_instances() -> anyhow::Result<()> {
-        let original = WeakEntitySet::new(SystemEpoch::allocate());
-        let replacement = WeakEntitySet::new(SystemEpoch::allocate());
+        let original = WeakEntitySet::new(NodeEpoch::allocate());
+        let replacement = WeakEntitySet::new(NodeEpoch::allocate());
         let id = EntityId::from_bytes([1; 32]);
         let state = State { head: Clock::genesis(EventId::from_bytes([2; 32])), ..State::default() };
         let resident = Entity::from_resident(original.get_or_insert_state(id, &state)?.1);
         let fresh = Entity::from_resident(replacement.get_or_insert_state(id, &state)?.1);
         assert_ne!(resident, fresh);
-        assert_ne!(resident.system_epoch(), fresh.system_epoch());
+        assert_ne!(resident.node_epoch(), fresh.node_epoch());
         let fork = LocalTrxEntity::edit(&resident, AuthorId::Unknown, Arc::new(AtomicBool::new(true)))?;
         drop(resident);
         assert!(original.get(&id).is_some());

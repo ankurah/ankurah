@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bb8_postgres::PostgresConnectionManager;
-use futures_util::{FutureExt, TryFutureExt};
+use futures_util::FutureExt;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::error::Severity;
 use tokio_postgres::NoTls;
@@ -173,16 +173,13 @@ impl Pool {
     }
 
     /// A new connection, its session's lock timeout set and its statements
-    /// prepared, in one round trip after connecting, and after creating the
-    /// maps' table if this is the pool's first.
+    /// prepared after creating the maps' table if this is the pool's first.
     async fn connect(&self) -> Result<Connection, MapError> {
-        let client = self.engine.dedicated_connection().await.map_err(MapError::database)?;
-        self.table.get_or_try_init(|| schema::create_table(&client)).await.map_err(MapError::Table)?;
-
+        let mut client = self.engine.dedicated_connection().await.map_err(MapError::database)?;
         let lock_timeout = format!("SET lock_timeout = {}", setting_millis(self.settings.lock_timeout));
-        let set = client.batch_execute(&lock_timeout).map_err(MapError::database);
-        let prepared = Statements::prepare(&client).map_err(MapError::database);
-        let ((), statements) = futures_util::try_join!(set, prepared)?;
+        client.batch_execute(&lock_timeout).await.map_err(MapError::database)?;
+        self.table.get_or_try_init(|| schema::create_table(&mut client)).await.map_err(MapError::Table)?;
+        let statements = Statements::prepare(&client).await.map_err(MapError::database)?;
 
         Ok(Connection { client, statements })
     }

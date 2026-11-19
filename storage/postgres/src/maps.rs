@@ -28,7 +28,7 @@ mod error;
 mod request;
 mod snapshot;
 
-pub(crate) use connection::schema::reset;
+pub(crate) use connection::schema::{reset, share_reset_lock};
 pub use connection::MapSettings;
 pub(crate) use connection::{Lease, Pool};
 pub use error::MapError;

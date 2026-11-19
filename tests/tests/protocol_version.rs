@@ -30,7 +30,7 @@ impl PeerSender for NullSender {
 /// A presence with a zeroed signature for tests that reject malformed messages or incompatible protocol versions.
 fn unsigned_presence(durable: bool, protocol_version: u32) -> proto::SignedPresence {
     proto::SignedPresence {
-        presence: proto::Presence { key: proto::PublicKey::Ed25519([7; 32]), durable, system_root: None, protocol_version },
+        presence: proto::Presence { key: proto::PublicKey::Ed25519([7; 32]), durable, protocol_version },
         signature: proto::Signature::Ed25519 { r: [0; 32], s: [0; 32] },
     }
 }

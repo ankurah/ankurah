@@ -99,6 +99,8 @@ fn load(database: &Database, id: EntityId) -> Result<Option<Attested<EntityState
 /// between reads invalidates the attempt; callers discard its provisional work.
 pub(super) struct SledStateSnapshot {
     database: Arc<Database>,
+    /// Kept as a handle only; each refill holds a permit through its native work.
+    reset: Arc<tokio::sync::RwLock<()>>,
     target: CounterCursor,
     after: Vec<u8>,
     exhausted: bool,
@@ -123,6 +125,7 @@ impl SledStateSnapshot {
                 (None, None)
             }
         };
+        let reset = engine.map_locks.reset_lock();
         let database = engine.database.lock().unwrap().clone();
         let mut snapshot = tokio::task::spawn_blocking(move || {
             let guard = database.index_manager.mutation_lock.lock().unwrap();
@@ -139,7 +142,7 @@ impl SledStateSnapshot {
                 },
             );
             drop(guard);
-            Ok::<_, RetrievalError>(Self { database, target, after, exhausted: false, selected: None, selection })
+            Ok::<_, RetrievalError>(Self { database, reset, target, after, exhausted: false, selected: None, selection })
         })
         .await??;
         if let StateScan::Selection(selection) = scan {
@@ -192,8 +195,9 @@ impl StateSnapshot for SledStateSnapshot {
         let mut selection =
             self.selection.clone().ok_or_else(|| RetrievalError::InvalidState("snapshot has no prepared selection".into()))?;
         selection.limit = Some(limit.get() as u64);
+        let reset = self.reset.clone().read_owned().await;
         self.validate().await?;
-        let result = super::query::fetch_after(self.database.clone(), selection, boundary).await;
+        let result = super::query::fetch_after(self.database.clone(), selection, boundary, reset).await;
         self.validate().await?;
         result
     }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[tokio::test]
 async fn basic_where_clause() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let client = node.context_async(c).await?;
 
     let _id = {
@@ -50,7 +50,7 @@ async fn basic_where_clause() -> Result<()> {
 #[tokio::test]
 async fn test_where_clause_with_id() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await?;
 
     let album_id = {
@@ -77,7 +77,7 @@ async fn test_where_clause_with_id() -> Result<()> {
 #[tokio::test]
 async fn no_order_by_returns_ascending_entity_id_order() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let client = node.context_async(c).await?;
 
     {

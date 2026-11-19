@@ -26,12 +26,12 @@ use crate::policy::ContextPolicy;
 use crate::reactor::Reactor;
 use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter};
 use crate::schema::catalog::register::RegistrationAuth;
-use crate::system::SystemManager;
 use crate::util::safemap::SafeMap;
 use crate::util::safeset::SafeSet;
 use crate::util::Iterable;
 use crate::{action_info, notice_info};
 use itertools::Itertools;
+use lifecycle::NodeLifecycle;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 
@@ -45,6 +45,7 @@ pub(crate) mod handler;
 pub mod handles;
 mod key;
 mod key_lookup;
+mod lifecycle;
 mod match_args;
 mod peer_state;
 mod replication;
@@ -143,7 +144,7 @@ where PA: PolicyAgent
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
-    pub system: SystemManager<SE>,
+    pub(crate) lifecycle: NodeLifecycle,
 
     pub catalog: Arc<CatalogManager>,
     alive: Mut<bool>,
@@ -159,6 +160,9 @@ where PA: PolicyAgent
 impl<SE, PA> NodeInner<SE, PA>
 where PA: PolicyAgent
 {
+    /// The process-local epoch of this node's entities and descriptor bindings.
+    pub fn epoch(&self) -> NodeEpoch { self.entities.node_epoch() }
+
     /// This node's id, the public key of its keypair: `None` while the node is unkeyed.
     pub fn id(&self) -> Option<proto::NodeId> { self.keypair.with(|key| key.as_ref().map(|key| key.public_key().node_id())) }
 
@@ -172,7 +176,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn check_not_halted(&self) -> Result<(), NodeHaltReason> { self.system.check_not_halted() }
+    fn check_not_halted(&self) -> Result<(), NodeHaltReason> { self.lifecycle.check_not_halted() }
 
     fn reactor(&self) -> &Reactor { &self.reactor }
     fn live_queries(&self) -> &crate::livequery::LiveQueryRegistry { &self.live_queries }
@@ -211,17 +215,13 @@ where
         Self::build(engine, policy_agent, true, Some(key), SmallRng::from_entropy())
     }
 
-    /// Wipe local storage, the stored keypair included, when a different system is offered, so a new node can adopt it.
-    /// Disabled by default. A different system always halts this node; it never recovers in place.
-    pub fn set_allow_system_replacement(&self, allow: bool) { self.system.set_allow_system_replacement(allow); }
-
     /// Initialization and terminal halt state; independent of peer connectivity.
-    pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }
+    pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.lifecycle.state() }
 
-    /// Require completed keypair, system, catalog, and policy initialization, or return why the node is unavailable.
+    /// Require completed keypair, catalog, and policy initialization, or return why the node is unavailable.
     pub fn check_ready(&self) -> Result<(), NodeReadinessError> { self.state().value().check_ready() }
 
-    /// Wait for keypair, system, catalog, and policy initialization without retaining the node; return an error if it halts.
+    /// Wait for keypair, catalog, and policy initialization without retaining the node; return an error if it halts.
     pub fn wait_ready(&self) -> impl std::future::Future<Output = Result<(), NodeReadinessError>> + Send + 'static {
         let state = self.state();
         async move {
@@ -249,11 +249,11 @@ where
     }
 
     fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, key: Option<NodeKey>, rng: SmallRng) -> Self {
-        let entityset = WeakEntitySet::new(SystemEpoch::allocate());
+        let entityset = WeakEntitySet::new(NodeEpoch::allocate());
         let unkeyed = key.is_none();
-        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
+        let lifecycle = NodeLifecycle::new();
         let alive = Mut::new(true);
-        let state = system_manager.node_state();
+        let state = lifecycle.state();
         let run = {
             let alive = alive.read();
             let state = state.clone();
@@ -291,7 +291,7 @@ where
             reactor,
             durable,
             policy_agent,
-            system: system_manager,
+            lifecycle,
             catalog,
             alive,
             run,
@@ -314,16 +314,19 @@ where
 
         let catalog = node.catalog.clone();
         let weak_node = node.weak();
-        let system = node.system.clone();
+        let lifecycle = node.lifecycle.clone();
         let run = node.run.clone();
         let agent = node.policy_agent.clone();
         let storage = node.storage.clone();
         crate::task::spawn(async move {
             let keyed = {
+                let lifecycle = lifecycle.clone();
                 let weak_node = weak_node.clone();
                 async move {
                     if unkeyed {
+                        let _operation = lifecycle.admit()?;
                         let key = key_lookup::look_up(&*storage).await?;
+                        lifecycle.check_not_halted()?;
                         if let Some(node) = weak_node.upgrade() {
                             node.keypair.set(Some(key));
                             notice_info!("{node} has its keypair");
@@ -332,7 +335,7 @@ where
                     Ok::<_, NodeHaltReason>(())
                 }
             };
-            let initialized = futures::future::try_join3(system.wait_system_ready(), catalog.start(weak_node.clone()).err_into(), keyed);
+            let initialized = futures::future::try_join(catalog.start(weak_node.clone()).err_into(), keyed);
             let initialized = async move {
                 initialized.await?;
                 agent.start(weak_node).await.map_err(|error| NodeHaltReason::PolicyAgentStartFailed(error.to_string()))
@@ -341,8 +344,8 @@ where
                 biased;
                 _ = run.wait_value(false) => {},
                 result = initialized => match result {
-                    Ok(_) => system.mark_running(),
-                    Err(reason) => { system.halt(reason); }
+                    Ok(_) => lifecycle.mark_running(),
+                    Err(reason) => { lifecycle.halt(reason); }
                 },
             }
         });
@@ -358,30 +361,24 @@ where
     async fn wait_keypair(&self) -> Result<NodeKey, NodeHaltReason> {
         tokio::select! {
             biased;
+            reason = self.lifecycle.wait_halted() => Err(reason),
             key = self.keypair.wait_for(|key: &Option<NodeKey>| key.clone()) => Ok(key),
-            reason = self.system.wait_halted() => Err(reason),
         }
     }
 
     /// A signed presence for the peer's `challenge`, using this node's `side` of the connection.
-    /// The node waits for its keypair, and for system storage to load so its presence includes any stored system root.
+    /// The node waits for its keypair; catalog readiness is independent of authentication.
     pub async fn presence(
         &self,
         side: proto::ConnectionSide,
         challenge: &proto::Challenge,
     ) -> Result<proto::SignedPresence, NodeHaltReason> {
-        self.system.wait_loaded().await?;
         let key = self.wait_keypair().await?;
-        let presence = proto::Presence {
-            key: key.public_key(),
-            durable: self.durable,
-            system_root: self.system.root(),
-            protocol_version: proto::PROTOCOL_VERSION,
-        };
+        let presence = proto::Presence { key: key.public_key(), durable: self.durable, protocol_version: proto::PROTOCOL_VERSION };
         Ok(presence.sign(side, challenge, |bytes| key.sign(bytes)))
     }
 
-    /// The node accepts a peer connection only if its presence passes signature, protocol version and system checks.
+    /// The node accepts a peer connection only if its presence passes signature and protocol version checks.
     /// `side` is this node's side; the peer's signature must cover the opposite side and the `challenge` this node sent.
     /// It waits for this node's keypair first, so a node with a connection is keyed.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %signed.presence.node_id().to_base64_short(), durable = %signed.presence.durable)))]
@@ -407,14 +404,7 @@ where
         }
         let presence = signed.presence;
 
-        self.system.wait_loaded().await?;
-        if presence.durable && !self.durable {
-            self.system.adopt_system(presence.system_root.clone().ok_or(PeerConnectionError::MissingSystem)?).await?;
-        } else if let (Some(current), Some(offered)) = (self.system.root_id(), &presence.system_root) {
-            if current != offered.payload.entity_id {
-                return Err(PeerConnectionError::SystemMismatch { current, offered: offered.payload.entity_id });
-            }
-        }
+        let _operation = self.lifecycle.admit()?;
         let connection = ConnectionId(self.next_connection.fetch_add(1, Ordering::Relaxed));
         notice_info!("Node({:#}) register_peer {:#} as {}", id, node_id, connection);
         let subscription_handler = SubscriptionHandler::new(connection, self);
@@ -478,7 +468,7 @@ where
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError>
     where
-        C: Iterable<PA::ContextData>,
+        C: Iterable<PA::ContextData> + Sync,
     {
         let connection = self.connections_of(node_id).pop().ok_or(RequestError::PeerNotConnected)?;
         self.request_on(connection, cdata, request_body).await
@@ -493,39 +483,44 @@ where
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError>
     where
-        C: Iterable<PA::ContextData>,
+        C: Iterable<PA::ContextData> + Sync,
     {
-        self.system.check_not_halted()?;
-        let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
-        let request_id = proto::RequestId::new();
+        self.lifecycle
+            .while_running(async {
+                let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
+                let request_id = proto::RequestId::new();
 
-        let request =
-            proto::NodeRequest { id: request_id.clone(), to: self.peer_node_id(connection)?, from: self.keyed_id(), body: request_body };
+                let request = proto::NodeRequest {
+                    id: request_id.clone(),
+                    to: self.peer_node_id(connection)?,
+                    from: self.keyed_id(),
+                    body: request_body,
+                };
 
-        // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
-        // follow-on uses #426's node session union for catalog queries.
-        let auth = if crate::schema::request_bypasses_policy(&request.body) {
-            Vec::new()
-        } else {
-            self.policy_agent.sign_request(self, cdata, &request)?
-        };
+                // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
+                // follow-on uses #426's node session union for catalog queries.
+                let auth = if crate::schema::request_bypasses_policy(&request.body) {
+                    Vec::new()
+                } else {
+                    self.policy_agent.sign_request(self, cdata, &request)?
+                };
 
-        let _pending = {
-            let peer = self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?;
-            let pending = peer_state::PendingRequest { connection: Arc::downgrade(&peer), id: request_id.clone() };
-            peer.pending_requests.insert(request_id, response_tx);
-            peer.send_message(proto::NodeMessage::Request { auth, request })?;
-            pending
-        };
+                let _pending = {
+                    let peer = self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?;
+                    let pending = peer_state::PendingRequest { connection: Arc::downgrade(&peer), id: request_id.clone() };
+                    peer.pending_requests.insert(request_id, response_tx);
+                    peer.send_message(proto::NodeMessage::Request { auth, request })?;
+                    pending
+                };
 
-        response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
+                response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
+            })
+            .await
     }
 
     // TODO LATER: rework this to be retried in the background some number of times
     pub fn send_update(&self, connection: ConnectionId, notification: proto::NodeUpdateBody) {
-        if self.system.check_not_halted().is_err() {
-            return;
-        }
+        let Ok(_operation) = self.lifecycle.admit() else { return };
         // same as request, minus cdata and the sign_request step
         debug!("{self}.send_update({connection}, {notification})");
         let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
@@ -556,99 +551,106 @@ where
     /// The node accepts a message only if its sender node id matches the peer registered for `connection`.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
     pub async fn handle_message(&self, connection: ConnectionId, message: proto::NodeMessage) -> anyhow::Result<()> {
-        self.system.check_not_halted()?;
-        let peer_node_id = self.peer_node_id(connection)?;
-        if message.sender() != peer_node_id {
-            return Err(anyhow!("peer {} sent a message as {}", peer_node_id, message.sender()));
-        }
-        let own_id = self.keyed_id();
-        match message {
-            proto::NodeMessage::Update(update) => {
-                debug!("Node({}) received update {}", own_id, update);
+        self.lifecycle
+            .while_running(async {
+                let peer_node_id = self.peer_node_id(connection)?;
+                if message.sender() != peer_node_id {
+                    return Err(anyhow!("peer {} sent a message as {}", peer_node_id, message.sender()));
+                }
+                let own_id = self.keyed_id();
+                match message {
+                    proto::NodeMessage::Update(update) => {
+                        debug!("Node({}) received update {}", own_id, update);
 
-                if let Some(sender) = { self.peer_connections.get(&connection).map(|c| c.sender.cloned()) } {
-                    let _from = update.from;
-                    let _id = update.id.clone();
-                    if update.to != own_id {
-                        warn!("{} received message from {} but is not the intended recipient", own_id, update.from);
-                        return Ok(());
+                        if let Some(sender) = { self.peer_connections.get(&connection).map(|c| c.sender.cloned()) } {
+                            let _from = update.from;
+                            let _id = update.id.clone();
+                            if update.to != own_id {
+                                warn!("{} received message from {} but is not the intended recipient", own_id, update.from);
+                                return Ok(());
+                            }
+
+                            // take down the return address
+                            let id = update.id.clone();
+                            let to = update.from;
+                            let from = own_id;
+
+                            let body = match self.handle_update(connection, update).await {
+                                Ok(_) => proto::NodeUpdateAckBody::Success,
+                                Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                            };
+
+                            sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
+                        }
                     }
-
-                    // take down the return address
-                    let id = update.id.clone();
-                    let to = update.from;
-                    let from = own_id;
-
-                    let body = match self.handle_update(connection, update).await {
-                        Ok(_) => proto::NodeUpdateAckBody::Success,
-                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
-                    };
-
-                    sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
-                }
-            }
-            proto::NodeMessage::UpdateAck(ack) => {
-                debug!("Node({}) received ack notification {} {}", own_id, ack.id, ack.body);
-                // let connection = self.peer_connections.get(&ack.from).ok_or(RequestError::PeerNotConnected)?;
-                // if let Some(tx) = connection.pending_updates.remove(&ack.id) {
-                //     tx.send(Ok(proto::NodeResponseBody::Success)).unwrap();
-                // }
-            }
-            proto::NodeMessage::Request { auth, request } => {
-                debug!("Node({}) received request {}", own_id, request);
-                // TODO: Should we spawn a task here and make handle_message synchronous?
-                // I think this depends on how we want to handle timeouts.
-                // I think we want timeouts to be handled by the node, not the connector,
-                // which would lend itself to spawning a task here and making this function synchronous.
-
-                // double check to make sure we have a connection to the peer
-                if let Some(sender) = { self.peer_connections.get(&connection).map(|c| c.sender.cloned()) } {
-                    let from = request.from;
-                    let request_id = request.id.clone();
-                    if request.to != own_id {
-                        warn!("{} received message from {} but is not the intended recipient", own_id, request.from);
-                        return Ok(());
+                    proto::NodeMessage::UpdateAck(ack) => {
+                        debug!("Node({}) received ack notification {} {}", own_id, ack.id, ack.body);
+                        // let connection = self.peer_connections.get(&ack.from).ok_or(RequestError::PeerNotConnected)?;
+                        // if let Some(tx) = connection.pending_updates.remove(&ack.id) {
+                        //     tx.send(Ok(proto::NodeResponseBody::Success)).unwrap();
+                        // }
                     }
+                    proto::NodeMessage::Request { auth, request } => {
+                        debug!("Node({}) received request {}", own_id, request);
+                        // TODO: Should we spawn a task here and make handle_message synchronous?
+                        // I think this depends on how we want to handle timeouts.
+                        // I think we want timeouts to be handled by the node, not the connector,
+                        // which would lend itself to spawning a task here and making this function synchronous.
 
-                    // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
-                    // follow-on uses #426's node session union for catalog queries.
-                    let cdata = if crate::schema::request_bypasses_policy(&request.body) {
-                        Ok(Vec::new())
-                    } else {
-                        self.policy_agent.check_request(self, &auth, &request).await
-                    };
-                    let body = match cdata {
-                        Ok(cdata) => match self.handle_request(connection, &cdata, request).await {
-                            Ok(result) => result,
-                            Err(e) => comparison::response_error(e),
-                        },
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                    };
-                    let _result =
-                        sender.send_message(proto::NodeMessage::Response(proto::NodeResponse { request_id, from: own_id, to: from, body }));
+                        // double check to make sure we have a connection to the peer
+                        if let Some(sender) = { self.peer_connections.get(&connection).map(|c| c.sender.cloned()) } {
+                            let from = request.from;
+                            let request_id = request.id.clone();
+                            if request.to != own_id {
+                                warn!("{} received message from {} but is not the intended recipient", own_id, request.from);
+                                return Ok(());
+                            }
+
+                            // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
+                            // follow-on uses #426's node session union for catalog queries.
+                            let cdata = if crate::schema::request_bypasses_policy(&request.body) {
+                                Ok(Vec::new())
+                            } else {
+                                self.policy_agent.check_request(self, &auth, &request).await
+                            };
+                            let body = match cdata {
+                                Ok(cdata) => match self.handle_request(connection, &cdata, request).await {
+                                    Ok(result) => result,
+                                    Err(e) => comparison::response_error(e),
+                                },
+                                Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                            };
+                            let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                                request_id,
+                                from: own_id,
+                                to: from,
+                                body,
+                            }));
+                        }
+                    }
+                    proto::NodeMessage::Response(response) => {
+                        debug!("Node {} received response {}", own_id, response);
+                        if response.to != own_id {
+                            return Err(anyhow!("response addressed to another node"));
+                        }
+                        let peer = self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?;
+                        if let Some(tx) = peer.pending_requests.remove(&response.request_id) {
+                            tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                        }
+                    }
+                    proto::NodeMessage::ReleaseComparison { comparison, .. } => {
+                        self.captures.release(connection, comparison);
+                    }
+                    proto::NodeMessage::UnsubscribeQuery { query_id, .. } => {
+                        // Remove predicate from the peer's subscription
+                        if let Some(peer_state) = self.peer_connections.get(&connection) {
+                            peer_state.subscription_handler.remove_predicate(query_id).await?;
+                        }
+                    }
                 }
-            }
-            proto::NodeMessage::Response(response) => {
-                debug!("Node {} received response {}", own_id, response);
-                if response.to != own_id {
-                    return Err(anyhow!("response addressed to another node"));
-                }
-                let peer = self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?;
-                if let Some(tx) = peer.pending_requests.remove(&response.request_id) {
-                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
-                }
-            }
-            proto::NodeMessage::ReleaseComparison { comparison, .. } => {
-                self.captures.release(connection, comparison);
-            }
-            proto::NodeMessage::UnsubscribeQuery { query_id, .. } => {
-                // Remove predicate from the peer's subscription
-                if let Some(peer_state) = self.peer_connections.get(&connection) {
-                    peer_state.subscription_handler.remove_predicate(query_id).await?;
-                }
-            }
-        }
-        Ok(())
+                Ok(())
+            })
+            .await
     }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
@@ -724,7 +726,7 @@ where
             }
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.keyed_id(), notification.from);
-                self.system.require_system_ready()?;
+                self.lifecycle.check_not_halted()?;
                 crate::node::applier::NodeApplier::apply_updates(self, &connection, &notification.from, items).await?;
                 Ok(())
             }
@@ -767,20 +769,23 @@ where
     /// The node uses its own authority without policy checks; the caller must authorize the events.
     /// Supply parents before their children. Importing an event again leaves its entity unchanged.
     pub async fn import_events(&self, events: &[proto::Attested<proto::Event>]) -> Result<(), MutationError> {
-        if !self.durable {
-            return Err(MutationError::NotDurable);
-        }
-        self.system.require_system_ready()?;
-        // Prevent registration from creating duplicate definitions while the import updates the catalog.
-        let _allocator = self.catalog.allocator.lock().await;
-        let policy = ContextPolicy::new(&self.policy_agent, ContextAuth::<Mut<Vec<PA::ContextData>>>::Privileged);
-        crate::util::retry::retry_on!(MutationError::WriteConflict, {
-            let mut trx = crate::transaction::remote::RemoteTransaction::new(self, &policy);
-            for event in events {
-                trx.add_event(event).await?;
-            }
-            trx.commit().await
-        })
+        self.lifecycle
+            .while_running(async {
+                if !self.durable {
+                    return Err(MutationError::NotDurable);
+                }
+                // Prevent registration from creating duplicate definitions while the import updates the catalog.
+                let _allocator = self.catalog.allocator.lock().await;
+                let policy = ContextPolicy::new(&self.policy_agent, ContextAuth::<Mut<Vec<PA::ContextData>>>::Privileged);
+                crate::util::retry::retry_on!(MutationError::WriteConflict, {
+                    let mut trx = crate::transaction::remote::RemoteTransaction::new(self, &policy);
+                    for event in events {
+                        trx.add_event(event).await?;
+                    }
+                    trx.commit().await
+                })
+            })
+            .await
     }
 
     /// Build a context over its credential source: bare ContextData, an
@@ -798,14 +803,14 @@ where
         Ok(Context::new(Node::clone(self), sessions))
     }
 
-    /// An uncredentialed context for local system work.
+    /// An uncredentialed context for local catalog work.
     pub(crate) fn privileged_context(&self) -> Context {
         Context(Arc::new(ContextInner { node: NodeHandle::Strong(Node::clone(self)), auth: ContextAuth::Privileged }))
     }
 
     /// Retrieve peer states and persist them in this node.
     pub(crate) async fn get_from_peer(&self, ids: Vec<proto::EntityId>, cdata: &Vec<PA::ContextData>) -> Result<(), RetrievalError> {
-        self.system.require_system_ready().map_err(MutationError::from)?;
+        self.lifecycle.check_not_halted()?;
         let connection = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
         let peer_node_id = self.peer_node_id(connection)?;
 
@@ -836,7 +841,7 @@ where
         selection: ankql::ast::Selection<Resolved>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        self.system.require_system_ready().map_err(MutationError::from)?;
+        self.lifecycle.check_not_halted()?;
         let peer = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
         self.reconcile_query(peer, selection.clone(), cdata, None).await?;
         self.fetch_entities_from_local(&selection).await
@@ -950,16 +955,20 @@ where
 
     /// Load matching states from local storage into resident entities; does not apply read policy.
     pub async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
-        self.system.check_not_halted()?;
-        let initial_states = self.storage.fetch_states(selection).await?;
-        let state_getter = LocalStateGetter::new(self.storage.clone());
-        let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);
-        let mut entities = Vec::with_capacity(initial_states.len());
-        for state in initial_states {
-            let (_, entity) = self.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state).await?;
-            entities.push(entity);
-        }
-        Ok(entities)
+        self.lifecycle
+            .while_running(async {
+                let initial_states = self.storage.fetch_states(selection).await?;
+                let state_getter = LocalStateGetter::new(self.storage.clone());
+                let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);
+                let mut entities = Vec::with_capacity(initial_states.len());
+                for state in initial_states {
+                    let (_, entity) =
+                        self.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state).await?;
+                    entities.push(entity);
+                }
+                Ok(entities)
+            })
+            .await
     }
 }
 impl<SE, PA> fmt::Display for NodeInner<SE, PA>

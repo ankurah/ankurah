@@ -33,9 +33,8 @@ macro_rules! get {
 }
 
 /// A reset on one node waits at the database for another node's open map
-/// transaction, whose commit then lands an entity record, making the tables
-/// records live in, and a map's entry: once the reset returns, neither is
-/// left.
+/// transaction, whose commit then lands an entity record and a map's entry:
+/// once the reset returns, neither is left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reset_removes_what_the_map_transaction_it_waited_for_landed() -> anyhow::Result<()> {
     let database = Database::start().await?;
@@ -107,8 +106,8 @@ async fn a_map_transaction_begun_during_a_reset_waits_for_it_though_no_map_exist
 
 /// A reset on a node whose pool holds one connection waits for the node's
 /// own open map transaction, on a database that holds no record yet. The
-/// transaction's commit, which makes the tables records live in through that
-/// pool, lands; the reset then removes what it landed.
+/// transaction's commit lands without acquiring a second share of the reset
+/// lock through that pool; the reset then removes what it landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reset_waiting_for_its_own_nodes_map_transaction_leaves_the_pool_to_that_transactions_commit() -> anyhow::Result<()> {
     let database = Database::start().await?;

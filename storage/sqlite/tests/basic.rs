@@ -20,7 +20,7 @@ use std::sync::Arc;
 async fn test_sqlite_create_and_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create some albums
@@ -43,7 +43,7 @@ async fn test_sqlite_create_and_query() -> Result<()> {
 async fn test_sqlite_update_entity() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create an album
@@ -74,7 +74,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
 async fn test_sqlite_state_change_detection() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create an album
@@ -103,7 +103,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
 async fn test_sqlite_multiple_updates() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create multiple albums
@@ -136,7 +136,7 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
 async fn test_sqlite_query_with_subscription() -> Result<()> {
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     let watcher = TestWatcher::changeset();
@@ -176,7 +176,7 @@ async fn test_sqlite_fetch_by_id_prefix() -> Result<()> {
     use common::EntityId;
     let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     let mut ids = Vec::new();

@@ -174,7 +174,7 @@ impl AsRef<Event> for Event {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum EventBody {
     Genesis {
-        /// The system root's entity id, or `None` for the root itself or an entity created outside a node.
+        /// Legacy system provenance, retained in event identity derivation. New Node entities use `None`.
         system: Option<EntityId>,
         /// Creator-random, drawn once when the event is minted. Two
         /// `create()` calls with identical payloads draw different nonces and

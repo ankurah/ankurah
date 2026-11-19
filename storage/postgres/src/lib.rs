@@ -46,6 +46,8 @@ mod dump;
 mod maps;
 mod materialization;
 mod query;
+#[cfg(test)]
+mod reset_tests;
 mod state;
 #[cfg(test)]
 #[path = "../tests/server/mod.rs"]
@@ -193,16 +195,18 @@ impl Postgres {
     /// assigning it on first use. The Postgres-private table is authoritative:
     /// the catalog is consulted only after a durable lookup misses.
     async fn table_for_model(&self, model_id: &ModelId) -> Result<String, RetrievalError> {
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&mut client).await.map_err(RetrievalError::storage)?;
         let model_key = bincode::serialize(model_id).map_err(RetrievalError::storage)?;
         if let Some(name) = Self::registered_table_name(&client, &model_key).await? {
             return Ok(name);
         }
         drop(client);
         let registered_label = self.catalog_registered_label(model_id).await;
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        let lock_key = acquire_ddl_lock(&client, MODEL_REGISTRATION_TABLE).await?;
+        let mut pooled = self.pool.get().await.map_err(RetrievalError::storage)?;
+        let transaction = reset_fenced_transaction(&mut pooled).await?;
+        let client = transaction.client();
+        acquire_ddl_lock(&transaction, MODEL_REGISTRATION_TABLE).await?;
         let result = async {
             if let Some(name) = Self::registered_table_name(&client, &model_key).await? {
                 return Ok(name);
@@ -253,17 +257,20 @@ impl Postgres {
             Ok(materialization_table_name)
         }
         .await;
-        release_ddl_lock(&client, lock_key).await?;
-        result
+        let name = result?;
+        transaction.commit().await.map_err(RetrievalError::storage)?;
+        Ok(name)
     }
 
     /// Ensure the model-independent canonical tables and the private
     /// entity-to-model association table exist. The DDL runs once per instance, and again after `delete_all`.
-    async fn ensure_shared_tables(&self, client: &tokio_postgres::Client) -> Result<(), StateError> {
+    async fn ensure_shared_tables(&self, pooled: &mut tokio_postgres::Client) -> Result<(), StateError> {
         if self.shared_tables_ready.load(Ordering::Acquire) {
             return Ok(());
         }
-        let lock_key = acquire_ddl_lock(client, "ankurah_shared_tables").await?;
+        let transaction = reset_fenced_transaction(pooled).await?;
+        let client = transaction.client();
+        acquire_ddl_lock(&transaction, "ankurah_shared_tables").await?;
         let result: Result<(), StateError> = async {
             client
                 .execute(
@@ -332,23 +339,22 @@ impl Postgres {
             Ok(())
         }
         .await;
-        release_ddl_lock(client, lock_key).await?;
         result?;
+        transaction.commit().await.map_err(|error| StateError::DDLError(Box::new(error)))?;
         self.shared_tables_ready.store(true, Ordering::Release);
         Ok(())
     }
 
-    /// Ensure the shared tables on a connection of the engine's pool, for a
-    /// commit whose own connection holds its transaction open: DDL there
-    /// would land only with that transaction, after the DDL lock that keeps
-    /// two sessions from creating one table at once was released.
-    async fn ensure_shared_tables_aside(&self) -> Result<(), MutationError> {
+    /// Prepare shared tables before leasing a map transaction. Acquiring a
+    /// second share of the reset lock after that would deadlock with a reset
+    /// queued between the two acquisitions.
+    async fn prepare_shared_tables(&self) -> Result<(), MutationError> {
         if self.shared_tables_ready.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        let client = self.pool.get().await.map_err(|error| MutationError::General(Box::new(error)))?;
-        Ok(self.ensure_shared_tables(&client).await?)
+        let mut client = self.pool.get().await.map_err(|error| MutationError::General(Box::new(error)))?;
+        Ok(self.ensure_shared_tables(&mut client).await?)
     }
 
     /// Open or create the private query surface for a model.
@@ -384,7 +390,8 @@ impl Postgres {
     /// - record present and different: refuse
     /// - ankurah tables present but no record: refuse as an unversioned store
     async fn check_protocol_version(&self) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
+        let mut pooled = self.pool.get().await?;
+        let client = &*pooled;
         let rows = client.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[]).await?;
         let tables: Vec<String> = rows.iter().map(|row| row.get("table_name")).collect();
         let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(&table.as_str()));
@@ -410,7 +417,9 @@ impl Postgres {
             None => {
                 // Fresh store: claim the record, serializing concurrent first
                 // opens the same way other engine DDL is serialized.
-                let lock_key = acquire_ddl_lock(&client, META_TABLE).await?;
+                let transaction = reset_fenced_transaction(&mut pooled).await?;
+                let client = transaction.client();
+                acquire_ddl_lock(&transaction, META_TABLE).await?;
                 let result = async {
                     client
                         .execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), &[])
@@ -438,8 +447,9 @@ impl Postgres {
                     }
                 }
                 .await;
-                release_ddl_lock(&client, lock_key).await?;
-                result
+                result?;
+                transaction.commit().await?;
+                Ok(())
             }
         }
     }
@@ -454,24 +464,23 @@ fn advisory_lock_key(identifier: &str) -> i64 {
 
 /// Acquire a PostgreSQL advisory lock for DDL operations on an engine-owned
 /// physical structure.
-async fn acquire_ddl_lock(client: &tokio_postgres::Client, physical_name: &str) -> Result<i64, StateError> {
+async fn acquire_ddl_lock(transaction: &tokio_postgres::Transaction<'_>, physical_name: &str) -> Result<(), StateError> {
     let lock_key = advisory_lock_key(&format!("ankurah_ddl:{}", physical_name));
     debug!("Acquiring advisory lock {} for {}", lock_key, physical_name);
-    client.execute("SELECT pg_advisory_lock($1)", &[&lock_key]).await.map_err(|err| {
+    transaction.execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key]).await.map_err(|err| {
         error!("Failed to acquire advisory lock for {}: {:?}", physical_name, err);
         StateError::DDLError(Box::new(err))
     })?;
-    Ok(lock_key)
+    Ok(())
 }
 
-/// Release a PostgreSQL advisory lock
-async fn release_ddl_lock(client: &tokio_postgres::Client, lock_key: i64) -> Result<(), StateError> {
-    debug!("Releasing advisory lock {}", lock_key);
-    client.execute("SELECT pg_advisory_unlock($1)", &[&lock_key]).await.map_err(|err| {
-        error!("Failed to release advisory lock {}: {:?}", lock_key, err);
-        StateError::DDLError(Box::new(err))
-    })?;
-    Ok(())
+/// The server owns this fence until commit or rollback, including when the
+/// caller is cancelled with a request already queued. Await acquisition before
+/// submitting writes so a cancelled lock waiter cannot write after reset.
+async fn reset_fenced_transaction(client: &mut tokio_postgres::Client) -> Result<tokio_postgres::Transaction<'_>, StateError> {
+    let transaction = client.transaction().await.map_err(|error| StateError::DDLError(Box::new(error)))?;
+    transaction.batch_execute(&maps::share_reset_lock()).await.map_err(|error| StateError::DDLError(Box::new(error)))?;
+    Ok(transaction)
 }
 
 #[async_trait]
@@ -490,7 +499,7 @@ impl StorageEngine for Postgres {
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&mut client).await.map_err(RetrievalError::storage)?;
         let snapshot = read_snapshot(&mut client).await?;
         load_states(&snapshot, &[id]).await?.into_iter().next().ok_or(RetrievalError::EntityNotFound(id))
     }
@@ -507,8 +516,8 @@ impl StorageEngine for Postgres {
         if event_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&mut client).await.map_err(RetrievalError::storage)?;
         let rows = client
             .query(
                 &format!(
@@ -524,8 +533,8 @@ impl StorageEngine for Postgres {
     }
 
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
+        let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        self.ensure_shared_tables(&mut client).await.map_err(RetrievalError::storage)?;
         client
             .query(
                 &format!(

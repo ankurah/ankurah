@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
     // liaison id=server-example
     let storage = SledStorageEngine::with_path(storage_dir)?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
 
     let mut server = WebsocketServer::new(node);
     println!("Running server...");
@@ -57,7 +57,7 @@ async fn rust_client_example() -> anyhow::Result<()> {
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new(Arc::new(storage), PermissiveAgent::new());
     let _client = WebsocketClient::new(node.clone(), "ws://localhost:9797").await?;
-    node.system.wait_system_ready().await?;
+    node.wait_ready().await?;
 
     // Create album
     let ctx = node.context(ankurah::policy::DEFAULT_CONTEXT)?;

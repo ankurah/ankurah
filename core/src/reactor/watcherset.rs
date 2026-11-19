@@ -315,7 +315,7 @@ impl WatcherChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{entity::LocalTrxEntity, property::backend::lww::LWWBackend, schema::SystemEpoch, selection::filter::evaluate_predicate};
+    use crate::{entity::LocalTrxEntity, property::backend::lww::LWWBackend, schema::NodeEpoch, selection::filter::evaluate_predicate};
     use ankql::ast::{ComparisonOperator, Expr, Predicate};
     use ankurah_core_types::Value;
 
@@ -340,12 +340,8 @@ mod tests {
         let property = proto::EntityId::from_bytes([2; 32]);
         let path = PropertyPath::registered(property, "data", vec!["nested".into(), "key".into()]);
         let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([3; 32]));
-        let pending = LocalTrxEntity::new(
-            None,
-            proto::AuthorId::Unknown,
-            SystemEpoch::allocate(),
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        );
+        let pending =
+            LocalTrxEntity::new(proto::AuthorId::Unknown, NodeEpoch::allocate(), Arc::new(std::sync::atomic::AtomicBool::new(true)));
         pending.add_membership(model)?;
         let backend = pending.get_backend::<LWWBackend>()?;
         let entity = pending.read();
@@ -383,12 +379,8 @@ mod tests {
         let open = || Box::new(Expr::Literal(Value::String("open".into())));
         let literal_first = Predicate::Comparison { left: open(), operator: ComparisonOperator::LessThan, right: status() };
         let path_first = Predicate::Comparison { left: status(), operator: ComparisonOperator::GreaterThan, right: open() };
-        let pending = LocalTrxEntity::new(
-            None,
-            proto::AuthorId::Unknown,
-            SystemEpoch::allocate(),
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        );
+        let pending =
+            LocalTrxEntity::new(proto::AuthorId::Unknown, NodeEpoch::allocate(), Arc::new(std::sync::atomic::AtomicBool::new(true)));
         let backend = pending.get_backend::<LWWBackend>()?;
         let entity = pending.read();
         let changes = Arc::new(vec![entity.clone()]);

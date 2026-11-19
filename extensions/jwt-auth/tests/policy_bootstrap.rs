@@ -16,7 +16,6 @@ async fn policy_is_written_explicitly_and_loaded_on_restart() -> anyhow::Result<
         let policy = JwtAgent::new_ephemeral();
         policy.set_keys(JwtKeys::Signing(keys.clone()));
         let node = Node::new_durable(storage.clone(), policy.clone());
-        node.system.create().await?;
         policy.set_policy_from_file(&node, common::blog_config_path()).await?;
         node.wait_ready().await?;
         assert!(policy.config().collections.contains_key("post"));

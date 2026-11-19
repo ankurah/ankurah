@@ -136,7 +136,6 @@ impl Fixture {
     async fn with_peer_durability(durable: bool) -> anyhow::Result<Self> {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new_durable(storage, ReadPolicy::default());
-        node.system.create().await?;
         node.wait_ready().await?;
         let peer = crate::test_utils::connect_peer(&node, &crate::node::NodeKey::generate(), durable, Sender).await?;
         let model = proto::ModelId::EntityId(EntityId::random());

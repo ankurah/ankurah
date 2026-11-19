@@ -37,7 +37,7 @@ impl SimNode {
     /// Register `peer` as a connected peer of this node, installing a
     /// `SimSender` so anything this node sends *to* `peer` is captured for the
     /// scheduler. Mirrors `Node::register_peer` as `LocalProcessConnection`
-    /// would, including initial system adoption from a durable peer.
+    /// would, including proof of the peer key.
     pub async fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
         let challenge = proto::Challenge::random();
@@ -118,8 +118,8 @@ impl SimNode {
     }
 }
 
-/// Build `n` nodes: node 0 is durable and owns the system root; the rest are
-/// ephemeral and join node 0's system. All nodes share one capture sink.
+/// Build `n` nodes: node 0 is durable; the rest are ephemeral.
+/// All nodes share one capture sink.
 /// Returns the nodes and the shared `Captured` for the scheduler.
 pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<SimNode>> {
     assert!(n >= 1, "need at least one node");
@@ -129,7 +129,6 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     let durable_engine = Arc::new(SledStorageEngine::new_test()?);
     crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
     let durable = Node::new_durable(durable_engine, PermissiveAgent::new());
-    durable.system.create().await?;
     durable.wait_ready().await?;
     nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
 
@@ -147,8 +146,7 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
 }
 
 /// Seed and bind the deterministic `SimRecord` catalog on one node. The
-/// node's system must be READY (the seeded binding resolves under its
-/// system epoch).
+/// node's descriptor bindings use its own process-local epoch.
 pub fn seed_sim_schema(node: &SimNode) -> anyhow::Result<()> {
     ankurah::core::test_helpers::seed_registered_schema(&node.node, SimRecord::descriptor(), &sim_model_definition())?;
     Ok(())

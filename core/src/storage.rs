@@ -56,7 +56,7 @@ pub mod pending_writes;
 /// named locks ([`LockName`]), under which its commit lands only if no other transaction that took
 /// them has committed meanwhile: [`map_lock_and_read`](Self::map_lock_and_read) says how an engine
 /// keeps that. Its map writes land with its entity records, all of them or none. A transaction that
-/// makes no map call takes no lock, and commits as it would if engines kept no maps, writing the same
+/// makes no map call takes no named map lock, and commits as it would if engines kept no maps, writing the same
 /// records the same way. On an engine with one writer for the whole store, its commit waits its turn
 /// behind an open map transaction, as it would behind any other writer.
 ///
@@ -253,6 +253,11 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// It empties every map too, and no transaction that made map calls before it lands anything in the
     /// maps it emptied: it waits for such a transaction to end, or makes that transaction's commit fail.
+    /// Native writes dispatched by a cancelled operation must also finish or be invalidated before reset
+    /// succeeds, including entity/event commits and materialization or index preparation. Dropping a Rust
+    /// future alone does not establish that its blocking task, server transaction or browser callback ended.
+    /// Callers must quiesce other active users of the storage; reset does not coordinate their application
+    /// lifecycles. Retained read-only snapshots may continue reading their earlier boundary.
     async fn delete_all(&self) -> Result<bool, MutationError>;
 
     /// List existing model materializations without creating any.

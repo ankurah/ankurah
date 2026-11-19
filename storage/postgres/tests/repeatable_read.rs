@@ -16,7 +16,6 @@ pub struct Album {
 async fn pg_repeatable_read() -> Result<()> {
     let (_container, postgres) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     let id;
@@ -66,7 +65,6 @@ async fn pg_repeatable_read() -> Result<()> {
 async fn pg_events() -> Result<()> {
     let (_container, postgres) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     let id;

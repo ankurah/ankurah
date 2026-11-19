@@ -187,7 +187,7 @@ async fn a_tuple_live_query_made_before_its_node_is_ready_checks_its_names_at_on
     let open = ctx.query::<(TaskView, AssignmentView)>("status = 'open'")?;
     let ambiguous = ctx.query::<(TaskView, AssignmentView)>("note = 'x'")?;
     let unknown = ctx.query::<(TaskView, AssignmentView)>("Nobody::closed_at = 5")?;
-    node.system.create().await?;
+    node.wait_ready().await?;
     open.wait_initialized().await?;
     assert!(open.ids().is_empty());
     let expected = ComponentScopeError::Ambiguous { name: "note".into(), first: "Task".into(), second: "Assignment".into() };

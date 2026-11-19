@@ -27,6 +27,8 @@ use crate::value::SqliteValue;
 mod maps;
 mod materialization;
 mod query;
+#[cfg(test)]
+mod reset_tests;
 mod state;
 mod transaction;
 use maps::Maps;
@@ -461,7 +463,7 @@ impl StorageEngine for SqliteStorageEngine {
         self.materializations.clear();
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
-        conn.with_connection_mut(move |c| {
+        conn.reset(move |c| {
             // One native transaction, begun with the database's write lock, so
             // that the reset lands whole or not at all, and no other writer
             // comes between its statements. A map transaction holds the write

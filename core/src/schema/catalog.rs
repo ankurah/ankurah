@@ -63,7 +63,7 @@ struct CatalogIndex {
 pub struct CatalogManager {
     index: OnceLock<Calculated<CatalogIndex>>,
     /// Validated registration replies can precede catalog subscription delivery.
-    /// These immutable property types belong to this node's one system epoch.
+    /// These immutable property types belong to this node's one node epoch.
     bound_types: Mutex<HashMap<EntityId, ValueType>>,
     ready: Mut<bool>,
     /// Hold declaration lookup through commit so concurrent registrations reuse identities
@@ -106,7 +106,11 @@ impl CatalogManager {
     /// Initial catalog loading, independent of policy startup.
     pub(crate) fn is_ready(&self) -> bool { self.ready.value() }
 
-    pub(crate) async fn wait_ready(&self) { self.ready.wait_value(true).await; }
+    /// Wait without retaining catalog queries or their storage handles.
+    pub(crate) fn wait_ready(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let ready = self.ready.read();
+        async move { ready.wait_value(true).await }
+    }
 
     /// Observe catalog changes without copying catalog rows into the notification.
     pub fn subscribe_changes(&self, listener: impl Fn() + Send + Sync + 'static) -> Option<SubscriptionGuard> {
@@ -375,7 +379,7 @@ mod tests {
         ] {
             let storage = Arc::new(TestStorage::default());
             let mut node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-            node.system.create().await?;
+            node.wait_ready().await?;
             let context = node.context_async(DEFAULT_CONTEXT).await?;
             context.resolve_model_id::<PublicationModel>().await?;
             let healthy = context.resolve_model_id::<MissingPublicationModel>().await?;
@@ -424,7 +428,7 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let model = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
+                seed.wait_ready().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?;
                 seed.catalog.model_by_label(PublicationModel::descriptor().label)?.unwrap().0
             };
@@ -435,7 +439,7 @@ mod tests {
             let (release, release_rx) = tokio::sync::oneshot::channel();
             *storage.hold_state_snapshot.lock().unwrap() = Some((entered, release_rx));
             let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-            node.system.wait_system_ready().await?;
+            node.wait_id().await?;
             // A context built directly skips the readiness check, so this query waits on the catalog.
             let query = Context::new(node.clone(), DEFAULT_CONTEXT).query::<PublicationModelView>(CACHED_TRUE)?;
             entered_rx.await?;
@@ -459,11 +463,11 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
+                seed.wait_ready().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let node = Node::new(storage, PermissiveAgent::new());
-            node.system.wait_system_ready().await?;
+            node.wait_id().await?;
             while node.catalog.counts() != (1, 1, 1) {
                 tokio::task::yield_now().await;
             }
@@ -488,7 +492,7 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
+                seed.wait_ready().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let (fetch_entered, fetch_observed) = tokio::sync::oneshot::channel();

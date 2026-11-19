@@ -37,19 +37,17 @@ async fn connect(node: &TestNode, peer: &TestNode, sender: impl PeerSender + 'st
 }
 
 #[tokio::test]
-async fn presence_does_not_require_an_adopted_system_but_rejects_a_halted_node() {
+async fn presence_does_not_require_a_ready_catalog_but_rejects_a_halted_node() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let challenge = proto::Challenge::random();
     let presence =
         tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(Dialing, &challenge)).await.unwrap().unwrap().presence;
     assert_eq!(Some(presence.node_id()), node.id());
     assert!(!presence.durable);
-    assert!(presence.system_root.is_none());
     assert_eq!(presence.protocol_version, proto::PROTOCOL_VERSION);
-    assert!(!node.system.is_system_ready());
-    assert_eq!(node.state().value(), NodeState::Uninitialized);
+    assert_eq!(node.state().value(), NodeState::Startup);
 
-    let halt_reason = node.system.halt(NodeHaltReason::SystemLoad("test failure".into()));
+    let halt_reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("test failure".into()));
     assert_eq!(node.state().value(), NodeState::Halted(halt_reason.clone()));
     assert_eq!(node.presence(Dialing, &challenge).await.unwrap_err(), halt_reason);
 }
@@ -91,23 +89,21 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
         let state = node.state();
         let run = node.run.clone();
         assert!(run.get());
-        assert_eq!(state.value(), NodeState::Uninitialized);
+        assert_eq!(state.value(), NodeState::Startup);
         assert_eq!(node.check_ready(), Err(NodeReadinessError::NotReady));
         let mut ready = Box::pin(node.wait_ready());
         assert!(futures::poll!(&mut ready).is_pending());
         let (changes, observed) = std::sync::mpsc::channel();
         let _subscription = state.subscribe(changes);
-        node.system.create().await.unwrap();
         entered_rx.await.unwrap();
         assert_eq!(state.value(), NodeState::Startup);
         assert!(run.get());
         assert_eq!(node.check_ready(), Err(NodeReadinessError::NotReady));
         assert!(futures::poll!(&mut ready).is_pending());
-        assert_eq!(observed.try_recv().unwrap(), NodeState::Startup);
 
-        let reason = NodeHaltReason::SystemLoad("first reason".into());
+        let reason = NodeHaltReason::CatalogLoad("first reason".into());
         if halt_during_startup {
-            node.system.halt(reason.clone());
+            node.lifecycle.halt(reason.clone());
             assert_eq!(ready.await, Err(NodeReadinessError::Halted(reason.clone())));
             release.send(()).unwrap();
         } else {
@@ -116,11 +112,11 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
             assert_eq!(node.check_ready(), Ok(()));
             assert!(run.get());
             assert_eq!(observed.try_recv().unwrap(), NodeState::Running);
-            node.system.halt(reason.clone());
+            node.lifecycle.halt(reason.clone());
         }
         assert_eq!(observed.try_recv().unwrap(), NodeState::Halted(reason.clone()));
-        assert_eq!(node.system.halt(NodeHaltReason::CatalogLoad("later reason".into())), reason);
-        node.system.mark_running();
+        assert_eq!(node.lifecycle.halt(NodeHaltReason::CatalogLoad("later reason".into())), reason);
+        node.lifecycle.mark_running();
         assert_eq!(node.check_ready(), Err(NodeReadinessError::Halted(reason.clone())));
         assert_eq!(node.wait_ready().await, Err(NodeReadinessError::Halted(reason.clone())));
         assert_eq!(state.value(), NodeState::Halted(reason));
@@ -129,11 +125,11 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
 }
 
 #[tokio::test]
-async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
+async fn dropping_a_starting_node_cancels_its_readiness_wait() {
     let storage = Arc::new(TestStorage::default());
     let weak_storage = Arc::downgrade(&storage);
     let node = Node::new(storage, PermissiveAgent::new());
-    node.system.wait_loaded().await.unwrap();
+    node.wait_id().await.unwrap();
     let weak = node.weak();
     let run = node.run.clone();
     drop(node);
@@ -149,27 +145,25 @@ async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
 }
 
 #[tokio::test]
-async fn presence_waits_for_the_persisted_system_root() {
+async fn presence_uses_the_persisted_key_while_catalog_loading_is_pending() {
     let storage = Arc::new(TestStorage::default());
     let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    seed.system.create().await.unwrap();
-    let root = seed.system.root().unwrap();
+    seed.wait_ready().await.unwrap();
+    let id = seed.id();
     drop(seed);
 
     let (entered, entered_rx) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
-    storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::System), (entered, release_rx));
+    storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
     let challenge = proto::Challenge::random();
-    let presence = node.presence(Dialing, &challenge);
-    tokio::pin!(presence);
-    assert!(futures::poll!(&mut presence).is_pending());
+    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(Dialing, &challenge)).await.unwrap().unwrap();
+    assert_eq!(Some(presence.presence.node_id()), id);
+    assert!(presence.presence.durable);
+    assert_eq!(node.state().value(), NodeState::Startup);
     release.send(()).unwrap();
-    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), presence).await.unwrap().unwrap().presence;
-    assert_eq!(Some(presence.node_id()), node.id());
-    assert!(presence.durable);
-    assert_eq!(presence.system_root, Some(root));
+    node.wait_ready().await.unwrap();
 }
 
 #[tokio::test]
@@ -190,7 +184,6 @@ async fn disconnect_releases_pending_requests() {
 async fn disconnect_releases_pending_requests_while_a_message_from_that_peer_is_being_handled() {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await.unwrap();
     node.wait_ready().await.unwrap();
     let peer = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let (sent, _messages) = std::sync::mpsc::channel();
@@ -287,10 +280,9 @@ async fn a_message_that_names_another_sender_than_its_connection_is_refused() {
 }
 
 #[tokio::test]
-async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
+async fn halt_cancels_an_inflight_read_and_rejects_new_work() {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await.unwrap();
     node.wait_ready().await.unwrap();
     let transaction = node.privileged_context().begin();
     let id = transaction.create(&crate::schema::catalog::SysModelRow { label: "test".into(), name: "Test".into() }).await.unwrap().id();
@@ -308,9 +300,9 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     assert!(futures::poll!(&mut read).is_pending());
     entered_rx.await.unwrap();
 
-    let reason = node.system.halt(NodeHaltReason::SystemLoad("fixture".into()));
-    release.send(()).unwrap();
-    assert_eq!(read.await.unwrap().iter().map(Entity::id).collect::<Vec<_>>(), vec![id]);
+    let reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
+    assert!(matches!(read.await, Err(RetrievalError::NodeHalted(error)) if error == reason));
+    assert!(release.send(()).is_err(), "halt cancelled the suspended read");
     assert!(matches!(node.fetch_entities_from_local(&selection).await, Err(RetrievalError::NodeHalted(error)) if error == reason));
     assert!(matches!(
         node.request_on(connection, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id] }).await,
@@ -326,14 +318,13 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
 async fn remote_creations_are_not_registered_or_published_before_storage_succeeds() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let a = ModelId::EntityId(proto::EntityId::random());
     let b = ModelId::EntityId(proto::EntityId::random());
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
-    let genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(a));
+    let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(a));
     let update = proto::Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(b));
-    let other_genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(b));
+    let other_genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(b));
     let other_update =
         proto::Event::update(other_genesis.entity_id, proto::Clock::singleton(&other_genesis), proto::AuthorId::Unknown, membership(a));
 
@@ -378,11 +369,10 @@ async fn remote_creations_are_not_registered_or_published_before_storage_succeed
 async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let [a, b, c] = [1, 2, 3].map(|byte| ModelId::EntityId(proto::EntityId::from_bytes([byte; 32])));
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
-    let genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(a));
+    let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(a));
     let id = genesis.entity_id;
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(genesis.clone(), None)]).await?;
     let getter = LocalEventGetter::new(storage.clone(), true);
@@ -420,4 +410,40 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
         received.try_iter().flat_map(|update| update.items).flat_map(|item| item.events).map(|event| event.payload.id()).collect();
     assert_eq!(notified, expected_events);
     Ok(())
+}
+
+#[tokio::test]
+async fn reset_waits_for_an_update_already_entering_its_peer_sender() {
+    #[derive(Clone)]
+    struct HeldSender {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl PeerSender for HeldSender {
+        fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> {
+            self.entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(())
+        }
+        fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+    }
+
+    let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    node.wait_ready().await.unwrap();
+    let peer = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let connection =
+        connect(&node, &peer, HeldSender { entered: Arc::new(Mutex::new(Some(entered))), release: Arc::new(Mutex::new(release_rx)) }).await;
+    let sender = node.clone();
+    let send = std::thread::spawn(move || sender.send_update(connection, proto::NodeUpdateBody::SubscriptionUpdate { items: vec![] }));
+    entered_rx.await.unwrap();
+    let reset = node.reset();
+    tokio::pin!(reset);
+    let pending = tokio::time::timeout(std::time::Duration::from_millis(100), reset.as_mut()).await;
+    release.send(()).unwrap();
+    send.join().unwrap();
+    assert!(pending.is_err(), "reset must not finish while an old update can still be sent");
+    reset.await.unwrap();
+    assert_eq!(node.state().value(), NodeState::Halted(NodeHaltReason::Reset));
 }

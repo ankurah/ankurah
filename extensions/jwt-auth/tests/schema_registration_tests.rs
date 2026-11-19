@@ -35,7 +35,6 @@ pub struct RegistrationRecord {
 async fn setup() -> anyhow::Result<TestNode> {
     let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
     node.wait_ready().await?;
     Ok(node)
@@ -239,7 +238,6 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
         agent.update_config(serde_json::from_str(config)?);
         let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-        server.system.create().await?;
         agent.set_policy(&server, &agent.config()).await?;
         let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
         agent.update_config(serde_json::from_str(config)?);
@@ -283,7 +281,6 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                 }
             })
         };
-        client.system.wait_system_ready().await?;
         client.wait_ready().await?;
         *held.lock().unwrap() = Some(Vec::new());
 
@@ -293,7 +290,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let trx = context.begin();
         let id = trx.create(&ScopeProbe { body: "hello".into() }).await?.id();
         trx.commit().await?;
-        let epoch = client.system.system_epoch().unwrap();
+        let epoch = client.epoch();
         let model = ScopeProbe::descriptor().bind_local(&client.catalog, epoch)?;
         assert_eq!(ScopeProbe::descriptor().resolved.get(epoch), Ok(model));
         assert!(ScopeProbe::descriptor().properties.iter().all(|property| property.resolved.get(epoch).is_ok()));

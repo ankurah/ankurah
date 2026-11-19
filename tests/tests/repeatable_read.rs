@@ -22,7 +22,7 @@ pub struct Album {
 #[tokio::test]
 async fn repeatable_read() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     let ctx = node.context_async(c).await?;
 
     let id;

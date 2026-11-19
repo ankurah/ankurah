@@ -34,31 +34,27 @@ async fn seed() -> anyhow::Result<Durable> {
     Ok(node)
 }
 
-/// Provision the existing System identity before constructing the new Node.
-/// Only the root and catalog definitions are copied; user data must arrive
-/// through the replication protocol exercised by each test.
+/// Import shared catalog identities into an independently initialized node.
+/// User data must arrive through replication; matching labels alone do not
+/// unify models minted independently by two nodes.
 async fn replica(seed: &Durable) -> anyhow::Result<Durable> { replica_in(seed, Arc::new(SledStorageEngine::new_test()?)).await }
 
 async fn replica_in(seed: &Durable, storage: Arc<SledStorageEngine>) -> anyhow::Result<Durable> {
     assert!(!Arc::ptr_eq(&seed.storage, &storage));
-    let root = seed.system.root().expect("seed has a persisted root");
-    let mut states = BTreeMap::from([(root.payload.entity_id, root)]);
+    let node = Node::new_durable(storage, PermissiveAgent::new());
+    within(node.wait_ready()).await?;
+    let mut states = BTreeMap::new();
     for model in [proto::SystemModel::Model, proto::SystemModel::Property, proto::SystemModel::ModelProperty] {
         for state in seed.storage.fetch_states(&Predicate::MemberOf(proto::ModelId::System(model)).into()).await? {
             states.insert(state.payload.entity_id, state);
         }
     }
-    let mut transaction = storage.transaction();
     for state in states.values() {
-        let history = seed.storage.dump_entity_events(state.payload.entity_id).await?;
+        let mut history = seed.storage.dump_entity_events(state.payload.entity_id).await?;
         assert!(!history.is_empty(), "provisioning must include supporting events");
-        transaction.set_state(&proto::Clock::default(), state).await?;
-        transaction.add_events(&history).await?;
+        history.sort_by_key(|event| event.payload.generation());
+        node.import_events(&history).await?;
     }
-    transaction.commit().await?.committed()?;
-    let node = Node::new_durable(storage, PermissiveAgent::new());
-    within(node.wait_ready()).await?;
-    assert_eq!(node.system.root_id(), seed.system.root_id());
     for id in states.keys() {
         assert_history(&node, *id, &event_ids(seed, *id).await?).await?;
     }

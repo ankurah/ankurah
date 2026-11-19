@@ -2,7 +2,6 @@
 
 mod common;
 use ankurah::core::{
-    connector::PeerConnectionError,
     error::{NodeHaltReason, RetrievalError},
     schema::registration::RegistrationError,
     session::{Session, SessionSet},
@@ -15,10 +14,10 @@ use std::time::Duration;
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
 /// Whether this compiled shape's identity cells are resolved for the node's
-/// current system epoch -- the registered-right-now probe, read from the
+/// current node epoch -- the registered-right-now probe, read from the
 /// descriptor itself.
 fn schema_registered(node: &TestNode, schema: &'static ankurah::core::schema::ModelStructDescriptor) -> bool {
-    node.system.system_epoch().is_some_and(|epoch| schema.resolved.get(epoch).is_ok())
+    schema.resolved.get(node.epoch()).is_ok()
 }
 
 // Distinct models per behavior so the collections never collide.
@@ -158,7 +157,7 @@ async fn query_rejects_unknown_names_before_registration() -> anyhow::Result<()>
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let ctx = Context::new(client.clone(), DEFAULT_CONTEXT);
-    assert!(client.system.system_epoch().is_none());
+    assert!(client.check_ready().is_err());
 
     for text in [
         "bogus = 'x'",
@@ -321,7 +320,7 @@ async fn query_update_can_retry_failed_initial_registration() -> anyhow::Result<
 }
 
 #[tokio::test]
-async fn query_wait_defers_until_system_ready() -> anyhow::Result<()> {
+async fn query_wait_defers_until_catalog_ready() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let ctx = Context::new(client.clone(), DEFAULT_CONTEXT);
@@ -329,7 +328,7 @@ async fn query_wait_defers_until_system_ready() -> anyhow::Result<()> {
     tokio::pin!(query);
     tokio::select! {
         biased;
-        _ = &mut query => panic!("query_wait must wait for the first system connection"),
+        _ = &mut query => panic!("query_wait must wait for catalog synchronization"),
         _ = tokio::task::yield_now() => {}
     }
     let _conn = LocalProcessConnection::new(&server, &client).await?;
@@ -355,7 +354,6 @@ async fn query_registers_missing_fields_of_an_existing_model() -> anyhow::Result
     server.context(DEFAULT_CONTEXT)?.resolve_model_id::<offline_v1::Evolving>().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     client.wait_ready().await?;
     let before = resolve_by_collection(&client, "evolving", "label").expect("existing field");
     assert!(resolve_by_collection(&client, "evolving", "added").is_none());
@@ -405,7 +403,7 @@ async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
+    client.wait_ready().await?;
     server.wait_ready().await?;
 
     // Wait until Widget is known to the client's catalog before disconnecting.
@@ -481,7 +479,7 @@ async fn offline_reassert_requires_every_compiled_field_to_be_bound() -> anyhow:
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
+    client.wait_ready().await?;
     let ctx = client.context_async(DEFAULT_CONTEXT).await.unwrap();
     ctx.resolve_model_id::<offline_v1::Evolving>().await?;
     // Wait until Evolving is known locally before testing offline reassertion.
@@ -618,7 +616,6 @@ async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     client.wait_ready().await?;
 
     // Complete the initial catalog answers before going offline. Contraption is never registered.
@@ -662,7 +659,7 @@ async fn direct_get_registers_before_edit() -> anyhow::Result<()> {
     // Client B never creates: it gets and edits only.
     let client_b = ephemeral_sled_setup().await?;
     let _conn_b = LocalProcessConnection::new(&server, &client_b).await?;
-    client_b.system.wait_system_ready().await?;
+    client_b.wait_ready().await?;
     let ctx_b = client_b.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     let view = ctx_b.get::<ContraptionView>(id).await?;
@@ -690,7 +687,7 @@ async fn transaction_get_binds_the_model_before_field_access() -> anyhow::Result
 
     let client_b = ephemeral_sled_setup().await?;
     let _conn_b = LocalProcessConnection::new(&server, &client_b).await?;
-    client_b.system.wait_system_ready().await?;
+    client_b.wait_ready().await?;
     let ctx_b = client_b.context_async(DEFAULT_CONTEXT).await.unwrap();
     let trx = ctx_b.begin();
     let entity = trx.get::<Contraption>(&id).await?;
@@ -742,7 +739,7 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
     server.wait_ready().await?;
     client.wait_ready().await?;
 
-    // Build the context after the initial system root has been adopted.
+    // Build the context after catalog synchronization.
     let ctx = client.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // DISCONNECT: dropping the connection deregisters the peer on both
@@ -791,18 +788,14 @@ async fn halted_node_cannot_reregister_even_an_already_bound_descriptor() -> any
 
         let ctx = client.context_async(DEFAULT_CONTEXT).await?;
         let retained_view = ctx.get::<GizmoView>(gizmo_id).await?;
-        let epoch = client.system.system_epoch().expect("initialized epoch");
+        let epoch = client.epoch();
         let binding = Gizmo::descriptor().resolved.get(epoch).expect("Gizmo is registered before halting");
         assert!(schema_registered(&client, Gizmo::descriptor()));
         assert!(!schema_registered(&client, Gadget::descriptor()));
         assert!(server.catalog.model_by_label("gadget").unwrap().is_none());
 
-        let other = durable_sled_setup().await?;
-        let root = client.system.root().expect("current root");
-        let proposed = other.system.root().expect("other root");
-        let halt_reason = NodeHaltReason::SystemReplacement { current: root.payload.entity_id, proposed: proposed.payload.entity_id };
-        client.set_allow_system_replacement(true);
-        assert_eq!(client.system.adopt_system(proposed).await, Err(PeerConnectionError::NodeHalted(halt_reason.clone())));
+        let halt_reason = NodeHaltReason::Reset;
+        client.reset().await?;
 
         let bound_error = ctx.resolve_model_id::<Gizmo>().await.expect_err("halting must take priority over the already-bound fast path");
         assert!(matches!(bound_error, RegistrationError::Retrieval(RetrievalError::NodeHalted(error)) if error == halt_reason));
@@ -810,7 +803,7 @@ async fn halted_node_cannot_reregister_even_an_already_bound_descriptor() -> any
         assert!(matches!(unbound_error, RegistrationError::Retrieval(RetrievalError::NodeHalted(error)) if error == halt_reason));
 
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason));
-        assert_eq!(client.system.system_epoch(), None);
+        assert_eq!(client.epoch(), epoch);
         assert_eq!(Gizmo::descriptor().resolved.get(epoch), Ok(binding), "existing views keep their original bindings");
         assert_eq!(retained_view.title()?, "retained binding");
         assert!(Gadget::descriptor().resolved.get(epoch).is_err());
@@ -908,7 +901,7 @@ async fn catalog_lookup_waits_for_subscription_delivery() -> anyhow::Result<()> 
 
     server_ctx.resolve_model_id::<ColdCatalog>().await?;
     let schema = ColdCatalog::descriptor();
-    let epoch = server.system.system_epoch().unwrap();
+    let epoch = server.epoch();
     let model = schema.resolved.get(epoch).unwrap();
     let property = schema.field_by_name("value").unwrap().resolved.get(epoch).unwrap();
     let proto::ModelId::EntityId(model_id) = model else { unreachable!() };

@@ -513,7 +513,6 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             RetrievalError::RequestError(req_err) => match req_err {
                 RequestError::PeerNotConnected => true,
                 RequestError::ConnectionLost => true,
-                RequestError::SystemNotReady => true,
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
                 RequestError::ServerError(_) => false,
@@ -583,7 +582,7 @@ where
         version: u32,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
-        node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
+        node.lifecycle.check_not_halted()?;
 
         node.reconcile_query(connection, selection, &context_data, Some((query_id, version))).await
     }

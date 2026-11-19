@@ -14,7 +14,7 @@ use super::{DynContextInner, SchemaResolver};
 #[derive(Clone)]
 pub(crate) enum ContextAuth<C> {
     Sessions(C),
-    /// Local authority for system/catalog writes; never user-constructible.
+    /// Local authority for catalog writes; never user-constructible.
     Privileged,
 }
 
@@ -58,10 +58,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// The node's id, even if its weak handle can no longer upgrade: `None` while the node is unkeyed.
     fn node_id(&self) -> Option<proto::NodeId> { self.node.node_id() }
 
-    /// This node's system root entity id, which every non-root genesis binds
-    /// into its own id. `None` before the node has created or adopted a system.
-    fn system_id(&self) -> Option<proto::EntityId> { self.node.upgrade().ok().and_then(|node| node.system.root_id()) }
-
     /// Check whether this context may write the entity.
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         let node = self.node.upgrade()?;
@@ -71,73 +67,79 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Retrieve an entity and enforce this context's read policy.
     async fn get_entity(&self, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
-        debug!("{}.get_entity {:?}", &*node, id);
-        let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
-        let cdata = policy.credentials();
+        node.lifecycle
+            .while_running(async {
+                debug!("{}.get_entity {:?}", &*node, id);
+                let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
+                let cdata = policy.credentials();
 
-        if !node.durable {
-            // Fetch from peers and commit first response
-            match node.get_from_peer(vec![id], &cdata).await {
-                Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if cached => (),
-                Err(e) => {
-                    return Err(e);
+                if !node.durable {
+                    // Fetch from peers and commit first response
+                    match node.get_from_peer(vec![id], &cdata).await {
+                        Ok(_) => (),
+                        Err(RetrievalError::NoDurablePeers) if cached => (),
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    }
                 }
-            }
-        }
 
-        if let Some(local) = node.entities.get(&id) {
-            debug!("{}.get_entity found local entity - returning", &*node);
-            let state = local.to_state()?;
-            let entity_id = local.id();
-            policy.check_read(&entity_id, &state)?;
-            return Ok(local);
-        }
-        debug!("{}.get_entity fetching from storage", node.as_ref());
+                if let Some(local) = node.entities.get(&id) {
+                    debug!("{}.get_entity found local entity - returning", &*node);
+                    let state = local.to_state()?;
+                    let entity_id = local.id();
+                    policy.check_read(&entity_id, &state)?;
+                    return Ok(local);
+                }
+                debug!("{}.get_entity fetching from storage", node.as_ref());
 
-        let entity_state: proto::Attested<proto::EntityState> = node
-            .storage
-            .get_states(vec![id], &policy.retrieval_predicate())
-            .await?
-            .into_iter()
-            .next()
-            .ok_or(RetrievalError::EntityNotFound(id))?
-            .try_into()?;
-        policy.check_read_state(&id, &entity_state.payload.state)?;
-        let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-        let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
-        let (_changed, entity) = node.entities.with_state(&state_getter, &event_getter, id, entity_state.payload.state).await?;
-        Ok(entity)
+                let entity_state: proto::Attested<proto::EntityState> = node
+                    .storage
+                    .get_states(vec![id], &policy.retrieval_predicate())
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or(RetrievalError::EntityNotFound(id))?
+                    .try_into()?;
+                policy.check_read_state(&id, &entity_state.payload.state)?;
+                let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
+                let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
+                let (_changed, entity) = node.entities.with_state(&state_getter, &event_getter, id, entity_state.payload.state).await?;
+                Ok(entity)
+            })
+            .await
     }
 
     /// Fetch a resolved selection with this context's read restrictions.
     /// Shared by `Context::fetch` and livequery gap filling.
     async fn fetch_entities(&self, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
-        let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
-        let cdata = policy.credentials();
-        args.selection.predicate = policy.filter_predicate(args.selection.predicate)?;
+        node.lifecycle
+            .while_running(async {
+                let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
+                let cdata = policy.credentials();
+                args.selection.predicate = policy.filter_predicate(args.selection.predicate)?;
 
-        // TODO honor CachePolicy::Local for fetch; Tracked currently behaves like Durable.
-        let entities = if !node.durable {
-            node.fetch_from_peer(args.selection, &cdata).await
-        } else {
-            let _digest_tree = node.digest_tree(args.selection.clone()).await?;
-            let states = node.storage.fetch_states(&args.selection).await?;
+                // TODO honor CachePolicy::Local for fetch; Tracked currently behaves like Durable.
+                let entities = if !node.durable {
+                    node.fetch_from_peer(args.selection, &cdata).await
+                } else {
+                    let _digest_tree = node.digest_tree(args.selection.clone()).await?;
+                    let states = node.storage.fetch_states(&args.selection).await?;
 
-            let mut entities = Vec::new();
-            let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-            let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
-            for state in states {
-                let (_, entity) =
-                    node.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state).await?;
-                entities.push(entity);
-            }
-            Ok(entities)
-        }?;
-        Ok(entities.into_iter().filter(|entity| policy.can_read(entity)).collect())
+                    let mut entities = Vec::new();
+                    let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
+                    let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
+                    for state in states {
+                        let (_, entity) =
+                            node.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state).await?;
+                        entities.push(entity);
+                    }
+                    Ok(entities)
+                }?;
+                Ok(entities.into_iter().filter(|entity| policy.can_read(entity)).collect())
+            })
+            .await
     }
 
     async fn digest_tree(&self, selection: ankql::ast::Selection<Resolved>) -> Result<Box<dyn Send + Sync>, RetrievalError> {

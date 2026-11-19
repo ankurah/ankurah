@@ -8,7 +8,7 @@ use crate::{
     },
     error::{MutationError, RetrievalError, StateError},
     property::{backend::PropertyBackend, PropertyError},
-    schema::SystemEpoch,
+    schema::NodeEpoch,
 };
 use ankurah_proto::{Attested, AuthorId, Clock, EntityId, Event, Membership, ModelId, Operation, OperationSet, State};
 use std::{
@@ -39,7 +39,6 @@ enum Origin {
     Pending {
         /// First id demand or commit preparation freezes the genesis that determines identity.
         genesis: OnceLock<Event>,
-        system: Option<EntityId>,
     },
     Mut {
         upstream: Arc<EntityInner>,
@@ -47,9 +46,9 @@ enum Origin {
 }
 
 impl LocalTrxEntity {
-    pub(crate) fn new(system: Option<EntityId>, author: AuthorId, epoch: SystemEpoch, alive: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(author: AuthorId, epoch: NodeEpoch, alive: Arc<AtomicBool>) -> Self {
         Self(Arc::new(LocalTrxEntityInner {
-            origin: Origin::Pending { genesis: OnceLock::new(), system },
+            origin: Origin::Pending { genesis: OnceLock::new() },
             author,
             data: TrxEntityData::new(EntityState::empty(), epoch),
             alive,
@@ -59,7 +58,7 @@ impl LocalTrxEntity {
 
     pub(crate) fn edit(entity: &Entity, author: AuthorId, alive: Arc<AtomicBool>) -> Result<Self, PropertyError> {
         let upstream = entity.resident()?;
-        let data = TrxEntityData::new(upstream.state.fork(), upstream.system_epoch());
+        let data = TrxEntityData::new(upstream.state.fork(), upstream.node_epoch());
         Ok(Self(Arc::new(LocalTrxEntityInner {
             origin: Origin::Mut { upstream },
             author,
@@ -75,7 +74,7 @@ impl LocalTrxEntity {
     /// Inspect identity without forcing a pending creation to generate its genesis.
     pub(crate) fn assigned_id(&self) -> Option<EntityId> { self.0.assigned_id() }
 
-    pub fn system_epoch(&self) -> SystemEpoch { self.0.data.system_epoch }
+    pub fn node_epoch(&self) -> NodeEpoch { self.0.data.node_epoch }
 
     pub fn head(&self) -> Clock { self.0.data.state.head() }
 
@@ -152,11 +151,11 @@ impl LocalTrxEntityInner {
     pub(in crate::entity) fn id(&self) -> EntityId {
         match &self.origin {
             Origin::Mut { upstream } => upstream.id,
-            Origin::Pending { genesis, system } => {
+            Origin::Pending { genesis } => {
                 genesis
                     .get_or_init(|| {
                         // Cannot fail: Yrs encoding has no error path, and LWW's bincode encoding of `Value`s cannot fail.
-                        let event = Event::genesis(*system, self.author.clone(), self.take_operations().unwrap());
+                        let event = Event::genesis(None, self.author.clone(), self.take_operations().unwrap());
                         self.data.state.set_head(Clock::singleton(&event));
                         self.data.events.lock().unwrap().push(event.clone().into());
                         event
@@ -168,7 +167,7 @@ impl LocalTrxEntityInner {
 
     pub(in crate::entity) fn assigned_id(&self) -> Option<EntityId> {
         match &self.origin {
-            Origin::Pending { genesis, .. } => genesis.get().map(|event| event.entity_id),
+            Origin::Pending { genesis } => genesis.get().map(|event| event.entity_id),
             Origin::Mut { upstream } => Some(upstream.id),
         }
     }

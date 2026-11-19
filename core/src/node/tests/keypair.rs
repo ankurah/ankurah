@@ -48,7 +48,6 @@ async fn a_node_stays_unkeyed_while_another_transaction_holds_the_keypair_lock_a
     let mut holder = storage.transaction();
     holder.map_lock_and_read(&[keypair_lock()], vec![]).await.unwrap();
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    node.system.wait_loaded().await.unwrap();
 
     let challenge = proto::Challenge::random();
     let presence = node.presence(Dialing, &challenge);
@@ -78,6 +77,6 @@ async fn a_storage_wipe_takes_the_keypair_and_the_next_node_generates_a_new_one(
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
     let wiped = node.wait_id().await.unwrap();
-    node.system.hard_reset().await.unwrap();
+    node.reset().await.unwrap();
     assert_ne!(Node::new(storage, PermissiveAgent::new()).wait_id().await.unwrap(), wiped);
 }

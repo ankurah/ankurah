@@ -16,6 +16,9 @@ use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChang
 use crate::engine::{maps, state};
 use crate::util::{cb_future::CBFuture, cb_race::CBRace, require::WBGRequire};
 
+#[cfg(all(test, target_arch = "wasm32"))]
+mod reset_tests;
+
 /// Key of the storage protocol epoch record in the `_ankurah_meta` object store.
 const PROTOCOL_VERSION_KEY: &str = "protocol_version";
 
@@ -25,6 +28,8 @@ pub struct Database(Arc<Inner>);
 #[derive(Debug)]
 struct Inner {
     connection: Arc<tokio::sync::Mutex<Connection>>,
+    /// Upgrade callbacks own their share even after their Rust caller drops.
+    reset: Arc<tokio::sync::RwLock<()>>,
     db_name: String,
     // _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
     /// Cache of existing index names to avoid repeated checks
@@ -47,6 +52,7 @@ impl Database {
 
         let database = Self(Arc::new(Inner {
             connection: Arc::new(tokio::sync::Mutex::new(connection)),
+            reset: Arc::default(),
             db_name: db_name.to_string(),
             // _callbacks: SendWrapper::new(Vec::new()), // Callbacks are now stored in Connection
             index_cache: SafeSet::new(),
@@ -144,6 +150,9 @@ impl Database {
     /// Close the database connection
     pub async fn close(&self) { self.0.connection.lock().await.close(); }
 
+    /// Drain queued and running upgrades before clearing their stores.
+    pub(crate) async fn hold_reset(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> { self.0.reset.clone().write_owned().await }
+
     /// Ensure an index exists, creating it if necessary via database version upgrade
     pub async fn assure_index_exists(&self, index_spec: &KeySpec<String>) -> Result<(), RetrievalError> {
         let name = index_spec.name_with("", "__");
@@ -158,8 +167,10 @@ impl Database {
         let lock_name = format!("ankurah-idb-upgrade-{}", self.0.db_name);
         let inner = self.0.clone();
         let spec = index_spec.clone();
+        let reset = inner.reset.clone().read_owned().await;
 
         NavigatorLock::with(&lock_name, async move || {
+            let _reset = reset;
             let name = spec.name_with("", "__");
             if inner.index_cache.contains(&name) {
                 return Ok(());
@@ -200,8 +211,10 @@ impl Database {
 
         let lock_name = format!("ankurah-idb-upgrade-{}", self.0.db_name);
         let inner = self.0.clone();
+        let reset = inner.reset.clone().read_owned().await;
 
         NavigatorLock::with(&lock_name, async move || {
+            let _reset = reset;
             // Without the Web Locks API, another tab's upgrade may take the
             // next version first, and this one then opens the database at
             // that version without the requested stores: the upgrade is tried again

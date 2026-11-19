@@ -38,7 +38,6 @@ async fn registration_fills_pending_bindings_and_restart_does_not_rebind() -> an
     let keys = common::test_keys();
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     let node = Node::new_durable(storage.clone(), agent.clone());
-    node.system.create().await?;
     let config = serde_json::from_value(serde_json::json!({
         "roles": {"reader": ["read"]},
         "collections": {"document": {"read": "read", "scope": [{"filter": "owner = $jwt.sub AND embargo = false"}]}}

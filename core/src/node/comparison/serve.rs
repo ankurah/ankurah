@@ -293,7 +293,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         known_state: KnownState,
         credentials: &Vec<PA::ContextData>,
     ) -> Result<ComparisonTarget, RetrievalError> {
-        self.system.check_not_halted()?;
+        self.lifecycle.check_not_halted()?;
         let limits = self.policy_agent.comparison_limits(credentials);
         let connection = self.peer_connections.get(&connection_id).ok_or_else(|| failure(ComparisonFailure::Expired))?;
         let mut reservation = self.captures.reserve((connection_id, id), &connection, selection.clone(), credentials.clone(), limits)?;
@@ -376,7 +376,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         credentials: &Vec<PA::ContextData>,
     ) -> Result<(), RetrievalError> {
         let result = (|| {
-            self.system.check_not_halted()?;
+            self.lifecycle.check_not_halted()?;
             checked.check_active()?;
             self.peer_connections.get(&checked.key.0).ok_or_else(|| failure(ComparisonFailure::Expired))?;
             if checked.slot.credentials != *credentials {
