@@ -270,7 +270,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
             let held = held.clone();
             tokio::spawn(async move {
                 while let Some(message) = client_rx.recv().await {
-                    if matches!(&message, proto::NodeMessage::Update(_)) {
+                    if matches!(&message, proto::NodeMessage::Update(update) if matches!(update.body, proto::NodeUpdateBody::SubscriptionUpdate { .. })) {
                         if let Some(held) = held.lock().unwrap().as_mut() {
                             held.push(message);
                             continue;
