@@ -15,11 +15,13 @@
 //! transaction on a connection of its own, which in the engine's
 //! write-ahead-log journal mode waits for no writer.
 //!
-//! A database in memory keeps no maps: each connection to it is a database of
-//! its own.
+//! A private-memory database has one connection. Its map calls release that
+//! connection between operations, stage writes, and validate a shared map
+//! revision when they read and commit.
 
 pub(super) mod calls;
 mod connections;
+pub(super) mod memory;
 mod snapshot;
 pub(super) mod statements;
 
@@ -27,7 +29,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, OnceCell};
 
-use crate::connection::SqliteConnectionManager;
+use crate::connection::{PooledConnection, SqliteConnectionManager};
 use crate::error::SqliteError;
 
 use self::connections::Connections;
@@ -38,6 +40,11 @@ pub use self::snapshot::SqliteMapSnapshot;
 /// turn its map transactions take.
 pub(crate) struct Maps {
     connections: Arc<Connections>,
+    pub(super) pool: bb8::Pool<SqliteConnectionManager>,
+    pub(super) names: ankurah_core::storage::LockTable,
+    /// Keep access to a private-memory database independent of pool checkout:
+    /// an unpolled checkout future can otherwise retain its only pool lease.
+    memory: OnceCell<Option<PooledConnection>>,
 
     /// The engine's writer turn, so that its map transactions queue for the
     /// write lock here, holding no connection, rather than in SQLite's busy
@@ -52,32 +59,47 @@ pub(crate) struct Maps {
 impl Maps {
     /// The map calls of an engine whose connections `pool` opens.
     pub(super) fn new(pool: bb8::Pool<SqliteConnectionManager>) -> Self {
-        Self { connections: Connections::new(pool), turn: Arc::new(Mutex::new(())), table: OnceCell::new() }
+        Self {
+            connections: Connections::new(pool.clone()),
+            pool,
+            names: Default::default(),
+            memory: OnceCell::new(),
+            turn: Arc::new(Mutex::new(())),
+            table: OnceCell::new(),
+        }
+    }
+
+    pub(super) async fn in_memory(&self) -> Result<bool, SqliteError> { Ok(self.memory_connection().await?.is_some()) }
+
+    pub(super) async fn memory_connection(&self) -> Result<Option<PooledConnection>, SqliteError> {
+        Ok(self
+            .memory
+            .get_or_try_init(|| async {
+                let pooled = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
+                let memory = pooled
+                    .with_connection(|connection| {
+                        let file: String =
+                            connection.query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |row| row.get(0))?;
+                        Ok(file.is_empty())
+                    })
+                    .await?;
+                Ok::<_, SqliteError>(memory.then(|| (*pooled).clone()))
+            })
+            .await?
+            .clone())
     }
 
     /// A connection for map calls, on a database that keeps maps.
-    async fn lease(&self) -> Result<Lease, SqliteError> {
+    pub(super) async fn lease(&self) -> Result<Lease, SqliteError> {
         self.table.get_or_try_init(|| self.create_table()).await?;
         self.connections.lease().await
     }
 
-    /// Create the maps' table, if the database has none yet:
-    /// [`SqliteError::MapsInMemory`] for a database in memory, which has no
-    /// file.
+    /// Create the file-backed database's maps on a dedicated connection.
     async fn create_table(&self) -> Result<(), SqliteError> {
         let mut lease = self.connections.lease().await?;
 
-        lease
-            .run(|connection| {
-                let file: String =
-                    connection.query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |row| row.get(0))?;
-                if file.is_empty() {
-                    return Err(SqliteError::MapsInMemory);
-                }
-
-                statements::create_table(connection)
-            })
-            .await
+        lease.run(statements::create_table).await
     }
 }
 

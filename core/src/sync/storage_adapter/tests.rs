@@ -11,6 +11,7 @@ use crate::sync::conformance::fixtures::{self, by_number, created, item, stores,
 use crate::sync::conformance::{self, TestDatabase};
 use crate::test_utils::TestStorage;
 
+mod buffered;
 mod cache;
 mod cancellation;
 mod damage;

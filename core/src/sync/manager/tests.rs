@@ -1,4 +1,4 @@
-//! The manager's public open/view API, residency, and caller-owned maintenance.
+//! Query-driven residency and reconciliation from canonical storage.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use crate::storage::StorageTransaction;
 use crate::sync::EntityVersion;
 use crate::test_utils::TestStorage;
 
+mod continuation;
 mod lifetime;
 mod maintenance;
 mod opening;
@@ -148,15 +149,14 @@ impl<G: DigestGroup> Fixture<G> {
         Ok(())
     }
 
-    /// Canonical states, tree writes, storage commit and cache publication
-    /// share one publication turn.
+    /// Commit canonical state, then reconcile before releasing publication.
     async fn commit(&self, changes: &[(Option<Version>, Option<Version>)]) -> anyhow::Result<()> {
         let _publication = self.publication.lock().await;
         let mut trx = self.storage.transaction();
         write_versions(&mut trx, changes).await?;
-        let applied = self.manager.apply(&mut trx, changes).await?;
-        assert!(applied.refused().is_empty() && applied.retired().is_empty());
-        applied.landed(&trx.commit().await?.committed()?);
+        self.manager.invalidate();
+        trx.commit().await?.committed()?;
+        self.manager.maintain_locked(false).await?;
         Ok(())
     }
 }

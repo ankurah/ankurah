@@ -319,12 +319,13 @@ async fn write_entity_rows(
         transaction
             .execute(
                 &format!(
-                    r#"INSERT INTO "{ENTITY_TABLE}" ("id", "state_buffer", "head", "attestations")
-                       VALUES ($1, $2, $3, $4)
+                    r#"INSERT INTO "{ENTITY_TABLE}" ("id", "state_buffer", "head", "attestations", "state_writer")
+                       VALUES ($1, $2, $3, $4, txid_current())
                        ON CONFLICT ("id") DO UPDATE SET
                            "state_buffer" = EXCLUDED."state_buffer",
                            "head" = EXCLUDED."head",
-                           "attestations" = EXCLUDED."attestations""#
+                           "attestations" = EXCLUDED."attestations",
+                           "state_writer" = EXCLUDED."state_writer""#
                 ),
                 &[&entity_id, &write.state_buffers, &write.head, &write.attestations],
             )

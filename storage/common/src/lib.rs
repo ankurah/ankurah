@@ -8,6 +8,7 @@ pub mod planner;
 pub mod predicate;
 pub mod selection;
 pub mod sorting;
+pub mod state;
 pub mod traits;
 pub mod types;
 

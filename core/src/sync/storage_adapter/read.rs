@@ -2,6 +2,7 @@
 //! maps.
 
 use std::ops::Bound;
+use std::sync::Arc;
 
 use ankurah_digest_tree::{DigestGroup, Encode, ReadTrx, Row, RowKey, StoreError};
 
@@ -21,11 +22,31 @@ pub struct StorageEngineSnapshot<SE: StorageEngine, K, L, G> {
 
     /// The generation the snapshot sees the tree's rows at.
     generation: u64,
+    pub(super) buffered: Option<Arc<super::Buffered>>,
+    pub(super) writes: crate::storage::pending_writes::PendingWrites,
 }
 
 impl<SE: StorageEngine, K, L, G> StorageEngineSnapshot<SE, K, L, G> {
     pub(super) fn new(store: EngineAdapter<SE, K, L, G>, snapshot: SE::Snapshot, generation: u64) -> Self {
-        Self { store, snapshot, generation }
+        Self { store, snapshot, generation, buffered: None, writes: Default::default() }
+    }
+
+    pub(super) async fn map_read(&mut self, reads: Vec<MapRead>) -> Result<Vec<crate::storage::MapRows>, StoreError> {
+        let (reads, own) = self.writes.read(reads);
+        let stored = match &self.buffered {
+            Some(buffered) => {
+                let (reads, overlay) = buffered.writes.read(reads);
+                let stored =
+                    if reads.is_empty() { Vec::new() } else { self.snapshot.map_read(reads).await.map_err(snapshot_store_failure)? };
+                overlay.answer(stored)
+            }
+            None => self.snapshot.map_read(reads).await.map_err(snapshot_store_failure)?,
+        };
+        Ok(own.answer(stored))
+    }
+
+    pub(super) fn rows_map(&self) -> crate::storage::MapId {
+        self.buffered.as_ref().map_or_else(|| self.store.inner().rows.clone(), |buffered| buffered.base.incarnation.rows())
     }
 }
 
@@ -46,10 +67,14 @@ where
     /// which the cache then keeps.
     async fn get_many(&mut self, keys: &[RowKey]) -> Result<Vec<Option<Row<K, L, G>>>, StoreError> {
         let tree = self.store.inner();
-        let mut read = ByKey::new(keys);
+        let mut read = ByKey::new(keys, self.rows_map());
+        read.fill_from_pending(&tree.id, &self.writes)?;
+        if let Some(buffered) = &self.buffered {
+            read.fill_from_pending(&tree.id, &buffered.writes)?;
+        }
         read.fill_from_cache(tree, self.generation);
 
-        if let Some(unread) = read.unread(tree) {
+        if let Some(unread) = read.unread() {
             let answers = self.snapshot.map_read(vec![unread]).await.map_err(snapshot_store_failure)?;
             read.fill_from_storage(tree, answers, Some(self.generation))?;
         }
@@ -64,10 +89,9 @@ where
         direction: ScanDirection,
         limit: usize,
     ) -> Result<Vec<(RowKey, Row<K, L, G>)>, StoreError> {
-        let tree = self.store.inner();
-        let read = MapRead::Range { map: tree.rows.clone(), start: encode_bound(start), end: encode_bound(end), direction, limit };
+        let read = MapRead::Range { map: self.rows_map(), start: encode_bound(start), end: encode_bound(end), direction, limit };
 
-        let entries = ranged(self.snapshot.map_read(vec![read]).await.map_err(snapshot_store_failure)?)?;
-        entries.into_iter().map(|entry| decode_entry(&tree.id, entry)).collect()
+        let entries = ranged(self.map_read(vec![read]).await?)?;
+        entries.into_iter().map(|entry| decode_entry(&self.store.inner().id, entry)).collect()
     }
 }

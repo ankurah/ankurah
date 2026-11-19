@@ -15,8 +15,8 @@ use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     schema::CatalogResolver,
     storage::{
-        transaction_call, CommittedEntityWrite, LockName, MapRead, MapRows, MapWrite, StorageCommitOutcome, StorageCommitResult,
-        StorageEngine, StorageTransaction,
+        transaction_call, CommittedEntityWrite, LockName, MapRead, MapRows, MapWrite, StateCursor, StateSnapshot, StorageCommitOutcome,
+        StorageCommitResult, StorageEngine, StorageTransaction,
     },
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
@@ -38,6 +38,7 @@ mod dump;
 mod maps;
 mod materialization;
 mod query;
+mod state;
 #[cfg(test)]
 #[path = "../tests/server/mod.rs"]
 mod test_server;
@@ -53,10 +54,8 @@ pub const DEFAULT_POOL_SIZE: u32 = 15;
 /// Default connection timeout in seconds
 pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
-/// Engine-level key/value metadata for the store itself (currently just the
-/// 'protocol_version' record). Not application data: it survives
-/// [`StorageEngine::delete_all`], because wiping the record would make the store
-/// read as unversioned and refuse its own reopen.
+/// Engine compatibility and canonical-state incarnation. A reset retains the
+/// protocol version and replaces the incarnation to invalidate saved cursors.
 const META_TABLE: &str = "_ankurah_meta";
 const MODEL_REGISTRATION_TABLE: &str = "_ankurah_postgres_model_map";
 const COLUMN_MAP_TABLE: &str = "_ankurah_postgres_column_map";
@@ -283,6 +282,7 @@ impl Postgres {
                 )
                 .await
                 .map_err(|error| StateError::DDLError(Box::new(error)))?;
+            state::ensure(client).await?;
             // Stores without this index gain it on their first read or write.
             client
                 .execute(
@@ -489,6 +489,10 @@ impl StorageEngine for Postgres {
         query::Query::prepare(self, selection).await?.states(self).await
     }
 
+    async fn state_snapshot(&self, since: Option<&StateCursor>) -> Result<Box<dyn StateSnapshot>, RetrievalError> {
+        Ok(Box::new(state::Snapshot::begin(self, since).await?))
+    }
+
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
         if event_ids.is_empty() {
             return Ok(Vec::new());
@@ -532,7 +536,7 @@ impl StorageEngine for Postgres {
     async fn delete_all(&self) -> Result<bool, MutationError> {
         self.materializations.clear();
 
-        // Start a transaction to drop all tables atomically, on a connection
+        // Reset all data atomically, on a connection
         // of the maps': a map transaction the reset waits for then finds the
         // engine's pool free for its commit, and the maps' lock timeout
         // bounds every lock wait of the reset, the tables' drops included.
@@ -541,7 +545,7 @@ impl StorageEngine for Postgres {
         let lease = self.maps.lease().await.map_err(|err| MutationError::General(Box::new(err)))?;
         let client = &lease.connection().client;
         lease.begin("BEGIN").await.map_err(|err| MutationError::General(Box::new(err)))?;
-        let emptied = maps::reset(client).await.map_err(|err| MutationError::General(Box::new(err)))?;
+        let mut emptied = maps::reset(client).await.map_err(|err| MutationError::General(Box::new(err)))?;
 
         let rows = client
             .query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[])
@@ -549,13 +553,27 @@ impl StorageEngine for Postgres {
             .map_err(|err| MutationError::General(Box::new(err)))?;
         let existing: BTreeSet<String> = rows.into_iter().map(|row| row.get("table_name")).collect();
 
+        // A canonical-state snapshot can span map reads and initial-build
+        // flushes. DROP would wait for its relation locks while holding the
+        // reset lock those map transactions need. MVCC deletes let the old
+        // snapshot finish; rotating its incarnation below prevents its reuse.
+        for table in [ENTITY_MODEL_TABLE, ENTITY_TABLE] {
+            if existing.contains(table) {
+                emptied |= client
+                    .execute(&format!(r#"DELETE FROM "{table}""#), &[])
+                    .await
+                    .map_err(|error| MutationError::UpdateFailed(Box::new(error)))?
+                    > 0;
+            }
+        }
+
         // Dynamic materialization names are engine-owned only when recorded in
         // the durable model map. Never infer ownership from an arbitrary table
         // in the shared schema.
         let mut owned: BTreeSet<String> = FIXED_STORAGE_TABLES
             .iter()
             .copied()
-            .filter(|name| ![META_TABLE, MAP_TABLE].contains(name) && existing.contains(*name))
+            .filter(|name| ![META_TABLE, MAP_TABLE, ENTITY_TABLE, ENTITY_MODEL_TABLE].contains(name) && existing.contains(*name))
             .map(str::to_owned)
             .collect();
         if existing.contains(MODEL_REGISTRATION_TABLE) {
@@ -577,6 +595,8 @@ impl StorageEngine for Postgres {
             let drop_query = format!("DROP TABLE IF EXISTS {}", quote_identifier(&table_name));
             client.execute(&drop_query, &[]).await.map_err(|err| MutationError::General(Box::new(err)))?;
         }
+
+        state::reset(client).await?;
 
         // Commit the transaction
         lease.end("COMMIT").await.map_err(|err| MutationError::General(Box::new(err)))?;

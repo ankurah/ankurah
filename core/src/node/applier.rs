@@ -217,6 +217,7 @@ impl NodeApplier {
         storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
         storage_trx.add_events(events).await?;
         let _publication = node.commit_publication_lock.lock().await;
+        node.invalidate_trees();
         match storage_trx.commit().await? {
             crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
             crate::storage::StorageCommitOutcome::Committed(_) => {}
@@ -260,6 +261,7 @@ impl NodeApplier {
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
+            node.invalidate_trees();
             storage_trx.commit().await?.committed()?;
             if adopted {
                 let (_, entity) = node
@@ -300,6 +302,7 @@ impl NodeApplier {
             storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
+            node.invalidate_trees();
             storage_trx.commit().await?.committed()?;
             let change = candidate.commit(&node.entities, event_getter, false).await?;
             Ok((!change.events().is_empty()).then_some(change))

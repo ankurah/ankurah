@@ -191,6 +191,7 @@ dependencies = [
  "uniffi",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-time",
  "yrs",
 ]
 
@@ -345,6 +346,7 @@ version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah-core-types",
+ "ankurah-digest-tree",
  "anyhow",
  "base64 0.22.1",
  "bincode",
@@ -393,6 +395,7 @@ dependencies = [
  "ankurah-proto",
  "futures",
  "indexmap 2.12.1",
+ "rand 0.9.2",
  "serde",
  "thiserror 2.0.17",
  "tracing",
@@ -456,6 +459,7 @@ dependencies = [
  "bytes",
  "ctor 0.2.9",
  "futures-util",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "testcontainers",

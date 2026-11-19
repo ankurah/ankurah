@@ -31,6 +31,9 @@ pub(super) struct LiveQueryInner {
     pub(super) current_version: AtomicU32,
     /// Resolved, policy-scoped intent; absent while initial resolution waits.
     pub(super) selection: Mut<Option<(ankql::ast::Selection<Resolved>, u32)>>,
+    /// The digest crate's own view, with its storage type erased by the context.
+    /// Keeping it alive keeps this query's backing tree maintained after LRU eviction.
+    digest_tree: std::sync::Mutex<Option<Box<dyn Send + Sync>>>,
     gap_fetcher: Arc<dyn GapFetcher<Entity>>,
     pub(super) cache_policy: CachePolicy,
     /// Dropping this handle cancels pending resolution on replacement or query drop.
@@ -59,6 +62,7 @@ impl LiveQueryInner {
             durable_notify: tokio::sync::Notify::new(),
             current_version: AtomicU32::new(1),
             selection: Mut::new(None),
+            digest_tree: std::sync::Mutex::new(None),
             gap_fetcher,
             cache_policy,
             resolution_task: std::sync::Mutex::new(None),
@@ -166,6 +170,15 @@ impl LiveQueryInner {
         }
 
         debug!("LiveQuery.activate() for predicate {} (version {})", self.query_id, version);
+
+        let digest_tree = self.context.digest_tree(selection.clone()).await?;
+        {
+            let _version = self.version_lock.lock().unwrap_or_else(|error| error.into_inner());
+            if !self.is_current(version) {
+                return Ok(());
+            }
+            *self.digest_tree.lock().unwrap() = Some(digest_tree);
+        }
 
         let reactor = self.context.node()?.reactor().clone();
 

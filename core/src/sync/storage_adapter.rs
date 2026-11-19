@@ -14,6 +14,7 @@ use super::Error;
 use crate::storage::{LockName, MapId, MapRows, MapSnapshot, StorageEngine};
 
 mod apply;
+mod buffered;
 mod by_key;
 mod cache;
 mod guard;
@@ -24,6 +25,7 @@ mod rows;
 mod trx;
 
 pub use apply::{apply, AppliedTrees, TreeChange};
+pub(in crate::sync) use buffered::Buffered;
 pub use cache::{CacheSettings, StorageCache};
 pub use layout::names::TreeId;
 pub use lifecycle::{create, drop, open, rebuild};
@@ -49,26 +51,39 @@ pub(super) struct Inner<SE> {
     lock: LockName,
     rows: MapId,
     log: MapId,
+    buffered: std::sync::Mutex<Option<Arc<Buffered>>>,
+    publication: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 /// A tree write's generation and cached row changes, published after the
 /// owner's storage transaction commits. An empty write keeps nothing.
 pub struct TreeLanding {
     written: Option<(u64, Changed)>,
+    buffered: Vec<crate::storage::MapWrite>,
 }
 
 impl TreeLanding {
     /// The landing of a write that wrote nothing.
-    fn nothing() -> Self { Self { written: None } }
+    fn nothing() -> Self { Self { written: None, buffered: Vec::new() } }
 
     /// The landing of a write that brought the tree to `generation`, changing
     /// `changed`.
-    fn of(generation: u64, changed: Changed) -> Self { Self { written: Some((generation, changed)) } }
+    fn of(generation: u64, changed: Changed) -> Self { Self { written: Some((generation, changed)), buffered: Vec::new() } }
 }
 
 impl<SE: StorageEngine> Inner<SE> {
     fn new(storage: Arc<SE>, cache: Arc<StorageCache>, id: TreeId, incarnation: Incarnation) -> Self {
-        Self { storage, cache, lock: id.lock(), rows: incarnation.rows(), log: incarnation.log(), id, incarnation }
+        Self {
+            storage,
+            cache,
+            lock: id.lock(),
+            rows: incarnation.rows(),
+            log: incarnation.log(),
+            id,
+            incarnation,
+            buffered: std::sync::Mutex::new(None),
+            publication: std::sync::Mutex::new(None),
+        }
     }
 
     /// The generation the tree's rows are kept at in the cache, if any are.
@@ -159,6 +174,10 @@ where
     /// opened fails the read.
     async fn begin_read(&self) -> Result<StorageEngineSnapshot<SE, K, L, G>, StoreError> {
         let tree = self.inner();
+        let buffered = tree.buffered.lock().unwrap().clone();
+        if let Some(buffered) = buffered {
+            return self.read_buffered(buffered).await;
+        }
         // Sampled before the snapshot begins, so a cache ahead of what it
         // finds can only hold rows said to have landed that didn't.
         let cached = tree.cached_generation();
@@ -181,6 +200,11 @@ where
     fn owns(&self, trx: &StorageEngineTrx<'_, SE, K, L, G>) -> bool { self.same_tree(trx.store()) }
 
     fn landed(&self, landing: TreeLanding) {
+        if !landing.buffered.is_empty() {
+            let mut buffered = self.inner.buffered.lock().unwrap();
+            let buffered = Arc::make_mut(buffered.as_mut().expect("a buffered transaction belongs to a buffered store"));
+            buffered.writes.add(landing.buffered);
+        }
         if let Some((generation, changed)) = landing.written {
             self.inner().cache.land(&self.inner().rows, generation, changed);
         }

@@ -22,6 +22,7 @@ use crate::{
 
 mod maps;
 mod query;
+pub(crate) mod state;
 mod transaction;
 use maps::MapLocks;
 pub use maps::SledMapSnapshot;
@@ -116,6 +117,13 @@ impl StorageEngine for SledStorageEngine {
         Ok(SledMapSnapshot::begin(self, locks).await)
     }
 
+    async fn state_snapshot(
+        &self,
+        since: Option<&ankurah_core::storage::StateCursor>,
+    ) -> Result<Box<dyn ankurah_core::storage::StateSnapshot>, RetrievalError> {
+        Ok(Box::new(state::SledStateSnapshot::begin(self, since).await?))
+    }
+
     async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> { SledStorageEngine::list_models(self) }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
@@ -179,9 +187,12 @@ impl StorageEngine for SledStorageEngine {
         let _reset = self.map_locks.hold_reset().await;
         let mut any_deleted = false;
 
-        // Get all tree names and drop them
         {
-            let database = self.database.lock().unwrap();
+            let mut database = self.database.lock().unwrap();
+            let previous = database.clone();
+            // State snapshots and commits use the same guard, so neither
+            // observes a reset part way through its canonical stores.
+            let _state = previous.index_manager.mutation_lock.lock().unwrap();
             let tree_names = database.db.tree_names();
 
             // Drop each tree
@@ -198,15 +209,9 @@ impl StorageEngine for SledStorageEngine {
                     }
                 }
             }
-        }
-
-        // Recreate the Database to ensure all tree references are fresh
-        {
-            let mut database_guard = self.database.lock().unwrap();
-            let old_database = database_guard.clone();
-            let new_database = Database::open(old_database.db.clone())
-                .map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
-            *database_guard = Arc::new(new_database);
+            let new_database =
+                Database::open(previous.db.clone()).map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
+            *database = Arc::new(new_database);
         }
 
         Ok(any_deleted)

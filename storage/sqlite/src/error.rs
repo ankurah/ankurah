@@ -31,25 +31,36 @@ pub enum SqliteError {
     #[error("Task join error: {0}")]
     TaskJoin(String),
 
+    #[error("the snapshot changed between reads")]
+    SnapshotChanged,
+
+    #[error("the canonical-state continuation cursor is no longer valid")]
+    InvalidStateCursor,
+
     #[error("incompatible store protocol version: found {found}, required {expected}; reset your development database (or migrate the store) before opening it with this binary")]
     ProtocolVersionMismatch { found: String, expected: u32 },
 
     #[error("store has existing ankurah tables but no recorded protocol version (pre-{expected} store); reset your development database (or migrate the store) before opening it with this binary")]
     UnversionedStore { expected: u32 },
-
-    /// A database in memory keeps no ordered maps: each connection to it is
-    /// a database of its own, so a map transaction's or a snapshot's
-    /// connection would see none of the others' maps.
-    #[error("an SQLite database in memory keeps no ordered maps: each connection to it is a database of its own")]
-    MapsInMemory,
 }
 
 impl From<SqliteError> for ankurah_core::error::RetrievalError {
-    fn from(err: SqliteError) -> Self { ankurah_core::error::RetrievalError::storage(err) }
+    fn from(err: SqliteError) -> Self {
+        match err {
+            SqliteError::SnapshotChanged => ankurah_core::error::MutationError::WriteConflict.into(),
+            SqliteError::InvalidStateCursor => Self::InvalidStateCursor,
+            error => Self::storage(error),
+        }
+    }
 }
 
 impl From<SqliteError> for ankurah_core::error::MutationError {
-    fn from(err: SqliteError) -> Self { ankurah_core::error::MutationError::General(Box::new(err)) }
+    fn from(err: SqliteError) -> Self {
+        match err {
+            SqliteError::SnapshotChanged => Self::WriteConflict,
+            error => Self::General(Box::new(error)),
+        }
+    }
 }
 
 impl From<SqliteError> for ankurah_core::error::StateError {

@@ -8,13 +8,14 @@ use ankurah_digest_tree::{DigestGroup, Encode, Row, RowKey, StoreError};
 
 use super::rows::{decode_row, got, row_or_damage};
 use super::Inner;
-use crate::storage::{MapRead, MapRows, StorageEngine};
+use crate::storage::{pending_writes::PendingWrites, MapId, MapRead, MapRows, StorageEngine};
 use crate::sync::storage_adapter::cache::admits;
 use crate::sync::TreeId;
 
 /// One read of a tree's rows by key.
 pub(super) struct ByKey<'k, K, L, G: DigestGroup> {
     keys: &'k [RowKey],
+    rows: MapId,
 
     /// Each key's row, `None` until the key is answered.
     answers: Vec<Option<Option<Row<K, L, G>>>>,
@@ -26,7 +27,19 @@ where
     L: Encode + Clone + Send + Sync + 'static,
     G: DigestGroup,
 {
-    pub(super) fn new(keys: &'k [RowKey]) -> Self { Self { keys, answers: keys.iter().map(|_| None).collect() } }
+    pub(super) fn new(keys: &'k [RowKey], rows: MapId) -> Self { Self { keys, rows, answers: keys.iter().map(|_| None).collect() } }
+
+    /// Answer writes before consulting the durable generation's cache. A
+    /// deletion or clear is an answer too; it must not fall through to storage.
+    pub(super) fn fill_from_pending(&mut self, tree: &TreeId, pending: &PendingWrites) -> Result<(), StoreError> {
+        let rows = self.rows.clone();
+        for (key, answer) in self.unanswered() {
+            if let Some(bytes) = pending.get(&rows, &key.encode()) {
+                *answer = Some(bytes.map(|bytes| decode_row(tree, bytes)).transpose()?);
+            }
+        }
+        Ok(())
+    }
 
     /// Answer the keys among `found`, the bytes of rows a read with the
     /// tree's lock found.
@@ -43,10 +56,10 @@ where
     /// Answer the keys whose rows the cache keeps of the tree at exactly
     /// `generation`.
     pub(super) fn fill_from_cache<SE: StorageEngine>(&mut self, tree: &Inner<SE>, generation: u64) {
+        let map = self.rows.clone();
         let unanswered: Vec<_> = self.unanswered().into_iter().filter(|(key, _)| admits(key)).collect();
-        let rows = tree
-            .cache
-            .get_many(&tree.rows, generation, unanswered.iter().map(|(key, _)| key.encode()), |bytes| row_or_damage(&tree.id, bytes));
+        let rows =
+            tree.cache.get_many(&map, generation, unanswered.iter().map(|(key, _)| key.encode()), |bytes| row_or_damage(&tree.id, bytes));
         for ((_, answer), row) in unanswered.into_iter().zip(rows) {
             if let Some(row) = row {
                 *answer = Some(Some(row));
@@ -55,10 +68,10 @@ where
     }
 
     /// The read of the keys not yet answered, or `None` when every one is.
-    pub(super) fn unread<SE: StorageEngine>(&self, tree: &Inner<SE>) -> Option<MapRead> {
+    pub(super) fn unread(&self) -> Option<MapRead> {
         let keys: Vec<Vec<u8>> =
             self.keys.iter().zip(&self.answers).filter(|(_, answer)| answer.is_none()).map(|(key, _)| key.encode()).collect();
-        (!keys.is_empty()).then(|| MapRead::Get { map: tree.rows.clone(), keys })
+        (!keys.is_empty()).then(|| MapRead::Get { map: self.rows.clone(), keys })
     }
 
     /// Answer the keys not yet answered from `answers`, the answers to their
@@ -70,6 +83,7 @@ where
         answers: Vec<MapRows>,
         generation: Option<u64>,
     ) -> Result<(), StoreError> {
+        let map = self.rows.clone();
         let unanswered = self.unanswered();
         let values = got(answers, unanswered.len())?;
         let rows = values
@@ -85,7 +99,7 @@ where
                     None
                 }
             });
-            tree.cache.fill_many(&tree.rows, generation, fills);
+            tree.cache.fill_many(&map, generation, fills);
         }
 
         for ((_, answer), row) in unanswered.into_iter().zip(rows) {

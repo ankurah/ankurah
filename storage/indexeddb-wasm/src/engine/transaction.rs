@@ -149,6 +149,10 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
             for name in ["entities", "entity_models", "materializations", "events"] {
                 store_names.push(&JsValue::from_str(name));
             }
+            if !staged_entities.is_empty() {
+                store_names.push(&state::META.into());
+                store_names.push(&state::CHANGES.into());
+            }
             if landing.is_some() {
                 for name in maps::STORES {
                     store_names.push(&JsValue::from_str(name));
@@ -205,12 +209,16 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
 
             let events = transaction.object_store("events").require("get events store")?;
             insert_events(&events, &staged_events).await?;
+            let position = if staged_entities.is_empty() { None } else { Some(state::advance(&transaction).await?) };
             let mut committed = Vec::with_capacity(staged_entities.len());
             for (original_index, write) in ordered {
                 let entity_id = write.entity_id;
                 let id_key = JsValue::from_str(&entity_id.to_base64());
                 let put = entities.put_with_key(&write.object, &id_key).require("put canonical entity")?;
                 cb_future(&put, "success", "error").await.require("await canonical entity put")?;
+                if let Some(position) = position {
+                    state::write_change(&transaction.object_store(state::CHANGES).require("get state changes")?, entity_id, position)?;
+                }
 
                 let prior = prior_models
                     .remove(&entity_id)

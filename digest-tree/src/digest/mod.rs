@@ -96,7 +96,8 @@ pub trait DigestGroup: Copy + Eq + fmt::Debug + Send + Sync + 'static + group::G
 
 /// The digest of a set of members: the sum of their elements, and how many
 /// there are. Two digests are equal when both their sums and their counts
-/// are.
+/// are. Serialization uses the canonical, versioned byte encoding; decoding
+/// rejects another group's encoding or a noncanonical group element.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Digest<G: DigestGroup> {
     element: G::Element,

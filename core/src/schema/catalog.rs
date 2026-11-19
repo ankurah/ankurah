@@ -5,7 +5,7 @@ pub use model::*;
 use resolver::ModelResolutionError;
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use ankql::ast::{Parsed, Predicate, Resolved, Selection};
 use ankurah_proto::{self as proto, EntityId, ModelId, PropertyId};
@@ -62,6 +62,9 @@ struct CatalogIndex {
 
 pub struct CatalogManager {
     index: OnceLock<Calculated<CatalogIndex>>,
+    /// Validated registration replies can precede catalog subscription delivery.
+    /// These immutable property types belong to this node's one system epoch.
+    bound_types: Mutex<HashMap<EntityId, ValueType>>,
     ready: Mut<bool>,
     /// Hold declaration lookup through commit so concurrent registrations reuse identities
     /// rather than both seeing a missing declaration and allocating different IDs.
@@ -69,7 +72,14 @@ pub struct CatalogManager {
 }
 
 impl Default for CatalogManager {
-    fn default() -> Self { Self { index: OnceLock::new(), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) } }
+    fn default() -> Self {
+        Self {
+            index: OnceLock::new(),
+            bound_types: Mutex::new(HashMap::new()),
+            ready: Mut::new(false),
+            allocator: tokio::sync::Mutex::new(()),
+        }
+    }
 }
 
 fn rows<R: View + Clone + 'static>(query: &LiveQuery<R>) -> Vec<(EntityId, R::Model)> {
@@ -254,6 +264,10 @@ impl CatalogManager {
     pub fn property_by_id(&self, id: &EntityId) -> Result<Option<SysPropertyRow>, RetrievalError> {
         self.with_property_by_id(id, Clone::clone)
     }
+
+    /// A type from a successfully validated registration reply, before its
+    /// canonical Property state arrives. Callers prefer an available definition.
+    pub(crate) fn bound_value_type(&self, id: &EntityId) -> Option<ValueType> { self.bound_types.lock().unwrap().get(id).copied() }
 
     pub fn property_by_name(&self, model: &EntityId, name: &str) -> Result<Option<(EntityId, SysPropertyRow)>, RetrievalError> {
         let Some(PropertyId::EntityId(id)) = self.try_resolve(&proto::ModelId::EntityId(*model), name)? else { return Ok(None) };

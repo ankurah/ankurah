@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ankql::ast::{ComparisonOperator, Expr, Predicate, Selection};
-use ankurah::core::entity::TemporaryEntity;
 use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
 use ankurah::core::storage::{StorageEngine, StorageTransaction};
 use ankurah::core::sync::conformance::fixtures::{assert_holds, created, item, stores};
@@ -192,14 +191,11 @@ async fn manager_maintenance_agrees_with_sql_for_a_nullable_conjunction_under_no
         let _publication = publication.lock().await;
         let mut trx = storage.transaction();
         trx.set_state(&before.payload.state.head, &after).await?;
-        let changes = [(
-            Some(TemporaryEntity::new(before.payload.entity_id, &before.payload.state)?),
-            Some(TemporaryEntity::new(after.payload.entity_id, &after.payload.state)?),
-        )];
-        let applied = manager.apply(&mut trx, &changes).await?;
-        assert!(applied.refused().is_empty() && applied.retired().is_empty());
-        applied.landed(&trx.commit().await?.committed()?);
+        manager.invalidate();
+        trx.commit().await?.committed()?;
     }
+    manager.maintain().await?;
+    manager.flush().await?;
 
     assert_eq!(storage.get_state(after.payload.entity_id).await?.payload.state.head, after.payload.state.head);
     let maintained: Vec<_> = tree.view().range(..)?.map_ok(|leaf| (leaf.id.0, leaf.payload.0)).try_collect().await?;

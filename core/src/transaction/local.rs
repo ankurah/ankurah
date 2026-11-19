@@ -230,6 +230,7 @@ impl Transaction {
                 relayed = true;
             }
             let publication = node.commit_publication_lock.lock().await;
+            node.invalidate_trees();
             storage_trx.commit().await?.committed()?;
             // Tests widen the window between the storage commit and the publication, in which a read
             // may load what was committed (tests/tests/publication_window.rs).

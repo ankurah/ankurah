@@ -7,7 +7,6 @@ use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicat
 use ankurah::core::sync::conformance::fixtures::{self, assert_holds, commit, created, item, stores};
 use ankurah::core::sync::conformance::{self, TestDatabase};
 use ankurah::core::{
-    entity::TemporaryEntity,
     property::backend::{LWWBackend, PropertyBackend},
     storage::{StorageEngine, StorageTransaction},
     sync::{CacheSettings, TreeId, TreeManager},
@@ -45,7 +44,7 @@ async fn a_trees_commits_outlive_its_databases_closing() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn a_manager_builds_maintains_and_rebuilds_from_canonical_sled_states() -> anyhow::Result<()> {
+async fn a_manager_builds_maintains_and_resumes_from_canonical_sled_states() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let model = ModelId::EntityId(EntityId::from_bytes([80; 32]));
     let score = PropertyId::EntityId(EntityId::from_bytes([90; 32]));
@@ -72,7 +71,7 @@ async fn a_manager_builds_maintains_and_rebuilds_from_canonical_sled_states() ->
     let third = entity(3, 20, false, 3)?;
     let moved = entity(1, 5, true, 11)?;
     let entered = entity(3, 20, true, 13)?;
-    let while_absent = entity(2, 40, true, 22)?;
+    let while_absent = entity(2, 1, true, 22)?;
     let selection = Selection {
         predicate: Predicate::Comparison {
             left: Box::new(Expr::Path(active.into())),
@@ -101,41 +100,26 @@ async fn a_manager_builds_maintains_and_rebuilds_from_canonical_sled_states() ->
         let members: Vec<_> = tree.view().range(..)?.map_ok(|leaf| (leaf.id.0, leaf.payload.0)).try_collect().await?;
         assert_eq!(
             members,
-            vec![
-                (second.payload.entity_id, second.payload.state.head.clone()),
-                (first.payload.entity_id, first.payload.state.head.clone())
-            ],
-            "the tree includes full predicate membership despite LIMIT and orders by the declared numeric property"
+            vec![(second.payload.entity_id, second.payload.state.head.clone())],
+            "the tree applies LIMIT using the declared numeric property"
         );
 
         {
             let _publication = publication.lock().await;
             let mut trx = storage.transaction();
-            let mut changes = Vec::new();
             for (before, after) in [(&first, &moved), (&third, &entered)] {
                 trx.set_state(&before.payload.state.head, after).await?;
-                changes.push((
-                    Some(TemporaryEntity::new(before.payload.entity_id, &before.payload.state)?),
-                    Some(TemporaryEntity::new(after.payload.entity_id, &after.payload.state)?),
-                ));
             }
-            let applied = manager.apply(&mut trx, &changes).await?;
-            assert!(applied.refused().is_empty() && applied.retired().is_empty());
-            applied.landed(&trx.commit().await?.committed()?);
+            manager.invalidate();
+            trx.commit().await?.committed()?;
         }
+        manager.maintain().await?;
         let members: Vec<_> = tree.view().range(..)?.map_ok(|leaf| (leaf.id.0, leaf.payload.0)).try_collect().await?;
-        assert_eq!(
-            members,
-            vec![
-                (moved.payload.entity_id, moved.payload.state.head.clone()),
-                (second.payload.entity_id, second.payload.state.head.clone()),
-                (entered.payload.entity_id, entered.payload.state.head.clone()),
-            ]
-        );
+        assert_eq!(members, vec![(moved.payload.entity_id, moved.payload.state.head.clone())]);
         drop((tree, manager));
 
         // With no resident tree, canonical storage advances without maintenance.
-        // The next manager must rebuild, rather than trusting the persisted rows.
+        // The next manager must continue from the persisted cursor.
         let mut trx = storage.transaction();
         trx.set_state(&second.payload.state.head, &while_absent).await?;
         trx.commit().await?.committed()?;
@@ -152,15 +136,8 @@ async fn a_manager_builds_maintains_and_rebuilds_from_canonical_sled_states() ->
     let tree = manager.open(selection).await?;
     assert_eq!(tree.store().id(), &tree_id);
     let members: Vec<_> = tree.view().range(..)?.map_ok(|leaf| (leaf.id.0, leaf.payload.0)).try_collect().await?;
-    assert_eq!(
-        members,
-        vec![
-            (moved.payload.entity_id, moved.payload.state.head),
-            (entered.payload.entity_id, entered.payload.state.head),
-            (while_absent.payload.entity_id, while_absent.payload.state.head),
-        ]
-    );
-    assert_eq!(tree.audit().await?.members, 3);
+    assert_eq!(members, vec![(while_absent.payload.entity_id, while_absent.payload.state.head)]);
+    assert_eq!(tree.audit().await?.members, 1);
     Ok(())
 }
 

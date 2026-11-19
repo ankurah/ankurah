@@ -568,20 +568,20 @@ where
         let node = self.upgrade().ok_or(NodeDropped)?;
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
-        // 1. Pre-fetch known_matches from local storage
-        let known_matches: Vec<ankurah_proto::KnownEntity> = node
-            .fetch_entities_from_local(&selection)
-            .await?
-            .into_iter()
-            .map(|entity| ankurah_proto::KnownEntity { entity_id: entity.id(), head: entity.head() })
-            .collect();
+        let (_digest_tree, known_state, known_matches) = node.prepare_known(selection.clone(), &context_data).await?;
 
-        // 2. Send subscribe request with known_matches
+        // Both accounts describe one local version; the peer still uses known_matches.
         let response = node
             .request(
                 peer_id,
                 &context_data,
-                ankurah_proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_matches },
+                ankurah_proto::NodeRequestBody::SubscribeQuery {
+                    query_id,
+                    selection: selection.clone(),
+                    version,
+                    known_matches,
+                    known_state,
+                },
             )
             .await?;
         let deltas = match response {

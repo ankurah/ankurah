@@ -271,7 +271,14 @@ where
         proto::NodeResponseBody::Error(error) => return Err(RetrievalError::Other(error).into()),
         other => return Err(RetrievalError::Other(format!("unexpected response to RegisterSchema: {other}")).into()),
     };
-    accept(registrant, &registered)
+    let mut types = node.catalog.bound_types.lock().unwrap();
+    accept(registrant, &registered)?;
+    for property in &registered.properties {
+        if let Some(value_type) = crate::value::ValueType::from_property_str(&property.value_type) {
+            types.entry(property.id).or_insert(value_type);
+        }
+    }
+    Ok(())
 }
 
 /// Build the wire request from the registrant's declaration.

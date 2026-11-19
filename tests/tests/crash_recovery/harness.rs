@@ -187,6 +187,13 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
 
     async fn map_snapshot(&self, locks: &[LockName]) -> Result<E::Snapshot, RetrievalError> { self.inner.map_snapshot(locks).await }
 
+    async fn state_snapshot(
+        &self,
+        since: Option<&ankurah::core::storage::StateCursor>,
+    ) -> Result<Box<dyn ankurah::core::storage::StateSnapshot>, RetrievalError> {
+        self.inner.state_snapshot(since).await
+    }
+
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { self.inner.get_state(id).await }
 
     async fn fetch_states(

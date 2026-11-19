@@ -3,6 +3,9 @@
 //! one group never decodes in another.
 
 use super::{Digest, DigestGroup};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::{fmt, marker::PhantomData};
 
 /// Why stored bytes are not a digest or a leaf element.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,6 +53,41 @@ impl<G: DigestGroup> Digest<G> {
         let wrong_length = DecodeError::Length { expected: Self::STORED_LEN, found: bytes.len() };
         let (element, count) = versioned::<G>(bytes, Self::STORED_LEN)?.split_last_chunk::<COUNT_LEN>().ok_or(wrong_length)?;
         Ok(Self { element: G::decode(element)?, count: u64::from_be_bytes(*count) })
+    }
+}
+
+impl<G: DigestGroup> Serialize for Digest<G> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut bytes = Vec::with_capacity(Self::STORED_LEN);
+        self.encode_into(&mut bytes);
+        serializer.serialize_bytes(&bytes)
+    }
+}
+
+impl<'de, G: DigestGroup> Deserialize<'de> for Digest<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_bytes(DigestVisitor(PhantomData))
+    }
+}
+
+struct DigestVisitor<G>(PhantomData<G>);
+
+impl<'de, G: DigestGroup> Visitor<'de> for DigestVisitor<G> {
+    type Value = Digest<G>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("a canonical digest encoding") }
+
+    fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> { Digest::decode(bytes).map_err(E::custom) }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut bytes = Vec::with_capacity(Digest::<G>::STORED_LEN);
+        while let Some(byte) = seq.next_element()? {
+            if bytes.len() == Digest::<G>::STORED_LEN {
+                return Err(de::Error::custom("trailing digest bytes"));
+            }
+            bytes.push(byte);
+        }
+        self.visit_bytes(&bytes)
     }
 }
 

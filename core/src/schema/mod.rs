@@ -113,12 +113,17 @@ mod request_policy_tests {
             (ModelId::EntityId(ankurah_proto::EntityId::random()), false),
         ] {
             let requests = [
-                NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_matches: Vec::new() },
+                NodeRequestBody::Fetch {
+                    selection: Predicate::MemberOf(model).into(),
+                    known_matches: Vec::new(),
+                    known_state: ankurah_proto::KnownState::empty(),
+                },
                 NodeRequestBody::SubscribeQuery {
                     query_id: QueryId::new(),
                     selection: Predicate::MemberOf(model).into(),
                     version: 1,
                     known_matches: Vec::new(),
+                    known_state: ankurah_proto::KnownState::empty(),
                 },
             ];
             for request in requests {

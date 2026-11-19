@@ -50,6 +50,8 @@ pub struct Database {
     pub(crate) entity_models_tree: sled::Tree,
     /// Every ordered map's entries, each under its map's name and its key.
     pub(crate) maps_tree: sled::Tree,
+    /// Canonical-state continuation metadata and the latest-change index.
+    pub(crate) state_changes: sled::Tree,
     pub property_manager: PropertyManager,
     pub index_manager: IndexManager,
 }
@@ -69,6 +71,8 @@ impl Database {
         let events_tree = db.open_tree("events")?; // the events are stored here
         let entity_models_tree = db.open_tree("_ankurah_sled_entity_models")?;
         let maps_tree = db.open_tree("_ankurah_sled_maps")?;
+        let state_changes = db.open_tree("_ankurah_sled_state_changes")?;
+        crate::engine::state::initialize(&state_changes, &entities_tree)?;
         // Durable bijection: PropertyId <-> compact u32 materialization slot.
         let property_slots_tree = db.open_tree("_ankurah_sled_property_map")?;
         let index_config_tree = db.open_tree("index_config")?; // the index config is stored here
@@ -76,7 +80,7 @@ impl Database {
         let property_manager = PropertyManager::open(property_slots_tree)?;
         let index_manager = IndexManager::open(index_config_tree, &db)?;
 
-        Ok(Self { db, entities_tree, events_tree, entity_models_tree, maps_tree, property_manager, index_manager })
+        Ok(Self { db, entities_tree, events_tree, entity_models_tree, maps_tree, state_changes, property_manager, index_manager })
     }
 
     /// Read an entity's memberships without loading its state buffers.

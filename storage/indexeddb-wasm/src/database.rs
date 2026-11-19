@@ -13,7 +13,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChangeEvent};
 
-use crate::engine::maps;
+use crate::engine::{maps, state};
 use crate::util::{cb_future::CBFuture, cb_race::CBRace, require::WBGRequire};
 
 /// Key of the storage protocol epoch record in the `_ankurah_meta` object store.
@@ -52,6 +52,8 @@ impl Database {
             index_cache: SafeSet::new(),
         }));
         database.check_protocol_version().await?;
+        database.connection_with_stores(state::has_object_stores, state::create_object_stores).await?;
+        state::initialize(&database).await?;
         Ok(database)
     }
 
@@ -183,8 +185,16 @@ impl Database {
     /// engine's maps, made in an upgrade of the database under the navigator
     /// lock unless it has them already.
     pub(crate) async fn connection_with_map_stores(&self) -> Result<SendWrapper<IdbDatabase>, RetrievalError> {
+        self.connection_with_stores(maps::has_object_stores, maps::create_object_stores).await
+    }
+
+    async fn connection_with_stores(
+        &self,
+        has_stores: fn(&IdbDatabase) -> bool,
+        create_stores: fn(&IdbDatabase) -> Result<(), JsValue>,
+    ) -> Result<SendWrapper<IdbDatabase>, RetrievalError> {
         let connection = self.0.fresh_connection().await?.db.clone();
-        if maps::has_object_stores(&connection) {
+        if has_stores(&connection) {
             return Ok(connection);
         }
 
@@ -194,11 +204,11 @@ impl Database {
         NavigatorLock::with(&lock_name, async move || {
             // Without the Web Locks API, another tab's upgrade may take the
             // next version first, and this one then opens the database at
-            // that version with no map stores: the upgrade is tried again
+            // that version without the requested stores: the upgrade is tried again
             // from the version found, until the stores are there.
             loop {
                 let mut connection = inner.fresh_connection().await?;
-                if maps::has_object_stores(&connection.db) {
+                if has_stores(&connection.db) {
                     return Ok(());
                 }
 
@@ -208,7 +218,7 @@ impl Database {
                 // Should the upgrade fail, the next call opens the database
                 // again rather than keep a closed connection.
                 connection.stale.store(true, Ordering::SeqCst);
-                *connection = Connection::open_with_map_stores(&inner.db_name, current_version + 1).await?;
+                *connection = Connection::open_with_stores(&inner.db_name, current_version + 1, create_stores).await?;
             }
         })
         .await?;
@@ -253,7 +263,7 @@ async fn has_ankurah_data(db: &IdbDatabase) -> Result<bool, RetrievalError> {
     let db = SendWrapper::new(db);
     SendWrapper::new(async move {
         let stores = ["entities", "materializations", "events", "entity_models", "property_columns", "model_registrations"];
-        for store_name in stores.into_iter().chain(maps::STORES) {
+        for store_name in stores.into_iter().chain(maps::STORES).chain(std::iter::once(state::CHANGES)) {
             if !db.object_store_names().contains(store_name) {
                 continue;
             }
@@ -325,6 +335,7 @@ impl Connection {
             if let Err(_) = transaction.object_store("entities") {
                 let db: IdbDatabase = transaction.db();
                 db.create_object_store("entities").require("create entities store")?;
+                state::create_object_stores(&db).require("create state change store")?;
 
                 let materializations = db.create_object_store("materializations").require("create materializations store")?;
                 let key_path = js_sys::Array::of2(&"__materialization".into(), &"id".into());
@@ -378,15 +389,16 @@ impl Connection {
         .await
     }
 
-    /// Open the database at a bumped version, creating the object stores of
-    /// the engine's maps.
-    async fn open_with_map_stores(db_name: &str, version: u32) -> Result<Self, RetrievalError> {
-        notice_info!("creating the maps' object stores in {db_name}");
-
+    /// Open the database at a bumped version, creating the requested engine stores.
+    async fn open_with_stores(
+        db_name: &str,
+        version: u32,
+        create_stores: fn(&IdbDatabase) -> Result<(), JsValue>,
+    ) -> Result<Self, RetrievalError> {
         Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
             let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
             let transaction = open_request.transaction().require("get upgrade transaction")?;
-            maps::create_object_stores(&transaction.db()).require("create the maps' object stores")?;
+            create_stores(&transaction.db()).require("create storage engine object stores")?;
 
             Ok(())
         })

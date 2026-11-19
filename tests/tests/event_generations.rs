@@ -183,6 +183,13 @@ impl StorageEngine for CountEventReads {
         self.inner.map_snapshot(locks).await
     }
 
+    async fn state_snapshot(
+        &self,
+        since: Option<&ankurah::core::storage::StateCursor>,
+    ) -> Result<Box<dyn ankurah::core::storage::StateSnapshot>, ankurah::error::RetrievalError> {
+        self.inner.state_snapshot(since).await
+    }
+
     async fn get_state(&self, id: proto::EntityId) -> Result<proto::Attested<proto::EntityState>, ankurah::error::RetrievalError> {
         self.inner.get_state(id).await
     }

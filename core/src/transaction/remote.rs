@@ -93,6 +93,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
             return Err(MutationError::TransactionFailed);
         }
         let publication = self.node.commit_publication_lock.lock().await;
+        self.node.invalidate_trees();
         self.storage.commit().await?.committed()?;
         // Tests widen the window between the storage commit and the publication, in which a read
         // may load what was committed (tests/tests/publication_window.rs).

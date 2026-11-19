@@ -37,6 +37,21 @@ pub struct KnownEntity {
     pub head: Clock,
 }
 
+/// The digest of the requester's locally known members of this request's Selection.
+///
+/// Sent alongside `known_matches` for verification. Receivers currently use only
+/// `known_matches` to select responses; this digest neither suppresses transfers
+/// nor establishes query completion.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct KnownState {
+    pub digest: ankurah_digest_tree::Digest<ankurah_digest_tree::Ristretto255>,
+}
+
+impl KnownState {
+    /// No known members of the requested Selection.
+    pub fn empty() -> Self { Self { digest: ankurah_digest_tree::Digest::empty() } }
+}
+
 /// Causal relation between two clocks: `subject` (local) vs `other`.
 /// - A `Clock` is a normalized antichain frontier (a lattice point).
 /// - `meet` is the GCA frontier: Max(Past(subject) ∩ Past(other)).
@@ -132,12 +147,14 @@ pub enum NodeRequestBody {
     Fetch {
         selection: ast::Selection<ast::Resolved>,
         known_matches: Vec<KnownEntity>,
+        known_state: KnownState,
     },
     SubscribeQuery {
         query_id: QueryId,
         selection: ast::Selection<ast::Resolved>,
         version: u32,
         known_matches: Vec<KnownEntity>,
+        known_state: KnownState,
     },
     /// Register one model's schema: an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
@@ -256,10 +273,10 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::GetEvents { event_ids } => {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
-            NodeRequestBody::Fetch { selection: query, known_matches } => {
+            NodeRequestBody::Fetch { selection: query, known_matches, .. } => {
                 write!(f, "Fetch {query} known:{}", known_matches.len())
             }
-            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_matches } => {
+            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_matches, .. } => {
                 write!(f, "Subscribe {query_id} {query} v{version} known:{}", known_matches.len())
             }
             NodeRequestBody::RegisterSchema { model } => {
@@ -307,5 +324,50 @@ impl std::fmt::Display for EntityDelta {
                 write!(f, "EntityDelta {}: StateAndRelation({})", self.entity_id, state)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ankurah_digest_tree::{Digest, LtHash16};
+
+    #[test]
+    fn query_requests_round_trip_both_accounts() {
+        let known = KnownEntity { entity_id: EntityId::from_bytes([7; 32]), head: Clock::default() };
+        for request in [
+            NodeRequestBody::Fetch {
+                selection: ast::Predicate::True.into(),
+                known_matches: vec![known.clone()],
+                known_state: KnownState::empty(),
+            },
+            NodeRequestBody::SubscribeQuery {
+                query_id: QueryId::new(),
+                selection: ast::Predicate::True.into(),
+                version: 1,
+                known_matches: vec![known.clone()],
+                known_state: KnownState::empty(),
+            },
+        ] {
+            let encoded = bincode::serialize(&request).unwrap();
+            let decoded: NodeRequestBody = bincode::deserialize(&encoded).unwrap();
+            let (known_matches, known_state) = match decoded {
+                NodeRequestBody::Fetch { known_matches, known_state, .. }
+                | NodeRequestBody::SubscribeQuery { known_matches, known_state, .. } => (known_matches, known_state),
+                _ => panic!("query request changed kind"),
+            };
+            assert_eq!(known_matches.len(), 1);
+            assert_eq!(known_matches[0].entity_id, known.entity_id);
+            assert_eq!(known_matches[0].head, known.head);
+            assert_eq!(known_state, KnownState::empty());
+        }
+    }
+
+    #[test]
+    fn known_state_validates_its_digest_group() {
+        let other_group = Digest::<LtHash16>::empty();
+        assert!(bincode::deserialize::<KnownState>(&bincode::serialize(&other_group).unwrap()).is_err());
+        let json = serde_json::to_string(&KnownState::empty()).unwrap();
+        assert_eq!(serde_json::from_str::<KnownState>(&json).unwrap(), KnownState::empty());
     }
 }

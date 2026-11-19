@@ -1,5 +1,4 @@
 use super::*;
-use crate::error::MutationError;
 
 #[tokio::test]
 async fn missing_predicate_values_are_nonmatches_during_opening_and_maintenance() -> anyhow::Result<()> {
@@ -69,24 +68,26 @@ async fn maintains_idle_trees<G: DigestGroup>() -> anyhow::Result<()> {
     fixture.commit(&changes).await?;
 
     assert_eq!(ids(&all_view).await?, vec![enters.id, leaves.id, inserted.id]);
-    assert_eq!(ids(&fixture.manager.view(active.clone()).await?).await?, vec![enters.id, inserted.id]);
+    assert_eq!(ids(&fixture.manager.view(active.clone()).await?).await?, vec![enters.id]);
     let resident = fixture.manager.tree(&selection_key(&active)?).unwrap();
     let members: Vec<_> = resident.view().range(..)?.try_collect().await?;
     assert_eq!(members[0].payload.0, enters.head);
-    assert_eq!(resident.audit().await?.members, 2);
+    assert_eq!(resident.audit().await?.members, 1);
     Ok(())
 }
 
 #[tokio::test]
-async fn maintenance_reaches_idle_trees_and_full_membership_in_ristretto() -> anyhow::Result<()> {
+async fn maintenance_reaches_idle_trees_and_limited_membership_in_ristretto() -> anyhow::Result<()> {
     maintains_idle_trees::<Ristretto255>().await
 }
 
 #[tokio::test]
-async fn maintenance_reaches_idle_trees_and_full_membership_in_lthash() -> anyhow::Result<()> { maintains_idle_trees::<LtHash16>().await }
+async fn maintenance_reaches_idle_trees_and_limited_membership_in_lthash() -> anyhow::Result<()> {
+    maintains_idle_trees::<LtHash16>().await
+}
 
 #[tokio::test]
-async fn rolled_back_maintenance_leaves_query_results_unchanged() -> anyhow::Result<()> {
+async fn a_rolled_back_canonical_write_reconciles_to_unchanged_results() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(2)?;
     let before = version(1, 10, true);
     fixture.seed(std::slice::from_ref(&before))?;
@@ -94,11 +95,15 @@ async fn rolled_back_maintenance_leaves_query_results_unchanged() -> anyhow::Res
     let mut after = before.clone();
     after.head = Clock::genesis(EventId::from_bytes([55; 32]));
     let changes = [(Some(before.clone()), Some(after))];
-    let _publication = fixture.publication.lock().await;
-    let mut trx = fixture.storage.transaction();
-    write_versions(&mut trx, &changes).await?;
-    let applied = fixture.manager.apply(&mut trx, &changes).await?;
-    drop((trx, applied));
+    {
+        let _publication = fixture.publication.lock().await;
+        let mut trx = fixture.storage.transaction();
+        write_versions(&mut trx, &changes).await?;
+        fixture.manager.invalidate();
+        drop(trx);
+    }
+    assert!(view.count(..).await.is_err());
+    fixture.manager.maintain().await?;
     let members: Vec<_> = view.range(..)?.try_collect().await?;
     assert_eq!(members[0].payload.0, before.head);
     assert_eq!(fixture.storage.get_state(before.id).await?.payload.state.head, before.head);
@@ -106,22 +111,52 @@ async fn rolled_back_maintenance_leaves_query_results_unchanged() -> anyhow::Res
 }
 
 #[tokio::test]
-async fn empty_or_unrelated_changes_make_no_map_calls() -> anyhow::Result<()> {
+async fn unrelated_and_repeated_states_leave_the_membership_digest_unchanged() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(2)?;
-    drop(fixture.manager.open(selection(true, None, false)).await?);
-    fixture.storage.record_map_reads();
+    let member = version(1, 10, true);
+    fixture.seed(std::slice::from_ref(&member))?;
+    let tree = fixture.manager.open(selection(true, None, false)).await?;
+    let before = tree.view().span_digest(..).await?;
     fixture.commit(&[]).await?;
     fixture.commit(&[(None, Some(version(2, 5, false)))]).await?;
-    assert!(fixture.storage.recorded_map_reads().is_empty());
+    fixture.commit(&[(Some(member.clone()), Some(member))]).await?;
+    assert_eq!(tree.view().span_digest(..).await?, before);
+    tree.audit().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn invalid_entity_identity_poisoning_prevents_commit() -> anyhow::Result<()> {
-    let fixture = Fixture::<Ristretto255>::new(1)?;
-    let _publication = fixture.publication.lock().await;
-    let mut trx = fixture.storage.transaction();
-    assert!(fixture.manager.apply(&mut trx, &[(Some(version(1, 10, true)), Some(version(2, 20, true)))]).await.is_err());
-    assert!(matches!(trx.commit().await, Err(MutationError::TransactionFailed)));
+async fn an_unreadable_tree_does_not_stop_maintenance_of_the_other_trees() -> anyhow::Result<()> {
+    let fixture = Fixture::<Ristretto255>::new(2)?;
+    let before = version(1, 10, true);
+    fixture.seed(std::slice::from_ref(&before))?;
+    let by_score = selection(false, None, false);
+    let mut by_active = by_score.clone();
+    by_active.order_by.as_mut().unwrap()[0].path = active().into();
+    fixture.manager.open(by_score).await?;
+    fixture.manager.open(by_active).await?;
+
+    // Break the first tree's ordering value, whichever order the registry uses.
+    // The other selection still has a valid ordering value and must catch up.
+    let trees = TreeManager::live(&mut fixture.manager.trees.lock().unwrap());
+    let broken_property = trees[0].0.order_by.as_ref().unwrap()[0].path.property_id();
+    let broken = trees[0].1.view();
+    let healthy = trees[1].1.view();
+    let mut values = vec![(score(), Value::I64(10)), (active(), Value::Bool(true))];
+    values.iter_mut().find(|(property, _)| *property == broken_property).unwrap().1 = Value::String("wrong type".into());
+    let mut after = state(before.id, model(), values)?;
+    after.payload.state.head = Clock::genesis(EventId::from_bytes([99; 32]));
+    {
+        let _publication = fixture.publication.lock().await;
+        let mut trx = fixture.storage.transaction();
+        trx.set_state(&before.head, &after).await?;
+        fixture.manager.invalidate();
+        trx.commit().await?.committed()?;
+    }
+    assert!(fixture.manager.maintain().await.is_err());
+    assert!(broken.count(..).await.is_err(), "a failed reconciliation remains invalidated");
+    let leaves: Vec<_> = healthy.range(..)?.try_collect().await?;
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(leaves[0].payload.0, after.payload.state.head);
     Ok(())
 }

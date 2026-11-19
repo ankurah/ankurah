@@ -72,6 +72,29 @@ fn ristretto255_stored_forms_round_trip() { stored_forms_round_trip::<Ristretto2
 fn lthash16_stored_forms_round_trip() { stored_forms_round_trip::<LtHash16>() }
 
 #[test]
+fn serde_uses_the_checked_canonical_encoding_for_both_groups() {
+    fn round_trip<G: DigestGroup>() {
+        let digest = digest_of::<G>(&[1, 3, 5]);
+        let binary = bincode::serialize(&digest).unwrap();
+        assert_eq!(binary, bincode::serialize(&stored(&digest)).unwrap());
+        assert_eq!(bincode::deserialize::<Digest<G>>(&binary).unwrap(), digest);
+        let json = serde_json::to_string(&digest).unwrap();
+        assert_eq!(serde_json::from_str::<Digest<G>>(&json).unwrap(), digest);
+    }
+    round_trip::<Ristretto255>();
+    round_trip::<LtHash16>();
+
+    let mut invalid_element = stored(&digest_of::<Ristretto255>(&[1]));
+    invalid_element[1..33].fill(0xff);
+    let valid = stored(&Digest::<Ristretto255>::empty());
+    let trailing = [&valid[..], &[0]].concat();
+    for invalid in [invalid_element, valid[..valid.len() - 1].to_vec(), trailing, stored(&Digest::<LtHash16>::empty())] {
+        assert!(bincode::deserialize::<Digest<Ristretto255>>(&bincode::serialize(&invalid).unwrap()).is_err());
+        assert!(serde_json::from_str::<Digest<Ristretto255>>(&serde_json::to_string(&invalid).unwrap()).is_err());
+    }
+}
+
+#[test]
 fn every_decoder_refuses_short_and_trailing_bytes() {
     let digest = stored(&digest_of::<Ristretto255>(&[1]));
     let leaf = stored_element::<Ristretto255>(&element::<Ristretto255>(1));

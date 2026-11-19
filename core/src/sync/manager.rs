@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use ankql::ast::{Resolved, Selection};
 use ankurah_digest_tree::{DigestGroup, Ristretto255};
@@ -13,8 +15,22 @@ use super::{CacheSettings, EngineAdapter, StorageCache};
 use crate::error::RetrievalError;
 use crate::storage::StorageEngine;
 
-mod maintenance;
+mod continuation;
 mod opening;
+mod preparation;
+
+/// When a managed tree persists the changes already reflected by its reads.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteBehind {
+    /// Flush after this many changed entities. Zero writes every maintained batch.
+    pub max_changes: usize,
+    /// Maximum time a completed maintenance batch may remain unflushed.
+    pub max_delay: Duration,
+}
+
+impl Default for WriteBehind {
+    fn default() -> Self { Self { max_changes: 1024, max_delay: Duration::from_millis(250) } }
+}
 
 pub(super) type DigestTree<SE, G> =
     ankurah_digest_tree::DigestTree<TreeProperty, EntityMemberId, EntityHead, G, EngineAdapter<SE, TreeProperty, EntityHead, G>>;
@@ -22,16 +38,21 @@ type WeakDigestTree<SE, G> =
     ankurah_digest_tree::WeakDigestTree<TreeProperty, EntityMemberId, EntityHead, G, EngineAdapter<SE, TreeProperty, EntityHead, G>>;
 
 /// One node's resident trees. Each tree's store owns record caching; this
-/// type owns residency, exact Selection lookup and entity-change routing.
+/// type owns residency, exact Selection lookup and canonical-state continuation.
 ///
 /// The owner supplies the publication lock shared with its entity commits.
-/// Opening holds it through the initial scan, rebuild and registration; writers
-/// hold it from before maintenance through storage commit and publication.
-/// Coordination of entity writes from other Nodes belongs to the integration.
+/// Opening holds it through reconciliation and registration. Writers invalidate
+/// views before committing canonical state while holding the same lock; reads
+/// resume after reconciliation publishes a complete tree version. Storage read
+/// boundaries and conditional flushes coordinate independent Nodes sharing an
+/// engine, without relying on this process-local lock.
 pub struct TreeManager<SE, G: DigestGroup = Ristretto255> {
     storage: Arc<SE>,
+    catalog: Weak<crate::schema::catalog::CatalogManager>,
     cache: Arc<StorageCache>,
     publication: Arc<tokio::sync::Mutex<()>>,
+    epoch: Arc<AtomicU64>,
+    write_behind: Mutex<WriteBehind>,
     // Hold this lock before `retained` when changing registration or recency.
     // Exact Selection encoding includes LIMIT.
     trees: Mutex<HashMap<Vec<u8>, (Selection<Resolved>, WeakDigestTree<SE, G>)>>,
@@ -46,15 +67,49 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
     pub fn new(storage: Arc<SE>, publication: Arc<tokio::sync::Mutex<()>>, cache: CacheSettings, capacity: usize) -> Self {
         Self {
             storage,
+            catalog: Weak::new(),
             publication,
+            epoch: Arc::new(AtomicU64::new(0)),
+            write_behind: Mutex::new(WriteBehind::default()),
             cache: Arc::new(StorageCache::new(cache)),
             trees: Mutex::new(HashMap::new()),
             retained: Mutex::new(NonZeroUsize::new(capacity).map(LruCache::new)),
         }
     }
 
+    /// Use validated registration types while their canonical definitions are in transit.
+    pub(crate) fn with_catalog(mut self, catalog: &Arc<crate::schema::catalog::CatalogManager>) -> Self {
+        self.catalog = Arc::downgrade(catalog);
+        self
+    }
+
     /// The storage engine used by this manager's trees.
     pub fn storage(&self) -> &Arc<SE> { &self.storage }
+
+    /// Prevent existing views from presenting the pre-commit tree as current.
+    /// Call before awaiting a canonical-state commit while holding publication.
+    /// Reconciliation is required even if that commit's outcome becomes unknown.
+    pub fn invalidate(&self) { self.epoch.fetch_add(1, Ordering::AcqRel); }
+
+    pub fn set_write_behind(&self, policy: WriteBehind) { *self.write_behind.lock().unwrap() = policy; }
+
+    /// The next pending flush deadline, if any managed tree has dirty records.
+    pub fn flush_after(&self) -> Option<Duration> {
+        let policy = *self.write_behind.lock().unwrap();
+        self.trees()
+            .iter()
+            .filter_map(|tree| {
+                let version = tree.store().buffered();
+                version.dirty_since.map(|since| {
+                    if version.changes >= policy.max_changes {
+                        Duration::ZERO
+                    } else {
+                        policy.max_delay.saturating_sub(since.elapsed())
+                    }
+                })
+            })
+            .min()
+    }
 
     /// The tree for this Selection key. Any clone, view, stream or transaction
     /// derived from it keeps the tree alive and receiving maintenance.

@@ -11,6 +11,7 @@ use ankurah_digest_tree::{Encode, Member, MemberId, Payload, StoreError};
 use ankurah_proto::Clock;
 
 use crate::selection::filter::Filterable;
+use crate::value::ValueExt;
 
 /// A property named by an entity tree's key specification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -72,7 +73,10 @@ impl<E: EntityVersion> Member<TreeProperty> for EntityMember<'_, E> {
         let value = self.0.value(&part.key.0);
         Ok(match &part.sub_path {
             None => value,
-            Some(path) => value.and_then(|value| value.extract_at_path(path)),
+            // A nested JSON property can change scalar type between entities.
+            // Preserve JSON's type tags rather than pretending the path has the
+            // enclosing property's declared type (or the first value's type).
+            Some(path) => value.and_then(|value| value.json_at_path(path)).map(Value::Json),
         })
     }
 

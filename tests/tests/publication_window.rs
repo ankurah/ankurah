@@ -1,14 +1,6 @@
-//! A creation or an edit reaches the durable node's live queries even when another query loads it
-//! from storage between its storage commit and its publication, whether an ephemeral peer wrote it
-//! through the durable node or the durable node wrote it in a local transaction. Before a durable
-//! node published every event of a commit, such a load made the entity resident first; the
-//! publication then found the creation's event applied, carried no events, and was dropped, so no
-//! live query heard of it (found by fwdcentaur, whose routing service is such a query and never
-//! routed a question the VS Code extension's new live query had loaded).
-//! ANKURAH_TEST_PUBLICATION_DELAY_MS (feature test-helpers, read in transaction/remote.rs and
-//! transaction/local.rs) widens the window so that the second query lands in it. Each case with a
-//! second query checks that it did: the second query found the commit in storage while the live
-//! query had not yet been told of it.
+//! Queries opened between a canonical commit and its publication wait for publication.
+//! Existing live queries receive the commit exactly once, with its full events.
+//! ANKURAH_TEST_PUBLICATION_DELAY_MS widens this window for local and peer writes.
 mod common;
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
@@ -73,8 +65,7 @@ fn names(query: &LiveQuery<AlbumView>) -> Result<Vec<String>> {
 }
 
 /// What a live query on the durable node hears of an album `writer` creates, alone or with another
-/// query on the durable node opened while the creation's publication waits. That query must find
-/// the creation in storage before the live query is told of it, or the case missed the window.
+/// query opened while publication waits. Opening its tree must wait for that publication.
 async fn heard(writer: Writer, concurrent_query: bool) -> Result<Heard> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     durable.system.create().await?;
@@ -100,9 +91,12 @@ async fn heard(writer: Writer, concurrent_query: bool) -> Result<Heard> {
     // Held until the publication, so that the entity it loaded stays resident.
     let _loaded = if concurrent_query {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let loaded = ctx_d.query_wait::<AlbumView>("name = 'the question'").await?;
-        assert_eq!(names(&loaded)?, ["the question"], "the second query ran before the storage commit, missing the window");
-        assert_eq!(*changes.lock().unwrap(), Vec::<Change>::new(), "the publication came before the second query, which missed the window");
+        let loading = ctx_d.query_wait::<AlbumView>("name = 'the question'");
+        futures_util::pin_mut!(loading);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut loading).await.is_err(), "tree opening waits for publication");
+        assert!(changes.lock().unwrap().is_empty(), "the test entered the publication window");
+        let loaded = loading.await?;
+        assert_eq!(names(&loaded)?, ["the question"]);
         Some(loaded)
     } else {
         None
@@ -115,8 +109,7 @@ async fn heard(writer: Writer, concurrent_query: bool) -> Result<Heard> {
 
 /// What a live query on the durable node hears of an edit `writer` commits to an album the query
 /// holds, alone or with another query on the durable node opened while the edit's publication
-/// waits. That query must find the edited value in storage before the live query is told of it, or
-/// the case missed the window.
+/// waits. The second query observes the edit only after publication completes.
 async fn heard_edit(writer: Writer, concurrent_query: bool) -> Result<Heard> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     durable.system.create().await?;
@@ -147,9 +140,12 @@ async fn heard_edit(writer: Writer, concurrent_query: bool) -> Result<Heard> {
     });
     let _loaded = if concurrent_query {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let loaded = ctx_d.query_wait::<AlbumView>("name = 'the answer'").await?;
-        assert_eq!(names(&loaded)?, ["the answer"], "the second query ran before the storage commit, missing the window");
-        assert_eq!(*changes.lock().unwrap(), Vec::<Change>::new(), "the publication came before the second query, which missed the window");
+        let loading = ctx_d.query_wait::<AlbumView>("name = 'the answer'");
+        futures_util::pin_mut!(loading);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut loading).await.is_err(), "tree opening waits for publication");
+        assert!(changes.lock().unwrap().is_empty(), "the test entered the publication window");
+        let loaded = loading.await?;
+        assert_eq!(names(&loaded)?, ["the answer"]);
         Some(loaded)
     } else {
         None
@@ -161,7 +157,7 @@ async fn heard_edit(writer: Writer, concurrent_query: bool) -> Result<Heard> {
 }
 
 /// A live query on the durable node hears of the album `writer` creates and then edits, alone and
-/// with a query loading it before each publication, which ANKURAH_TEST_PUBLICATION_DELAY_MS holds
+/// with a query opening during each publication, which ANKURAH_TEST_PUBLICATION_DELAY_MS holds
 /// back; with that query, it hears of each commit exactly once, carrying the commit's events.
 async fn hears_each_commit(writer: Writer) -> Result<()> {
     std::env::set_var("ANKURAH_TEST_PUBLICATION_DELAY_MS", "500");
@@ -170,20 +166,20 @@ async fn hears_each_commit(writer: Writer) -> Result<()> {
     assert_eq!(
         creation.changes,
         [(ChangeKind::Add, creation.album, creation.committed.clone())],
-        "with a query loading it before its publication, the live query hears of it too, once"
+        "with a query waiting for publication, the live query hears of the creation exactly once"
     );
     assert!(heard_edit(writer, false).await?.told(ChangeKind::Update), "alone, the live query hears of the edit");
     let edit = heard_edit(writer, true).await?;
     assert_eq!(
         edit.changes,
         [(ChangeKind::Update, edit.album, edit.committed.clone())],
-        "with a query loading it before its publication, the live query hears of the edit too, once"
+        "with a query waiting for publication, the live query hears of the edit exactly once"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_commit_loaded_before_its_publication_still_reaches_live_queries() -> Result<()> { hears_each_commit(Writer::Peer).await }
+async fn a_peer_commit_publishes_before_a_concurrent_query_initializes() -> Result<()> { hears_each_commit(Writer::Peer).await }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_local_commit_loaded_before_its_publication_still_reaches_live_queries() -> Result<()> { hears_each_commit(Writer::Local).await }
+async fn a_local_commit_publishes_before_a_concurrent_query_initializes() -> Result<()> { hears_each_commit(Writer::Local).await }

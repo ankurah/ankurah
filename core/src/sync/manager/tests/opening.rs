@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use super::*;
 
 #[tokio::test]
-async fn exact_selections_share_one_tree_without_limiting_membership() -> anyhow::Result<()> {
+async fn exact_selections_share_one_tree_with_limited_membership() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(4)?;
     let selection = selection(true, Some(1), false);
     let entities = [version(1, 30, true), version(2, 10, true), version(3, 5, false)];
@@ -16,8 +16,8 @@ async fn exact_selections_share_one_tree_without_limiting_membership() -> anyhow
     assert!(std::ptr::eq(first.store().inner(), second.store().inner()));
     assert_eq!(fixture.manager.trees().len(), 1);
     let view = fixture.manager.view(selection).await?;
-    assert_eq!(view.count(..).await?, 2, "membership ignores LIMIT");
-    assert_eq!(ids(&view).await?, vec![entities[1].id, entities[0].id]);
+    assert_eq!(view.count(..).await?, 1, "membership includes LIMIT");
+    assert_eq!(ids(&view).await?, vec![entities[1].id]);
     Ok(())
 }
 
@@ -57,7 +57,7 @@ async fn exact_limits_and_orders_have_distinct_trees_with_id_ties_ascending() ->
     let fixture = Fixture::<Ristretto255>::new(4)?;
     fixture.seed(&[version(2, 10, true), version(1, 10, true), version(3, 20, true)])?;
     let mut backing_ids = Vec::new();
-    for (limit, descending, expected) in [(Some(1), false, [1, 2, 3]), (None, false, [1, 2, 3]), (Some(1), true, [3, 1, 2])] {
+    for (limit, descending, expected) in [(Some(1), false, vec![1]), (None, false, vec![1, 2, 3]), (Some(1), true, vec![3])] {
         let tree = fixture.manager.open(selection(false, limit, descending)).await?;
         backing_ids.push(tree.store().id().clone());
         let expected: Vec<_> = expected.into_iter().map(|id| EntityId::from_bytes([id; 32])).collect();
@@ -88,7 +88,7 @@ async fn concurrent_opens_of_one_selection_share_the_registered_tree() -> anyhow
     let selection = selection(false, None, false);
     let (entered, scanning) = oneshot::channel();
     let (release, resume) = oneshot::channel();
-    fixture.storage.hold_fetch.lock().unwrap().insert(model(), (entered, resume));
+    *fixture.storage.hold_state_snapshot.lock().unwrap() = Some((entered, resume));
     let mut first = pin!(fixture.manager.open(selection.clone()));
     assert!(poll_once(first.as_mut()).is_pending());
     scanning.await?;
@@ -103,7 +103,7 @@ async fn concurrent_opens_of_one_selection_share_the_registered_tree() -> anyhow
 }
 
 #[tokio::test]
-async fn recalling_an_evicted_tree_rebuilds_current_entities_under_the_same_id() -> anyhow::Result<()> {
+async fn recalling_an_evicted_tree_reconciles_current_entities_under_the_same_id() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(1)?;
     let all = selection(false, None, false);
     let active = selection(true, None, false);
@@ -128,7 +128,7 @@ async fn recalling_an_evicted_tree_rebuilds_current_entities_under_the_same_id()
 }
 
 #[tokio::test]
-async fn a_new_manager_rebuilds_the_same_backing_tree_from_current_storage() -> anyhow::Result<()> {
+async fn a_new_manager_resumes_the_same_backing_tree_from_current_storage() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(1)?;
     let selection = selection(false, None, false);
     let before = version(1, 10, true);
@@ -160,7 +160,7 @@ async fn entity_publication_waits_until_a_scanned_tree_is_registered() -> anyhow
     fixture.seed(std::slice::from_ref(&before))?;
     let (entered, scanning) = oneshot::channel();
     let (release, resume) = oneshot::channel();
-    fixture.storage.hold_fetch.lock().unwrap().insert(model(), (entered, resume));
+    *fixture.storage.hold_state_snapshot.lock().unwrap() = Some((entered, resume));
     let mut opening = pin!(fixture.manager.open(selection(false, None, false)));
     assert!(poll_once(opening.as_mut()).is_pending());
     scanning.await?;
@@ -260,12 +260,8 @@ async fn id_and_system_ordering_use_their_declared_builtin_types() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn unsupported_subpaths_and_missing_or_invalid_property_metadata_fail_before_registration() -> anyhow::Result<()> {
+async fn missing_or_invalid_property_metadata_fails_before_registration() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(1)?;
-    let mut subpath = selection(false, None, false);
-    subpath.order_by.as_mut().unwrap()[0].path.subpath.push("nested".into());
-    assert!(fixture.manager.open(subpath).await.is_err());
-
     let mut missing = selection(false, None, false);
     missing.order_by.as_mut().unwrap()[0].path = PropertyId::EntityId(EntityId::from_bytes([99; 32])).into();
     assert!(matches!(fixture.manager.open(missing).await, Err(RetrievalError::EntityNotFound(_))));
@@ -277,7 +273,7 @@ async fn unsupported_subpaths_and_missing_or_invalid_property_metadata_fail_befo
 }
 
 #[tokio::test]
-async fn refresh_after_reset_registers_a_new_incarnation_and_leaves_old_handles_retired() -> anyhow::Result<()> {
+async fn opening_after_reset_rebuilds_the_backing_tree_and_preserves_live_views() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(1)?;
     let mut selection = selection(false, None, false);
     selection.order_by.as_mut().unwrap()[0].path = PropertyId::Id.into();
@@ -292,13 +288,13 @@ async fn refresh_after_reset_registers_a_new_incarnation_and_leaves_old_handles_
     fixture.seed(std::slice::from_ref(&current))?;
     assert!(old.view().count(..).await.is_err());
     let reused = fixture.manager.open(selection.clone()).await?;
-    assert!(std::ptr::eq(old.store().inner(), reused.store().inner()), "open still reuses the resident until recovery is requested");
+    assert!(std::ptr::eq(old.store().inner(), reused.store().inner()), "recovery preserves the resident handle");
 
     let refreshed = fixture.manager.refresh(selection.clone()).await?;
     assert_eq!(refreshed.store().id(), old.store().id());
-    assert!(!refreshed.store().same_tree(old.store()), "the reset removed the original incarnation");
+    assert!(refreshed.store().same_tree(old.store()), "the adapter follows the rebuilt backing incarnation");
     assert_eq!(ids(&refreshed.view()).await?, vec![current.id]);
-    assert!(old.view().count(..).await.is_err(), "refresh does not revive a removed incarnation");
+    assert_eq!(ids(&old.view()).await?, vec![current.id], "existing views follow the completed rebuild");
     assert_eq!(fixture.manager.trees().len(), 1);
     assert!(std::ptr::eq(refreshed.store().inner(), fixture.manager.open(selection).await?.store().inner()));
 
@@ -310,34 +306,35 @@ async fn refresh_after_reset_registers_a_new_incarnation_and_leaves_old_handles_
 }
 
 #[tokio::test]
-async fn refresh_restores_a_committed_refusal_while_rollback_keeps_the_resident_valid() -> anyhow::Result<()> {
+async fn opening_recovers_a_committed_adapter_refusal_while_rollback_keeps_the_resident_valid() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(1)?;
     let selection = selection(false, None, false);
     let before = version(1, 10, true);
     fixture.seed(std::slice::from_ref(&before))?;
     let old = fixture.manager.open(selection.clone()).await?;
-    let mut incorrect_before = before.clone();
-    incorrect_before.score = 20;
     let mut after = before.clone();
     after.score = 30;
     after.head = Clock::genesis(EventId::from_bytes([61; 32]));
-    let changes = [(Some(incorrect_before), Some(after.clone()))];
+    let changes = [(Some(before.clone()), Some(after.clone()))];
 
     for commit in [false, true] {
         {
             let _publication = fixture.publication.lock().await;
             let mut trx = fixture.storage.transaction();
             write_versions(&mut trx, &changes).await?;
-            let applied = fixture.manager.apply(&mut trx, &changes).await?;
-            assert!(matches!(applied.refused(), [(_, ankurah_digest_tree::Error::NotHeld { .. })]));
+            let applied = crate::sync::storage_adapter::apply(
+                &fixture.storage,
+                &mut trx,
+                vec![crate::sync::TreeChange::Refused(old.clone(), ankurah_digest_tree::Error::Inconsistent("test refusal"))],
+            )
+            .await?;
+            assert!(matches!(applied.refused(), [(_, ankurah_digest_tree::Error::Inconsistent(_))]));
             assert!(applied.retired().is_empty());
             if commit {
                 applied.landed(&trx.commit().await?.committed()?);
             }
         }
 
-        let reused = fixture.manager.open(selection.clone()).await?;
-        assert!(std::ptr::eq(old.store().inner(), reused.store().inner()), "the explicit recovery operation owns replacement");
         if commit {
             assert!(old.view().count(..).await.is_err(), "only the committed refusal retires the tree");
         } else {
@@ -346,7 +343,7 @@ async fn refresh_restores_a_committed_refusal_while_rollback_keeps_the_resident_
         }
     }
 
-    let refreshed = fixture.manager.refresh(selection).await?;
+    let refreshed = fixture.manager.open(selection).await?;
     assert!(std::ptr::eq(old.store().inner(), refreshed.store().inner()), "the rebuilt incarnation keeps its original shared handle");
     assert_eq!(old.view().count(30i64..=30).await?, 1);
     let members: Vec<_> = refreshed.view().range(..)?.try_collect().await?;

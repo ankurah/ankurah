@@ -24,7 +24,8 @@ use crate::sync::{Error, TreePart};
 /// them, which only storage holds.
 pub struct StorageEngineTrx<'a, SE: StorageEngine, K, L, G> {
     store: EngineAdapter<SE, K, L, G>,
-    trx: &'a mut (dyn StorageTransaction + 'a),
+    trx: Option<&'a mut (dyn StorageTransaction + 'a)>,
+    buffered: Option<super::StorageEngineSnapshot<SE, K, L, G>>,
 
     /// The generation the tree's rows were at when the transaction took the
     /// tree's lock, or `None` for a tree it creates.
@@ -51,7 +52,11 @@ impl<'a, SE: StorageEngine, K, L, G> StorageEngineTrx<'a, SE, K, L, G> {
         locked: Option<u64>,
         leaves: BTreeMap<RowKey, Option<Vec<u8>>>,
     ) -> Self {
-        Self { store, trx, locked, generation: locked, leaves }
+        Self { store, trx: Some(trx), buffered: None, locked, generation: locked, leaves }
+    }
+
+    pub(super) fn buffered(store: EngineAdapter<SE, K, L, G>, read: super::StorageEngineSnapshot<SE, K, L, G>) -> Self {
+        Self { store, trx: None, buffered: Some(read), locked: None, generation: None, leaves: BTreeMap::new() }
     }
 
     /// The store the transaction is lent as.
@@ -82,17 +87,21 @@ where
     /// read through the transaction, which the cache keeps if the transaction
     /// hasn't written.
     async fn get_many(&mut self, keys: &[RowKey]) -> Result<Vec<Option<Row<K, L, G>>>, StoreError> {
+        if let Some(read) = &mut self.buffered {
+            return read.get_many(keys).await;
+        }
         let tree = self.store.inner();
         let landed = self.landed_generation();
-        let mut read = ByKey::new(keys);
+        let mut read = ByKey::new(keys, tree.rows.clone());
 
         if let Some(generation) = landed {
             read.fill_from_prefetch(&tree.id, &self.leaves)?;
             read.fill_from_cache(tree, generation);
         }
 
-        if let Some(unread) = read.unread(tree) {
-            let answers = self.trx.map_read(vec![unread]).await.map_err(transaction_store_failure)?;
+        if let Some(unread) = read.unread() {
+            let answers =
+                self.trx.as_mut().expect("storage transaction").map_read(vec![unread]).await.map_err(transaction_store_failure)?;
             read.fill_from_storage(tree, answers, landed)?;
         }
 
@@ -106,9 +115,13 @@ where
         direction: ScanDirection,
         limit: usize,
     ) -> Result<Vec<(RowKey, Row<K, L, G>)>, StoreError> {
+        if let Some(read) = &mut self.buffered {
+            return read.range(start, end, direction, limit).await;
+        }
         let read =
             MapRead::Range { map: self.store.inner().rows.clone(), start: encode_bound(start), end: encode_bound(end), direction, limit };
-        let entries = ranged(self.trx.map_read(vec![read]).await.map_err(transaction_store_failure)?)?;
+        let entries =
+            ranged(self.trx.as_mut().expect("storage transaction").map_read(vec![read]).await.map_err(transaction_store_failure)?)?;
 
         let id = &self.store.inner().id;
         entries.into_iter().map(|entry| decode_entry(id, entry)).collect()
@@ -135,6 +148,11 @@ where
             return Ok(TreeLanding::nothing());
         }
 
+        if let Some(read) = &mut self.buffered {
+            let writes = super::buffered::encode_batch(read.rows_map(), batch);
+            read.writes.add(writes.clone());
+            return Ok(TreeLanding::buffered(writes));
+        }
         let tree = self.store.inner();
         let generation = match self.generation {
             None => 0,
@@ -173,7 +191,7 @@ where
             }
         }
 
-        self.trx.map_write(writes).await.map_err(transaction_store_failure)?;
+        self.trx.as_mut().expect("storage transaction").map_write(writes).await.map_err(transaction_store_failure)?;
         self.generation = Some(generation);
 
         Ok(TreeLanding::of(generation, changed))

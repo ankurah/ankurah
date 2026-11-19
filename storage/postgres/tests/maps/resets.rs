@@ -1,7 +1,7 @@
 //! A reset of the engine against the map transactions on the database: a
 //! reset on one node waits for another node's open map transaction, and
-//! removes all that transaction landed, the tables its records made among
-//! it; no map transaction begins until the reset ends, whether or not any
+//! removes all data that transaction landed; no map transaction begins until
+//! the reset ends, whether or not any
 //! map existed when it began; a reset waiting for its own node's map
 //! transaction leaves the node's pool to that transaction's commit; one that
 //! waits past its node's lock timeout fails with it; and a reset answers
@@ -37,7 +37,7 @@ macro_rules! get {
 /// records live in, and a map's entry: once the reset returns, neither is
 /// left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reset_removes_what_the_map_transaction_it_waited_for_landed_the_tables_its_record_made_among_it() -> anyhow::Result<()> {
+async fn a_reset_removes_what_the_map_transaction_it_waited_for_landed() -> anyhow::Result<()> {
     let database = Database::start().await?;
     let (here, there) = (database.node().await?, database.node().await?);
     let (record, _) = entity!(1);
@@ -67,8 +67,7 @@ async fn a_reset_removes_what_the_map_transaction_it_waited_for_landed_the_table
 /// A map transaction that begins on one node while a reset on another is
 /// under way, on a database that holds an entity record and no map yet,
 /// waits at the database for the reset to end, and then lands. The reset,
-/// as it drops the table of entity records, waits for a lock the test holds
-/// on it.
+/// as it deletes entity records, waits for the test's writer-blocking table lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_map_transaction_begun_during_a_reset_waits_for_it_though_no_map_existed_when_it_began() -> anyhow::Result<()> {
     let database = Database::start().await?;
@@ -79,7 +78,7 @@ async fn a_map_transaction_begun_during_a_reset_waits_for_it_though_no_map_exist
     first.commit().await?.committed()?;
 
     let holder = database.connection().await?;
-    holder.batch_execute(r#"BEGIN; LOCK TABLE "_ankurah_entity" IN ACCESS SHARE MODE"#).await?;
+    holder.batch_execute(r#"BEGIN; LOCK TABLE "_ankurah_entity" IN SHARE MODE"#).await?;
     let resetting = tokio::spawn({
         let there = there.clone();
         async move { there.delete_all().await }

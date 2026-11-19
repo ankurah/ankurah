@@ -4,9 +4,12 @@
 //! IndexedDB stages them because a browser transaction cannot remain open
 //! across arbitrary async work. PostgreSQL uses the same buffer to send writes
 //! with its next read request or commit, saving a network round trip. SQLite
-//! writes directly into its native transaction and does not use this helper.
-//! All pending writes are submitted before the storage commit completes;
-//! this is transaction-local buffering, not write-behind across commits.
+//! writes directly into file-backed transactions; its private-memory mode
+//! stages writes so its sole connection remains available between calls.
+//! Those engines submit all pending writes before their storage commit completes.
+//! The digest-tree adapter also uses this overlay for deferred persistence of
+//! rebuildable trees. The owner determines when writes become visible and durable;
+//! this helper supplies neither a commit boundary nor a recovery checkpoint.
 //!
 //! Engines add writes here until they submit them to storage. To answer reads
 //! before submission, call [`PendingWrites::read`], execute the returned reads
@@ -21,14 +24,14 @@ use std::ops::Bound;
 
 use super::{MapId, MapRead, MapRows, MapWrite, ScanDirection};
 
-/// The map writes a transaction has made and has yet to land.
-#[derive(Default)]
+/// Map writes yet to be submitted to storage.
+#[derive(Clone, Default)]
 pub struct PendingWrites {
     maps: BTreeMap<MapId, MapChanges>,
 }
 
-/// What a transaction's pending writes do to one map.
-#[derive(Default)]
+/// What pending writes do to one map.
+#[derive(Clone, Default)]
 pub struct MapChanges {
     /// Whether a `Clear` came before the writes in `keys`, so that none of
     /// the entries the map held before remain.
@@ -39,6 +42,14 @@ pub struct MapChanges {
 }
 
 impl PendingWrites {
+    pub(crate) fn is_empty(&self) -> bool { self.maps.is_empty() }
+
+    /// A pending value, deletion, or clear for this key. The outer `None`
+    /// means these writes leave the stored value untouched.
+    pub(crate) fn get(&self, map: &MapId, key: &[u8]) -> Option<Option<&[u8]>> {
+        self.maps.get(map).and_then(|changes| written(changes, key))
+    }
+
     /// Fold `writes`, in order, into those pending: a write replaces any
     /// pending under its key, and a clear every pending write to its map.
     pub fn add(&mut self, writes: Vec<MapWrite>) {

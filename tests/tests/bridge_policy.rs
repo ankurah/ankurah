@@ -111,6 +111,7 @@ struct BridgePolicyAgent {
     deny_read_events: Arc<Mutex<HashSet<EventId>>>,
     deny_reads: Arc<AtomicBool>,
     deny_read_states: Arc<Mutex<HashSet<proto::EntityId>>>,
+    sent_queries: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl BridgePolicyAgent {
@@ -120,6 +121,7 @@ impl BridgePolicyAgent {
             deny_read_events: Arc::new(Mutex::new(HashSet::new())),
             deny_reads: Arc::new(AtomicBool::new(false)),
             deny_read_states: Arc::new(Mutex::new(HashSet::new())),
+            sent_queries: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -140,11 +142,14 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _node: &NodeInner<SE, Self>,
         cdata: &C,
-        _request: &proto::NodeRequest,
+        request: &proto::NodeRequest,
     ) -> Result<Vec<proto::AuthData>, AccessDenied>
     where
         C: Iterable<Self::ContextData>,
     {
+        if matches!(request.body, proto::NodeRequestBody::Fetch { .. } | proto::NodeRequestBody::SubscribeQuery { .. }) {
+            self.sent_queries.lock().unwrap().push(bincode::serialize(&request.body).unwrap());
+        }
         Ok(cdata.iterable().map(|_| proto::AuthData(vec![])).collect())
     }
 
@@ -238,6 +243,123 @@ impl PolicyAgent for BridgePolicyAgent {
 }
 
 #[tokio::test]
+async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_matching() -> Result<()> {
+    use ankurah::View;
+
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server.system.create().await?;
+    let writer = server.context_async(DEFAULT_CONTEXT).await?;
+    let trx = writer.begin();
+    let visible = trx.create(&Pet { name: "Visible".into(), age: "3".into() }).await?.id();
+    let hidden = trx.create(&Pet { name: "Hidden".into(), age: "4".into() }).await?.id();
+    trx.commit().await?;
+
+    let agent = BridgePolicyAgent::new();
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let _connection = LocalProcessConnection::new(&client, &server).await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    reader.fetch::<PetView>("true").await?;
+    agent.deny_read_states.lock().unwrap().insert(hidden);
+    agent.sent_queries.lock().unwrap().clear();
+
+    assert_eq!(reader.fetch::<PetView>("true").await?.len(), 1);
+    let _query = reader.query_wait::<PetView>("true").await?;
+    let requests = std::mem::take(&mut *agent.sent_queries.lock().unwrap());
+    let mut summaries = Vec::new();
+    for request in requests {
+        let request: proto::NodeRequestBody = bincode::deserialize(&request)?;
+        let (subscription, known_state, known_matches) = match request {
+            proto::NodeRequestBody::Fetch { known_state, known_matches, .. } => (false, known_state, known_matches),
+            proto::NodeRequestBody::SubscribeQuery { known_state, known_matches, .. } => (true, known_state, known_matches),
+            _ => unreachable!(),
+        };
+        assert_eq!(known_state.digest.count(), 1);
+        assert_eq!(known_matches.len(), 1);
+        assert_eq!(known_matches[0].entity_id, visible);
+        assert_eq!(known_matches[0].head, client.storage.get_state(visible).await?.payload.state.head);
+        summaries.push((subscription, known_state));
+    }
+    assert_eq!(summaries.len(), 2);
+    assert!(!summaries[0].0 && summaries[1].0);
+    assert_eq!(summaries[0].1, summaries[1].1, "both request paths describe the same allowed members and heads");
+    for (id, changes_summary) in [(hidden, false), (visible, true)] {
+        let view = writer.get::<PetView>(id).await?;
+        let trx = writer.begin();
+        trx.edit::<Pet>(view.entity())?.name()?.insert(0, "Changed ")?;
+        trx.commit().await?;
+        // Apply the peer's new state, then prepare another account of local state.
+        reader.fetch::<PetView>("true").await?;
+        agent.sent_queries.lock().unwrap().clear();
+        reader.fetch::<PetView>("true").await?;
+        let encoded = agent.sent_queries.lock().unwrap().pop().unwrap();
+        let proto::NodeRequestBody::Fetch { known_state, .. } = bincode::deserialize(&encoded)? else { panic!("expected fetch") };
+        assert_eq!(known_state.digest.count(), 1);
+        assert_eq!(known_state != summaries[0].1, changes_summary, "only an allowed member's changed head changes its digest");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn limited_known_state_is_sent_but_never_controls_the_response() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server.system.create().await?;
+    let writer = server.context_async(DEFAULT_CONTEXT).await?;
+    let trx = writer.begin();
+    let mut ids = Vec::new();
+    for name in ["A", "B", "C"] {
+        ids.push(trx.create(&Pet { name: name.into(), age: "3".into() }).await?.id());
+    }
+    trx.commit().await?;
+    let agent = BridgePolicyAgent::new();
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let _connection = LocalProcessConnection::new(&client, &server).await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    reader.fetch::<PetView>("true").await?;
+    agent.sent_queries.lock().unwrap().clear();
+    reader.fetch::<PetView>("true ORDER BY name ASC LIMIT 2").await?;
+    let request = agent.sent_queries.lock().unwrap().pop().unwrap();
+    let proto::NodeRequestBody::Fetch { selection, known_state, known_matches } = bincode::deserialize(&request)? else {
+        panic!("expected fetch");
+    };
+    assert_eq!(known_state.digest.count(), 2);
+    assert_eq!(known_matches.iter().map(|member| member.entity_id).collect::<Vec<_>>(), ids[..2]);
+
+    for subscription in [false, true] {
+        let mut responses = Vec::new();
+        for summary in [known_state.clone(), proto::KnownState::empty()] {
+            let request = if subscription {
+                proto::NodeRequestBody::SubscribeQuery {
+                    query_id: proto::QueryId::new(),
+                    selection: selection.clone(),
+                    version: 1,
+                    known_matches: Vec::new(),
+                    known_state: summary,
+                }
+            } else {
+                proto::NodeRequestBody::Fetch { selection: selection.clone(), known_matches: Vec::new(), known_state: summary }
+            };
+            let response = client.request(server.id, &DEFAULT_CONTEXT, request).await?;
+            let deltas = match response {
+                proto::NodeResponseBody::Fetch(deltas) | proto::NodeResponseBody::QuerySubscribed { deltas, .. } => deltas,
+                response => panic!("unexpected response: {response:?}"),
+            };
+            assert_eq!(deltas.iter().map(|delta| delta.entity_id).collect::<Vec<_>>(), ids[..2]);
+            responses.push(bincode::serialize(&deltas)?);
+        }
+        assert_eq!(responses[0], responses[1], "a matching digest does not suppress any state transfer");
+    }
+    let response = client
+        .request(
+            server.id,
+            &DEFAULT_CONTEXT,
+            proto::NodeRequestBody::Fetch { selection, known_matches, known_state: proto::KnownState::empty() },
+        )
+        .await?;
+    assert!(matches!(response, proto::NodeResponseBody::Fetch(deltas) if deltas.is_empty()), "known_matches alone suppresses transfers");
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     use ankurah::core::schema::{MODEL_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID, PROPERTY_COLLECTION_ID};
 
@@ -284,12 +406,14 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             proto::NodeRequestBody::Fetch {
                 selection: Predicate::MemberOf(model).into(),
                 known_matches: vec![proto::KnownEntity { entity_id, head: known_head.clone() }],
+                known_state: proto::KnownState::empty(),
             },
             proto::NodeRequestBody::SubscribeQuery {
                 query_id: proto::QueryId::new(),
                 selection: Predicate::MemberOf(model).into(),
                 version: 1,
                 known_matches: vec![proto::KnownEntity { entity_id, head: known_head }],
+                known_state: proto::KnownState::empty(),
             },
         ];
         for request in requests {
@@ -314,7 +438,11 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_matches: vec![] },
+                proto::NodeRequestBody::Fetch {
+                    selection: Predicate::MemberOf(model).into(),
+                    known_matches: vec![],
+                    known_state: proto::KnownState::empty(),
+                },
             )
             .await?;
         assert!(matches!(response, proto::NodeResponseBody::Error(message) if message.contains("all reads denied")));

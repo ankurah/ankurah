@@ -124,6 +124,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let entities = if !node.durable {
             node.fetch_from_peer(args.selection, &cdata).await
         } else {
+            let _digest_tree = node.digest_tree(args.selection.clone()).await?;
             let states = node.storage.fetch_states(&args.selection).await?;
 
             let mut entities = Vec::new();
@@ -137,6 +138,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             Ok(entities)
         }?;
         Ok(entities.into_iter().filter(|entity| policy.can_read(entity)).collect())
+    }
+
+    async fn digest_tree(&self, selection: ankql::ast::Selection<Resolved>) -> Result<Box<dyn Send + Sync>, RetrievalError> {
+        let node = self.node.upgrade()?;
+        let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
+        let selection = ankql::ast::Selection { predicate: policy.filter_predicate(selection.predicate)?, ..selection };
+        node.digest_tree(selection).await
     }
 
     /// Validate and commit the transaction, then publish its entity changes.

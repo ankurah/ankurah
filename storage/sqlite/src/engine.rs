@@ -27,6 +27,7 @@ use crate::value::SqliteValue;
 mod maps;
 mod materialization;
 mod query;
+mod state;
 mod transaction;
 use maps::Maps;
 pub use maps::SqliteMapSnapshot;
@@ -50,7 +51,7 @@ pub(crate) const ENTITY_MODEL_TABLE: &str = "_ankurah_entity_model";
 /// engine creates it once, before its first map call.
 pub(crate) const MAP_TABLE: &str = "_ankurah_map";
 const FIXED_STORAGE_TABLES: &[&str] =
-    &[META_TABLE, MODEL_MAP_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE, MAP_TABLE];
+    &[META_TABLE, MODEL_MAP_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE, MAP_TABLE, state::CHANGES_TABLE];
 
 fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
 
@@ -210,6 +211,7 @@ impl SqliteStorageEngine {
             resolver: Arc::new(std::sync::RwLock::new(None)),
         };
         engine.check_protocol_version().await?;
+        engine.maps.memory_connection().await?;
         Ok(engine)
     }
 
@@ -290,6 +292,7 @@ impl SqliteStorageEngine {
                 ),
                 [],
             )?;
+            state::initialize(c)?;
             Ok(())
         })
         .await
@@ -365,11 +368,17 @@ impl StorageEngine for SqliteStorageEngine {
 
     fn transaction(&self) -> Self::Transaction<'_> { SqliteTransaction::new(self) }
 
-    /// A read transaction on a connection of its own. In the engine's
-    /// write-ahead-log journal mode its reads never wait for a commit, so it
-    /// takes no lock: `locks` go unused.
+    /// A WAL read transaction on a connection of its own, or revision-checked
+    /// short reads for a private-memory database. Neither takes named locks.
     async fn map_snapshot(&self, _locks: &[LockName]) -> Result<SqliteMapSnapshot, RetrievalError> {
         Ok(SqliteMapSnapshot::begin(&self.maps).await?)
+    }
+
+    async fn state_snapshot(
+        &self,
+        since: Option<&ankurah_core::storage::StateCursor>,
+    ) -> Result<Box<dyn ankurah_core::storage::StateSnapshot>, RetrievalError> {
+        Ok(Box::new(state::SqliteStateSnapshot::begin(self, since).await?))
     }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
@@ -433,24 +442,28 @@ impl StorageEngine for SqliteStorageEngine {
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
         self.materializations.clear();
+        let memory = self.maps.in_memory().await?;
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
-        conn.with_connection(|c| {
-            // Emptying the maps waits, as every write does, for a map
-            // transaction that holds the database's write lock, as one does
-            // from its first map call to its end; past the busy timeout, the
-            // reset fails as busy. A transaction whose first map call is still
-            // queued on the writer turn holds no database lock yet; it and the
-            // reset run one after the other, in the order they take the write
-            // lock. Emptying comes first, so that what the reset drops
-            // includes the tables made by the commit of a transaction it
-            // waited for.
-            let emptied = maps::statements::empty(c)?;
+        conn.with_connection_mut(move |c| {
+            // One native transaction, begun with the database's write lock, so
+            // that the reset lands whole or not at all, and no other writer
+            // comes between its statements. A map transaction holds the write
+            // lock from its first map call to its end, so it lands wholly
+            // before the reset or wholly after it: the reset waits for one
+            // under way, as every write does, and removes all it landed; one
+            // whose first map call comes during the reset waits for the reset
+            // in turn. Past the busy timeout, whichever waits fails as busy.
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let emptied = maps::statements::empty(&tx)?;
+            if memory {
+                maps::memory::advance(&tx)?;
+            }
 
             // Dynamic materializations are engine-owned only when named by the
             // durable model map. Arbitrary tables may belong to the embedding
             // application and must survive an Ankurah reset.
-            let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+            let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
             let existing: BTreeSet<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
             drop(stmt);
 
@@ -461,7 +474,7 @@ impl StorageEngine for SqliteStorageEngine {
                 .map(str::to_owned)
                 .collect();
             if existing.contains(MODEL_MAP_TABLE) {
-                let mut stmt = c.prepare(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#))?;
+                let mut stmt = tx.prepare(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#))?;
                 owned.extend(
                     stmt.query_map([], |row| row.get::<_, String>(0))?
                         .collect::<Result<Vec<_>, _>>()?
@@ -470,15 +483,13 @@ impl StorageEngine for SqliteStorageEngine {
                 );
             }
 
-            if owned.is_empty() {
-                return Ok(emptied);
+            for table in &owned {
+                tx.execute(&format!("DROP TABLE IF EXISTS {}", quote_identifier(table)), [])?;
             }
+            tx.execute(&format!(r#"DELETE FROM "{META_TABLE}" WHERE "key" = ?"#), [state::CURSOR_KEY])?;
 
-            for table in owned {
-                c.execute(&format!("DROP TABLE IF EXISTS {}", quote_identifier(&table)), [])?;
-            }
-
-            Ok(true)
+            tx.commit()?;
+            Ok(emptied || !owned.is_empty())
         })
         .await
         .map_err(|e| MutationError::General(Box::new(e)))
@@ -528,15 +539,18 @@ fn decode_state_row(
 }
 
 async fn load_state(conn: &PooledConnection, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
-    conn.with_connection_mut(move |c| load_states(&c.transaction()?, &[id]))
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(RetrievalError::EntityNotFound(id))
+    conn.with_connection_mut(move |c| {
+        let transaction = c.transaction()?;
+        load_states(&transaction, &[id])
+    })
+    .await?
+    .into_iter()
+    .next()
+    .ok_or(RetrievalError::EntityNotFound(id))
 }
 
 /// Reconstruct state and memberships within the caller's read snapshot.
-fn load_states(snapshot: &rusqlite::Transaction<'_>, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, SqliteError> {
+fn load_states(snapshot: &Connection, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, SqliteError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }

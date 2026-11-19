@@ -15,7 +15,7 @@ use ankurah::core::test_helpers::map_conformance::{
     fixtures::{entity, HANG},
 };
 use ankurah::proto::Clock;
-use ankurah_storage_sqlite::{SqliteConnectionManager, SqliteError, SqliteStorageEngine};
+use ankurah_storage_sqlite::{SqliteConnectionManager, SqliteStorageEngine};
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
@@ -37,24 +37,35 @@ map_conformance::every_case!(on_a_fresh_database);
 // state while later commits land.
 map_conformance::every_case_for_engines_whose_snapshots_keep_their_state!(on_a_fresh_database);
 
-/// A database in memory keeps no maps, since each connection to it is a
-/// database of its own: a transaction's first map call refuses it, leaving the
-/// transaction unable to commit, and so does a snapshot.
-#[tokio::test]
-async fn a_database_in_memory_refuses_map_calls() -> anyhow::Result<()> {
-    let engine = SqliteStorageEngine::open_in_memory().await?;
+mod memory {
+    use super::*;
 
-    let mut trx = engine.transaction();
-    let called = trx.map_lock_and_read(&[LockName::new("l")], vec![]).await;
-    assert!(matches!(called, Err(MutationError::General(error)) if in_memory(error.as_ref())));
-    assert!(matches!(trx.commit().await, Err(MutationError::TransactionFailed)));
+    macro_rules! on_memory {
+        ($($case:ident),* $(,)?) => {
+            $(#[tokio::test]
+            async fn $case() -> anyhow::Result<()> {
+                map_conformance::$case(&SqliteStorageEngine::open_in_memory().await?).await
+            })*
+        };
+    }
 
-    let begun = engine.map_snapshot(&[]).await;
-    assert!(matches!(begun, Err(RetrievalError::StorageError(error)) if in_memory(error.as_ref())));
-    Ok(())
+    map_conformance::every_case!(on_memory);
+    map_conformance::every_case_for_engines_that_lock_by_name!(on_memory);
+
+    #[tokio::test]
+    async fn a_commit_invalidates_an_older_snapshot_without_holding_the_only_connection() -> anyhow::Result<()> {
+        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let read = MapRead::Get { map: MapId::new("m"), keys: vec![b"a".to_vec()] };
+        let mut snapshot = engine.map_snapshot(&[]).await?;
+        snapshot.map_read(vec![read.clone()]).await?;
+        let mut transaction = engine.transaction();
+        transaction.map_write(vec![MapWrite::Put { map: MapId::new("m"), key: b"a".to_vec(), value: vec![1] }]).await?;
+        transaction.commit().await?.committed()?;
+        assert!(matches!(snapshot.map_read(vec![read]).await,
+            Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict)));
+        Ok(())
+    }
 }
-
-fn in_memory(error: &(dyn std::error::Error + 'static)) -> bool { matches!(error.downcast_ref(), Some(SqliteError::MapsInMemory)) }
 
 /// A reset answers whether it deleted anything, the maps' entries among it:
 /// once one has emptied the maps, the next finds nothing to delete.

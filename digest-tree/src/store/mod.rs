@@ -31,13 +31,10 @@ pub(crate) use overlay::Overlay;
 ///
 /// # What a tree relies on
 ///
-/// A tree's rows describe its owner's records, so they land in the same
-/// transaction as the records they describe, or not at all. The tree writes
-/// through its owner's transaction on the store ([`Trx`](Self::Trx)), which
-/// the owner lends it for one commit or one creation and then commits with
-/// its own records. A commit reads the rows its changes touch through that
-/// transaction, sums new digests from them, and, after all its reads, writes
-/// the new rows in one batch. Those sums are right only if
+/// The tree writes through its owner's transaction on the store
+/// ([`Trx`](Self::Trx)), lent for one commit or creation. A commit reads the
+/// rows its changes touch, sums new digests from them, and then writes the
+/// new rows in one batch. Those sums are right only if
 ///
 /// - the batch lands with the owner's transaction, whole, or not at all;
 /// - while the tree reads and writes through the transaction, and until the
@@ -46,6 +43,14 @@ pub(crate) use overlay::Overlay;
 ///   one transaction once another's write has landed;
 /// - the transaction's reads see the tree as the last landed commit left it,
 ///   and see the transaction's own writes, ranges included.
+///
+/// The owner keeps the tree consistent with the records it describes. It may
+/// commit both in one storage transaction, or publish a rebuildable tree in
+/// memory and persist it later. With deferred persistence, the durable tree
+/// rows and their recovery checkpoint must describe the same source version
+/// and land atomically. The owner must reconcile subsequent source changes
+/// before serving a recovered tree. A memory commit is still an atomic tree
+/// commit; deferring persistence does not permit partially visible writes.
 ///
 /// Each of the tree's own reads, a count, the digests or the pages at some
 /// spans, an audit, or one batch of a range read, begins a read of the store
@@ -74,7 +79,7 @@ pub trait Store<K, V>: Clone + Send + Sync + 'static {
     type Pending: Send + 'static;
 
     /// Begin a read that sees one consistent committed state for all its rows.
-    /// Include every commit completed before this call began. Commits concurrent
+    /// Include every tree commit completed before this call began. Commits concurrent
     /// with snapshot acquisition may be included, but never partially.
     fn begin_read(&self) -> impl Future<Output = Result<Self::Read, StoreError>> + Send;
 

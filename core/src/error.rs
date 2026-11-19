@@ -93,6 +93,10 @@ pub enum RetrievalError {
     DecodeError(Arc<DecodeError>),
     #[error("invalid stored state: {0}")]
     InvalidState(String),
+    /// A continuation token has an unknown format, belongs to another store,
+    /// or predates a reset. Derived data must be rebuilt from a full snapshot.
+    #[error("entity-state cursor is not valid for this storage incarnation")]
+    InvalidStateCursor,
     #[error("State error: {0}")]
     StateError(Arc<StateError>),
     #[error("Mutation error: {0}")]

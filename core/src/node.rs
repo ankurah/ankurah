@@ -45,6 +45,7 @@ mod schema_registration;
 mod state;
 #[cfg(test)]
 mod tests;
+mod trees;
 
 pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
@@ -98,11 +99,15 @@ where PA: PolicyAgent
     pub durable: bool,
     pub storage: Arc<SE>,
 
+    /// Digest trees created by this node's queries and maintained from canonical state.
+    pub(crate) trees: crate::sync::TreeManager<SE>,
+    tree_maintenance: Arc<tokio::sync::Notify>,
+
     pub(crate) entities: WeakEntitySet,
     /// Hold across storage commit and WeakEntitySet publication: register a new resident entity
     /// or update one already registered there. Otherwise a competing writer could retry
     /// from stale in-memory state after storage advances. Reactor notification follows later.
-    pub(crate) commit_publication_lock: tokio::sync::Mutex<()>,
+    pub(crate) commit_publication_lock: Arc<tokio::sync::Mutex<()>>,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -213,11 +218,23 @@ where
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new(&run)) };
 
+        let commit_publication_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let catalog = Arc::new(CatalogManager::default());
+        let trees = crate::sync::TreeManager::new(
+            engine.clone(),
+            commit_publication_lock.clone(),
+            crate::sync::CacheSettings { bytes: 8 * 1024 * 1024 },
+            64,
+        )
+        .with_catalog(&catalog);
+
         let node = Node(Arc::new(NodeInner {
             id,
             storage: engine,
+            trees,
+            tree_maintenance: Arc::new(tokio::sync::Notify::new()),
             entities: entityset,
-            commit_publication_lock: tokio::sync::Mutex::new(()),
+            commit_publication_lock,
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
             rng: Mutex::new(rng),
@@ -225,7 +242,7 @@ where
             durable,
             policy_agent,
             system: system_manager,
-            catalog: Arc::new(CatalogManager::default()),
+            catalog,
             alive,
             run,
             sessions: SessionSet::new(),
@@ -235,6 +252,7 @@ where
 
         let resolver: Arc<dyn crate::storage::CatalogResolver> = node.catalog.clone();
         node.storage.set_catalog_resolver(Arc::downgrade(&resolver));
+        node.start_tree_maintenance();
 
         if let Some(ref relay) = node.subscription_relay {
             let weak_node = node.weak();
@@ -502,7 +520,8 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::Fetch { mut selection, known_matches } => {
+            // KnownState is carried as a dry run; only known_matches controls the response.
+            proto::NodeRequestBody::Fetch { mut selection, known_matches, known_state: _ } => {
                 let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
                 selection.predicate = policy.filter_predicate(selection.predicate)?;
 
@@ -535,7 +554,7 @@ where
                 Ok(proto::NodeResponseBody::Get(results))
             }
             proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
-            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
+            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches, known_state: _ } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // Catalog subscriptions carry no credential; others carry exactly one.
                 let cdata = match cdata.iterable().at_most_one() {
@@ -807,15 +826,10 @@ where
         self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-        let known_matched_entities = self.fetch_entities_from_local(&selection).await?;
-
-        let known_matches = known_matched_entities
-            .iter()
-            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
-            .collect();
+        let (_digest_tree, known_state, known_matches) = self.prepare_known(selection.clone(), cdata).await?;
 
         let selection_clone = selection.clone();
-        match self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches }).await? {
+        match self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches, known_state }).await? {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let event_getter = CachedEventGetter::new(self, cdata);
                 let state_getter = LocalStateGetter::new(self.storage.clone());

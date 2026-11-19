@@ -25,6 +25,13 @@ where
     /// A view of the whole tree.
     pub fn view(&self) -> DigestTreeView<K, I, L, G, S> { DigestTreeView::new(self.clone(), vec![Span::all()]) }
 
+    /// Encode a member's key and payload as this tree would hold them, without
+    /// reading or inserting it. Owners can persist this leaf alongside their
+    /// own member lookup for later updates after an ordering property changes.
+    pub fn leaf<M: crate::Member<K, Id = I, Payload = L>>(&self, member: &M) -> Result<Leaf<I, L>, Error> {
+        Ok(Leaf { key: crate::key::member_key(&self.inner.key_spec, member)?, id: member.id(), payload: member.payload() })
+    }
+
     /// A view of the part of the tree within `spans`: a span of addresses or
     /// a key range of values ([`IntoSpan`](crate::IntoSpan)), such as
     /// `2010..` for the members whose first key part holds 2010 or more, or an

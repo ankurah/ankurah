@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) mod maps;
 pub(crate) mod query;
+pub(crate) mod state;
 mod transaction;
 pub use maps::{IndexedDbMapSnapshot, MapError};
 pub use transaction::IndexedDbTransaction;
@@ -297,6 +298,13 @@ impl StorageEngine for IndexedDBStorageEngine {
         Ok(IndexedDbMapSnapshot::new(self.db.clone(), locks))
     }
 
+    async fn state_snapshot(
+        &self,
+        since: Option<&ankurah_core::storage::StateCursor>,
+    ) -> Result<Box<dyn ankurah_core::storage::StateSnapshot>, RetrievalError> {
+        Ok(Box::new(state::IndexedDbStateSnapshot::begin(self.db.clone(), since).await?))
+    }
+
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { load_state(&self.db, id).await }
 
     async fn fetch_states(
@@ -378,6 +386,8 @@ impl StorageEngine for IndexedDBStorageEngine {
             for name in ["entities", "materializations", "events", "entity_models", "property_columns", MODEL_REGISTRATIONS_STORE] {
                 store_names.push(&name.into());
             }
+            store_names.push(&state::CHANGES.into());
+            store_names.push(&state::META.into());
             if empties_maps {
                 for name in maps::STORES {
                     store_names.push(&name.into());
@@ -390,6 +400,8 @@ impl StorageEngine for IndexedDBStorageEngine {
             for name in ["entities", "materializations", "events", "entity_models", "property_columns", MODEL_REGISTRATIONS_STORE] {
                 transaction.object_store(name).require("get store for reset")?.clear().require("clear store")?;
             }
+            transaction.object_store(state::CHANGES).require("get state change store")?.clear().require("clear state changes")?;
+            state::reset(&transaction)?;
             if empties_maps {
                 maps::reset(&transaction)?;
             }

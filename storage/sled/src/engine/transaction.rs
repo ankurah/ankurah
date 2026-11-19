@@ -186,7 +186,12 @@ fn commit_staged(
         }
     }
     entities.sort_by_key(|entity| entity.entity_id);
-    let mut trees = vec![database.entities_tree.clone(), database.entity_models_tree.clone(), database.events_tree.clone()];
+    let mut trees = vec![
+        database.entities_tree.clone(),
+        database.entity_models_tree.clone(),
+        database.events_tree.clone(),
+        database.state_changes.clone(),
+    ];
     let mut tree_positions = BTreeMap::<Vec<u8>, usize>::new();
     for (position, tree) in trees.iter().enumerate() {
         tree_positions.insert(tree.name().to_vec(), position);
@@ -239,6 +244,18 @@ fn commit_staged(
                 transactional[2].insert(key.clone(), value.clone())?;
             }
         }
+        let changes = &transactional[3];
+        let position = if entities.is_empty() {
+            None
+        } else {
+            let current = changes.get(state::COUNTER)?.ok_or_else(|| sled_abort("missing canonical state counter"))?;
+            let next = state::decode_counter(&current)
+                .map_err(sled_abort)?
+                .checked_add(1)
+                .ok_or_else(|| sled_abort("canonical state counter exhausted"))?;
+            changes.insert(state::COUNTER, next.to_be_bytes().as_slice())?;
+            Some(next)
+        };
         let mut results = Vec::with_capacity(entities.len());
         for prepared in &entities {
             let entity_id = prepared.entity_id;
@@ -256,6 +273,15 @@ fn commit_staged(
             }
             associations.insert(key.clone(), prepared.encoded_memberships.clone())?;
             canonical.insert(key.clone(), prepared.encoded_state.clone())?;
+            if let Some(position) = position {
+                let member_key = state::member_key(entity_id);
+                if let Some(previous) = changes.get(&member_key)? {
+                    let previous = state::decode_counter(&previous).map_err(sled_abort)?;
+                    changes.remove(state::change_key(previous, entity_id))?;
+                }
+                changes.insert(member_key, position.to_be_bytes().as_slice())?;
+                changes.insert(state::change_key(position, entity_id), &[])?;
+            }
 
             for materialization in &prepared.materializations {
                 let model_position = *tree_positions

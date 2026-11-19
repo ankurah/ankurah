@@ -49,10 +49,14 @@ pub(in crate::sync::storage_adapter) type Changed = Vec<(Vec<u8>, Option<Vec<u8>
 
 pub(in crate::sync::storage_adapter) fn key(generation: u64) -> Vec<u8> { generation.to_be_bytes().to_vec() }
 
+/// A clear or replacement invalidates every cached row, including keys that
+/// are absent from the replacement's explicit writes.
+pub(in crate::sync::storage_adapter) fn whole_tree() -> Vec<u8> { vec![WHOLE_TREE] }
+
 /// The entry for a write that changed `changed`.
 pub(in crate::sync::storage_adapter) fn entry(changed: &Changed) -> Vec<u8> {
     if changed.len() > MOST_ROWS {
-        return vec![WHOLE_TREE];
+        return whole_tree();
     }
 
     let mut bytes = vec![ROWS];

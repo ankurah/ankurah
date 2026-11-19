@@ -15,6 +15,7 @@ use std::{
 mod maps;
 use maps::{MapReads, Maps, OpenSnapshot, TestMapSnapshot, TransactionMaps};
 
+mod states;
 mod tests;
 
 type Pause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
@@ -28,6 +29,11 @@ pub(crate) struct TestStorage {
     pub hold_set_state: Mutex<Option<Pause>>,
     pub hold_commit: Mutex<Option<Pause>>,
     pub hold_after_commit: Mutex<Option<Pause>>,
+    /// Pause a canonical-state snapshot after capturing its read boundary.
+    pub hold_state_snapshot: Mutex<Option<Pause>>,
+    /// Pause the page that many calls from now, counting from zero.
+    pub hold_state_page: Arc<Mutex<Option<(usize, Pause)>>>,
+    pub reject_state_finish: Arc<AtomicBool>,
     /// Pauses the next map write part way, after the first of its writes.
     pub hold_map_write: Mutex<Option<Pause>>,
     /// Pauses a transaction's map call before it is answered: the call that
@@ -52,7 +58,6 @@ pub(crate) struct TestStorage {
     map_reads: MapReads,
 }
 
-#[derive(Default)]
 struct TestData {
     states: BTreeMap<EntityId, Attested<EntityState>>,
     events: BTreeMap<EventId, Attested<Event>>,
@@ -63,11 +68,34 @@ struct TestData {
 
     /// How many times `delete_all` has emptied the storage.
     resets: u64,
+    incarnation: EntityId,
+    revision: u64,
+    state_revisions: BTreeMap<EntityId, u64>,
+}
+
+impl Default for TestData {
+    fn default() -> Self {
+        Self {
+            states: BTreeMap::new(),
+            events: BTreeMap::new(),
+            maps: Arc::new(Maps::new()),
+            resets: 0,
+            incarnation: EntityId::random(),
+            revision: 0,
+            state_revisions: BTreeMap::new(),
+        }
+    }
 }
 
 impl TestStorage {
     /// Replace fixture data directly, including intentionally corrupt state.
-    pub fn set_state(&self, state: Attested<EntityState>) { self.data.lock().unwrap().states.insert(state.payload.entity_id, state); }
+    pub fn set_state(&self, state: Attested<EntityState>) {
+        let mut data = self.data.lock().unwrap();
+        data.revision += 1;
+        let revision = data.revision;
+        data.state_revisions.insert(state.payload.entity_id, revision);
+        data.states.insert(state.payload.entity_id, state);
+    }
 
     pub fn fail_next_commit(&self) { self.fail_next_commit.store(true, Ordering::SeqCst); }
 
@@ -192,6 +220,9 @@ impl TestStorageTransaction<'_> {
             return Ok(StorageCommitOutcome::Conflict { observed });
         }
         let mut entities = Vec::new();
+        if !self.states.is_empty() {
+            data.revision += 1;
+        }
         for (_, attested_state) in self.states {
             let entity_id = attested_state.payload.entity_id;
             let previous = observed[&entity_id].as_ref();
@@ -200,6 +231,8 @@ impl TestStorageTransaction<'_> {
                 entity_id,
                 canonical_changed: previous.is_none_or(|previous| previous.payload.state.head != state.head),
             });
+            let revision = data.revision;
+            data.state_revisions.insert(entity_id, revision);
             data.states.insert(entity_id, attested_state);
         }
         for event in self.events {
@@ -242,6 +275,20 @@ impl StorageEngine for TestStorage {
             reads: Arc::clone(&self.map_reads),
             _open: open,
         })
+    }
+
+    async fn state_snapshot(
+        &self,
+        since: Option<&crate::storage::StateCursor>,
+    ) -> Result<Box<dyn crate::storage::StateSnapshot>, RetrievalError> {
+        let snapshot =
+            states::Snapshot::new(&self.data.lock().unwrap(), since, self.hold_state_page.clone(), self.reject_state_finish.clone())?;
+        let hold = self.hold_state_snapshot.lock().unwrap().take();
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            release.await.unwrap();
+        }
+        Ok(Box::new(snapshot))
     }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {

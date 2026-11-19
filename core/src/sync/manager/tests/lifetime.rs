@@ -110,22 +110,22 @@ async fn opening_new_selections_prunes_expired_weak_entries_without_maintenance(
 }
 
 #[tokio::test]
-async fn maintenance_keeps_trees_alive_until_commit_lands() -> anyhow::Result<()> {
+async fn an_in_progress_reconciliation_keeps_its_tree_alive() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(0)?;
     let selection = selection(false, None, false);
     let before = version(1, 10, true);
     fixture.seed(std::slice::from_ref(&before))?;
     let tree = fixture.manager.open(selection.clone()).await?;
-    let mut after = before.clone();
-    after.score = 20;
-    let changes = [(Some(before), Some(after))];
-    let _publication = fixture.publication.lock().await;
-    let mut trx = fixture.storage.transaction();
-    write_versions(&mut trx, &changes).await?;
-    let applied = fixture.manager.apply(&mut trx, &changes).await?;
+    let (entered, scanning) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    *fixture.storage.hold_state_snapshot.lock().unwrap() = Some((entered, resume));
+    let mut maintenance = Box::pin(fixture.manager.maintain());
+    assert!(ankurah_digest_tree::test_support::poll_once(maintenance.as_mut()).is_pending());
+    scanning.await?;
     drop(tree);
-    assert!(fixture.manager.tree(&selection_key(&selection)?).is_some());
-    applied.landed(&trx.commit().await?.committed()?);
+    assert!(fixture.manager.trees().len() == 1);
+    release.send(()).unwrap();
+    maintenance.await?;
     assert!(fixture.manager.tree(&selection_key(&selection)?).is_none());
     Ok(())
 }
