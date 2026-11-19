@@ -19,7 +19,7 @@ use crate::sync::error::open_failure;
 use crate::sync::member::EntityMember;
 use crate::sync::{storage_adapter, EntityHead, EntityMemberId, TreeId};
 
-const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+pub(super) const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 const ATTEMPTS: usize = 3;
 
 impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
@@ -123,7 +123,7 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         force_flush: bool,
     ) -> Result<(), RetrievalError> {
         let (working, mut snapshot, full, initial) = self.begin_reconciliation(tree, selection, rebuild).await?;
-        let changed = self.apply_snapshot(&working, selection, &mut *snapshot, initial).await?;
+        let changed = self.apply_snapshot(&working, selection, &mut *snapshot, full, initial).await?;
         let cursor = snapshot.finish().await?;
         working.store().advance(cursor, self.epoch.load(Ordering::Acquire), changed);
         let version = working.store().buffered();
@@ -160,8 +160,10 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         // A Ready tree rebuilt through the public adapter may contain arbitrary
         // members without their lookup/cursor, so it needs full replacement.
         let mut clear = rebuild || (initial && !base.is_building());
-        let scan = if selection.limit.is_some() {
+        let scan = if selection.limit.is_some() && full {
             StateScan::Selection(selection)
+        } else if selection.limit.is_some() {
+            StateScan::SelectionChanges { selection, since: base.cursor.as_ref() }
         } else {
             StateScan::Changes(if full { None } else { base.cursor.as_ref() })
         };
@@ -171,6 +173,7 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
                 clear = true;
                 let scan = match scan {
                     StateScan::Changes(_) => StateScan::Changes(None),
+                    StateScan::SelectionChanges { selection, .. } => StateScan::Selection(selection),
                     selection => selection,
                 };
                 self.storage.state_snapshot(scan).await?
@@ -198,8 +201,13 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         tree: &DigestTree<SE, G>,
         selection: &Selection<Resolved>,
         snapshot: &mut dyn StateSnapshot,
+        full: bool,
         initial: bool,
     ) -> Result<usize, RetrievalError> {
+        self.validate_order_types(tree, snapshot).await?;
+        if let Some(limit) = selection.limit.filter(|_| !full) {
+            return self.apply_limited_changes(tree, selection, snapshot, limit).await;
+        }
         let mut page = snapshot.next_page(PAGE_SIZE).await?;
         if selection.limit.is_some() {
             let mut selected = Vec::new();
@@ -224,12 +232,12 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
             let trx = tree.store().buffered_transaction().await.map_err(|error| open_failure(error.into()))?;
             prepared.apply(trx).await.map_err(open_failure)?.landed();
             tree.store().set_member_rows(removed);
-            return Ok(count + self.apply_states(tree, selection, selected).await?);
+            return Ok(count + self.apply_states(tree, selection, selected, None, None).await?);
         }
         let mut count = 0;
         while !page.is_empty() {
             count += page.len();
-            self.apply_states(tree, selection, page).await?;
+            self.apply_states(tree, selection, page, None, None).await?;
             if initial && tree.store().buffered().has_writes() {
                 // No completed backing tree exists yet. Persist bounded build
                 // batches as Building, with no recovery cursor. Another builder
@@ -242,11 +250,13 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         Ok(count)
     }
 
-    async fn apply_states(
+    pub(super) async fn apply_states(
         &self,
         tree: &DigestTree<SE, G>,
         selection: &Selection<Resolved>,
         states: Vec<Attested<EntityState>>,
+        matching: Option<&std::collections::HashSet<ankurah_proto::EntityId>>,
+        through: Option<&[u8]>,
     ) -> Result<usize, RetrievalError> {
         let ids: Vec<_> = states.iter().map(|state| state.payload.entity_id).collect();
         let keys: Vec<_> = ids.iter().map(|id| id.to_bytes().to_vec()).collect();
@@ -260,7 +270,9 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
                 .map(|(key, head)| Leaf { key, id: EntityMemberId(id), payload: EntityHead(head) });
             // Membership can exclude an unrelated model without decoding its
             // property backends. A former member still needs its old leaf removed.
-            if membership_match(&selection.predicate, &|model| state.payload.state.memberships.contains(model)) == Some(false) {
+            if matching.is_some_and(|matching| !matching.contains(&id))
+                || membership_match(&selection.predicate, &|model| state.payload.state.memberships.contains(model)) == Some(false)
+            {
                 if let Some(old) = old {
                     changes.remove_leaf(old).map_err(open_failure)?;
                     members.push((id.to_bytes().to_vec(), None));
@@ -268,7 +280,9 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
                 continue;
             }
             let entity = TemporaryEntity::new(id, &state.payload.state)?;
-            let matches = if selection.limit.is_some() {
+            let matches = if let Some(matching) = matching {
+                matching.contains(&id)
+            } else if selection.limit.is_some() {
                 true
             } else {
                 match evaluate_predicate(&entity, &selection.predicate) {
@@ -278,6 +292,10 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
                 }
             };
             let new = if matches { Some(tree.leaf(&EntityMember(&entity)).map_err(open_failure)?) } else { None };
+            // An incremental limited tree retains only its complete prefix.
+            // Candidates beyond it are supplied by the final snapshot refill.
+            let new = new
+                .filter(|leaf| through.is_none_or(|through| ankurah_digest_tree::leaf_address(&leaf.key, &leaf.id).as_slice() <= through));
             if old == new {
                 continue;
             }

@@ -4,10 +4,11 @@
 //! saved snapshot includes the transactions that were still running, so a
 //! later scan can find their writes even when they commit out of ID order.
 
-use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
+use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
+    selection::ordering::OrderBoundary,
     storage::{StateCursor, StateScan, StateSnapshot},
 };
 use ankurah_proto::{Attested, EntityId, EntityState};
@@ -77,6 +78,8 @@ pub(super) struct Snapshot {
     after: (i64, String),
     selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
     ended: bool,
+    query: Option<Arc<Query>>,
+    incarnation: String,
 }
 
 /// Separate exact in-progress writers from the new-ID range. Each query can
@@ -87,14 +90,27 @@ enum WriterScope {
 }
 
 impl Snapshot {
+    fn ensure_active(&self) -> Result<(), RetrievalError> {
+        if self.ended {
+            return Err(MutationError::WriteConflict.into());
+        }
+        Ok(())
+    }
+
     pub(super) async fn begin(engine: &Postgres, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
-        let (since, selection) = match scan {
-            StateScan::Changes(since) => (since, None),
+        let (since, selection, selection_changes) = match scan {
+            StateScan::Changes(since) => (since, None, false),
+            StateScan::SelectionChanges { selection, since } => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection change snapshot requires LIMIT".into()));
+                }
+                (since, Some(selection), true)
+            }
             StateScan::Selection(selection) => {
                 if selection.limit.is_none() {
                     return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
                 }
-                (None, Some(selection))
+                (None, Some(selection), false)
             }
         };
         let client = tokio::time::timeout(Duration::from_secs(crate::DEFAULT_CONNECTION_TIMEOUT_SECS), engine.pool.dedicated_connection())
@@ -108,6 +124,8 @@ impl Snapshot {
             after: (0, String::new()),
             selected: None,
             ended: false,
+            query: None,
+            incarnation: String::new(),
         };
         engine.ensure_shared_tables(&snapshot.client).await.map_err(RetrievalError::storage)?;
         // Planning may prepare materializations and their columns. Do that
@@ -150,34 +168,35 @@ impl Snapshot {
                     .map_err(|_| RetrievalError::InvalidStateCursor)?,
             )
         } else {
-            prepared.as_ref().map(|(incarnation, boundary, _)| (incarnation.clone(), boundary.clone()))
+            None
         };
         if let Some((old_incarnation, old_snapshot)) = previous {
             if old_incarnation != incarnation {
                 return Err(RetrievalError::InvalidStateCursor);
             }
-            let previous = Boundary::parse(&old_snapshot)?;
-            let current = Boundary::parse(&target)?;
-            if previous.end > current.end
-                || current.running.iter().any(|xid| *xid < previous.end && previous.running.binary_search(xid).is_err())
-            {
-                return Err(RetrievalError::InvalidStateCursor);
-            }
-            snapshot.scopes.extend(previous.running.into_iter().map(WriterScope::Transaction));
-            snapshot.scopes.push_back(WriterScope::Since(previous.end));
+            snapshot.scopes = scopes_since(&old_snapshot, &target)?;
         } else {
             snapshot.scopes.push_back(WriterScope::Since(0));
         }
 
+        snapshot.incarnation = incarnation.clone();
         let mut encoded = CURSOR_FORMAT.to_vec();
-        encoded.extend(bincode::serialize(&(incarnation, target))?);
+        encoded.extend(bincode::serialize(&(incarnation, &target))?);
         snapshot.cursor = StateCursor::new(encoded);
-        if let Some((incarnation, _, query)) = prepared {
+        if let Some((incarnation, planned_at, query)) = prepared {
             // Compare canonical changes, not raw snapshot text: planning DDL
             // and unrelated transactions can allocate IDs without changing any
             // state. The ordinary change scan also catches older late commits.
-            if !snapshot.next_page(NonZeroUsize::MIN).await?.is_empty() {
+            let requested_scopes = std::mem::replace(&mut snapshot.scopes, scopes_since(&planned_at, &target)?);
+            let changed_during_planning = !snapshot.next_page(NonZeroUsize::MIN).await?.is_empty();
+            snapshot.scopes = requested_scopes;
+            snapshot.after = (0, String::new());
+            if changed_during_planning {
                 return Err(MutationError::WriteConflict.into());
+            }
+            if selection_changes {
+                snapshot.query = Some(Arc::new(query));
+                return Ok(snapshot);
             }
             // Reset drops materialization tables. Keep their read locks only
             // while collecting the bounded selection, so reset cannot wait on
@@ -205,6 +224,38 @@ impl Snapshot {
         }
         Ok(snapshot)
     }
+    async fn complete_query<T>(&mut self, result: Result<T, RetrievalError>) -> Result<T, RetrievalError> {
+        let result = match result {
+            Ok(value) => self
+                .client
+                .batch_execute("ROLLBACK TO SAVEPOINT selection_query; RELEASE SAVEPOINT selection_query")
+                .await
+                .map(|_| value)
+                .map_err(RetrievalError::storage),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if self.client.batch_execute("ROLLBACK").await.is_ok() {
+                    self.ended = true;
+                    return Err(after_possible_reset(&self.client, &self.incarnation, error).await);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+fn scopes_since(previous: &str, current: &str) -> Result<VecDeque<WriterScope>, RetrievalError> {
+    let previous = Boundary::parse(previous)?;
+    let current = Boundary::parse(current)?;
+    if previous.end > current.end || current.running.iter().any(|xid| *xid < previous.end && previous.running.binary_search(xid).is_err()) {
+        return Err(RetrievalError::InvalidStateCursor);
+    }
+    let mut scopes: VecDeque<_> = previous.running.into_iter().map(WriterScope::Transaction).collect();
+    scopes.push_back(WriterScope::Since(previous.end));
+    Ok(scopes)
 }
 
 async fn read_boundary(client: &Client) -> Result<(String, String), RetrievalError> {
@@ -237,6 +288,7 @@ async fn after_possible_reset(client: &Client, before: &str, error: RetrievalErr
 #[async_trait]
 impl StateSnapshot for Snapshot {
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        self.ensure_active()?;
         if let Some(selected) = &mut self.selected {
             return Ok(selected.by_ref().take(limit.get()).collect());
         }
@@ -281,6 +333,7 @@ impl StateSnapshot for Snapshot {
     }
 
     async fn get_states(&mut self, ids: &[EntityId]) -> Result<Vec<Option<Attested<EntityState>>>, RetrievalError> {
+        self.ensure_active()?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -294,7 +347,28 @@ impl StateSnapshot for Snapshot {
         Ok(ids.iter().map(|id| states.get(id).cloned()).collect())
     }
 
+    async fn matching_ids(&mut self, ids: &[EntityId]) -> Result<Vec<EntityId>, RetrievalError> {
+        self.ensure_active()?;
+        let query = self.query.clone().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
+        self.client.batch_execute("SAVEPOINT selection_query").await.map_err(RetrievalError::storage)?;
+        let result = query.matching_ids_in(&self.client, ids).await;
+        self.complete_query(result).await
+    }
+
+    async fn select_after(
+        &mut self,
+        after: Option<&OrderBoundary>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        self.ensure_active()?;
+        let query = self.query.clone().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
+        self.client.batch_execute("SAVEPOINT selection_query").await.map_err(RetrievalError::storage)?;
+        let result = query.select_after_in(&self.client, after, limit).await;
+        self.complete_query(result).await
+    }
+
     async fn finish(mut self: Box<Self>) -> Result<StateCursor, RetrievalError> {
+        self.ensure_active()?;
         self.client.batch_execute("ROLLBACK").await.map_err(RetrievalError::storage)?;
         self.ended = true;
         Ok(self.cursor.clone())

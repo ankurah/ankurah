@@ -82,6 +82,31 @@ async fn a_write_between_pages_invalidates_the_snapshot_and_finish() -> anyhow::
 }
 
 #[tokio::test]
+async fn refill_reads_reject_commits_and_resets_after_their_boundary() -> anyhow::Result<()> {
+    let engine = SledStorageEngine::new_test()?;
+    let (state, _) = entity!(8);
+    put(&engine, &Clock::default(), &state).await?;
+    let selection = Selection { predicate: Predicate::True, order_by: None, limit: Some(1) };
+    for reset in [false, true] {
+        let mut snapshot = engine.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: None }).await?;
+        assert_eq!(snapshot.select_after(None, NonZeroUsize::new(1).unwrap()).await?.len(), 1);
+        if reset {
+            engine.delete_all().await?;
+        } else {
+            put(&engine, &state.payload.state.head, &state).await?;
+        }
+        for result in [
+            snapshot.matching_ids(&[state.payload.entity_id]).await.map(|_| ()),
+            snapshot.select_after(None, NonZeroUsize::new(1).unwrap()).await.map(|_| ()),
+            snapshot.finish().await.map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict)));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn cursors_survive_reopen_but_not_reset_or_another_store() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let engine = SledStorageEngine::with_path(directory.path().to_owned())?;

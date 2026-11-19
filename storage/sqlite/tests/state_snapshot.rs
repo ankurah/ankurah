@@ -134,11 +134,18 @@ async fn wal_pages_point_reads_and_refill_share_a_snapshot_while_writes_continue
     put(&engine, &Clock::default(), &a).await?;
     put(&engine, &Clock::default(), &b).await?;
     let selection = Selection { predicate: Predicate::True, order_by: None, limit: Some(10) };
-    let mut snapshot = engine.state_snapshot(StateScan::Selection(&selection)).await?;
+    let mut snapshot = engine.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: None }).await?;
     let first = snapshot.next_page(NonZeroUsize::new(1).unwrap()).await?;
     put(&engine, &Clock::default(), &later).await?;
     put(&engine, &a.payload.state.head, &a).await?;
     assert!(snapshot.get_states(&[later.payload.entity_id]).await?[0].is_none());
+    assert_eq!(snapshot.matching_ids(&[a.payload.entity_id, later.payload.entity_id]).await?, [a.payload.entity_id]);
+    let mut expected = vec![a.clone(), b.clone()];
+    expected.sort_by_key(|state| state.payload.entity_id);
+    assert_eq!(snapshot.select_after(None, NonZeroUsize::new(10).unwrap()).await?, expected);
+    let first_entity = ankurah_core::entity::TemporaryEntity::new(expected[0].payload.entity_id, &expected[0].payload.state)?;
+    let boundary = ankurah_core::selection::ordering::OrderBoundary::from_item(&selection, &first_entity);
+    assert_eq!(snapshot.select_after(Some(&boundary), NonZeroUsize::MIN).await?, expected[1..]);
     let rest = snapshot.next_page(NonZeroUsize::new(10).unwrap()).await?;
     assert_eq!(first.len() + rest.len(), 2);
     let cursor = snapshot.finish().await?;
@@ -150,6 +157,25 @@ async fn wal_pages_point_reads_and_refill_share_a_snapshot_while_writes_continue
     expected.sort();
     assert_eq!(changed, expected);
     caught_up.finish().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_selection_queries_refuse_a_changed_boundary() -> anyhow::Result<()> {
+    let engine = SqliteStorageEngine::open_in_memory().await?;
+    let (state, _) = entity!(5);
+    put(&engine, &Clock::default(), &state).await?;
+    let selection = Selection { predicate: Predicate::True, order_by: None, limit: Some(1) };
+    for membership in [true, false] {
+        let mut snapshot = engine.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: None }).await?;
+        put(&engine, &state.payload.state.head, &state).await?;
+        let error = if membership {
+            snapshot.matching_ids(&[state.payload.entity_id]).await.unwrap_err()
+        } else {
+            snapshot.select_after(None, NonZeroUsize::MIN).await.unwrap_err()
+        };
+        assert!(matches!(error, RetrievalError::MutationError(error) if matches!(*error, MutationError::WriteConflict)));
+    }
     Ok(())
 }
 

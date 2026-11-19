@@ -1,27 +1,15 @@
 use crate::internal::prelude::*;
 use crate::reactor::AbstractEntity;
-use crate::value::Value;
-use ankql::ast::Resolved;
+use crate::selection::{filter::ValueLookup, ordering::OrderBoundary};
+use ankql::ast::{Resolved, Selection};
 use async_trait::async_trait;
 
-/// Trait for fetching entities to fill gaps when LIMIT causes entities to be evicted
+/// Fetch matching entities strictly after a retained result-set prefix.
 #[async_trait]
 pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
-    /// Fetch entities to fill a gap in a limited result set
-    ///
-    /// # Arguments
-    /// * `selection` - The original selection (predicate, order_by, limit)
-    /// * `last_entity` - The last entity in the current result set (used to build continuation predicate)
-    /// * `gap_size` - Number of entities needed to fill the gap
-    ///
-    /// # Returns
-    /// Vector of entities that match the selection and come after `last_entity` in sort order
-    async fn fetch_gap(
-        &self,
-        selection: &ankql::ast::Selection<Resolved>,
-        last_entity: Option<&E>,
-        gap_size: usize,
-    ) -> Result<Vec<E>, RetrievalError>;
+    /// `selection` is the original limited query. `last_entity` ends its
+    /// retained prefix; `None` requests candidates from the beginning.
+    async fn fetch_gap(&self, selection: &Selection<Resolved>, last_entity: Option<&E>, gap_size: usize) -> Result<Vec<E>, RetrievalError>;
 }
 
 /// Fills query gaps through the same node and live credential source as the query.
@@ -37,171 +25,136 @@ impl QueryGapFetcher {
 impl GapFetcher<crate::entity::Entity> for QueryGapFetcher {
     async fn fetch_gap(
         &self,
-        selection: &ankql::ast::Selection<Resolved>,
+        selection: &Selection<Resolved>,
         last_entity: Option<&crate::entity::Entity>,
         gap_size: usize,
     ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
-        // Build gap predicate if we have a last entity
-        let gap_selection = if let Some(last) = last_entity {
-            let gap_predicate = if let Some(ref order_by) = selection.order_by {
-                build_continuation_predicate(&selection.predicate, order_by, last)
-                    .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?
-            } else {
-                selection.predicate.clone()
-            };
-
-            ankql::ast::Selection { predicate: gap_predicate, order_by: selection.order_by.clone(), limit: Some(gap_size as u64) }
-        } else {
-            // No last entity, just use original selection with gap_size limit
-            ankql::ast::Selection {
-                predicate: selection.predicate.clone(),
-                order_by: selection.order_by.clone(),
-                limit: Some(gap_size as u64),
-            }
-        };
-
-        self.context.0.fetch_entities(MatchArgs { selection: gap_selection, cache_policy: CachePolicy::Durable }).await
+        fetch_gap_from(selection, last_entity, gap_size, |selection| {
+            self.context.0.fetch_entities(MatchArgs { selection, cache_policy: CachePolicy::Durable })
+        })
+        .await
     }
 }
 
-/// Build a supplemental predicate to fetch entities after the last entity in sort order
-///
-/// For ORDER BY a ASC, b DESC with last entity having a=5, b=10:
-/// Returns: a >= 5 AND b <= 10 AND NOT (id = last_entity.id)
-pub fn build_continuation_predicate<E: AbstractEntity>(
-    original_predicate: &ankql::ast::Predicate<Resolved>,
-    order_by: &[ankql::ast::OrderByItem<Resolved>],
-    last_entity: &E,
-) -> Result<ankql::ast::Predicate<Resolved>, String> {
-    use ankql::ast::{ComparisonOperator, Expr, OrderDirection, Predicate};
-
-    let mut gap_conditions = Vec::new();
-
-    // Add original predicate
-    gap_conditions.push(original_predicate.clone());
-
-    // Add ORDER BY continuation conditions
-    for order_item in order_by {
-        let identifier = &order_item.path;
-
-        // Get the field value from the last entity
-        if let Some(field_value) = last_entity.value(&identifier.property_id()) {
-            let literal = match field_value {
-                // Skip Object, Binary, and Json for now - they're not commonly used in ORDER BY
-                Value::Object(_) | Value::Binary(_) | Value::Json(_) => continue,
-                literal => literal,
-            };
-
-            let operator = match order_item.direction {
-                OrderDirection::Asc => ComparisonOperator::GreaterThanOrEqual,
-                OrderDirection::Desc => ComparisonOperator::LessThanOrEqual,
-            };
-
-            let condition =
-                Predicate::Comparison { left: Box::new(Expr::Path(identifier.clone())), operator, right: Box::new(Expr::Literal(literal)) };
-
-            gap_conditions.push(condition);
-        }
+async fn fetch_gap_from<E: ValueLookup<Resolved>, F: std::future::Future<Output = Result<Vec<E>, RetrievalError>>>(
+    selection: &Selection<Resolved>,
+    last_entity: Option<&E>,
+    gap_size: usize,
+    fetch: impl FnOnce(Selection<Resolved>) -> F,
+) -> Result<Vec<E>, RetrievalError> {
+    if gap_size == 0 {
+        return Ok(Vec::new());
     }
-
-    // Add entity ID exclusion to avoid fetching the last entity again
-    let id_exclusion = Predicate::Comparison {
-        left: Box::new(Expr::Path(ankql::ast::PropertyPath::id())),
-        operator: ComparisonOperator::NotEqual,
-        right: Box::new(Expr::Literal(Value::EntityId(last_entity.id()))),
-    };
-    gap_conditions.push(id_exclusion);
-
-    // Combine all conditions with AND
-    let result =
-        gap_conditions.into_iter().reduce(|acc, condition| Predicate::And(Box::new(acc), Box::new(condition))).unwrap_or(Predicate::True);
-
-    Ok(result)
+    if selection.limit.is_none() {
+        return Err(RetrievalError::Other("gap filling requires a limited selection".into()));
+    }
+    // Capture values before awaiting: an Entity handle can change during the
+    // fetch. Keep the original Selection so policy and managed-tree identity
+    // stay the same. Its top N bounds this fallback's candidate set.
+    let boundary = last_entity.map(|last| OrderBoundary::from_item(selection, last));
+    let candidates = fetch(selection.clone()).await?;
+    // ORDER BY comparisons are not interchangeable with predicate comparisons
+    // (notably for JSON, missing values and collations).
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| boundary.as_ref().is_none_or(|boundary| boundary.precedes(candidate)))
+        .take(gap_size)
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::value::Value;
-    use ankql::ast::{OrderByItem, OrderDirection, Parsed, Predicate, PropertyId, Resolved};
-    use ankurah_derive::selection;
-    use ankurah_proto as proto;
-    use maplit::hashmap;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
-    /// A deterministic durable identity for a fixture field name.
-    fn prop(name: &str) -> PropertyId {
-        let mut bytes = [0u8; 32];
-        let n = name.as_bytes();
-        let len = n.len().min(32);
-        bytes[..len].copy_from_slice(&n[..len]);
-        PropertyId::EntityId(proto::EntityId::from_bytes(bytes))
+    use ankql::ast::{OrderByItem, OrderDirection, Predicate, PropertyId};
+    use ankurah_proto::EntityId;
+
+    use super::*;
+    use crate::{selection::filter::Filterable, value::Value};
+
+    fn property(byte: u8) -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([byte; 32])) }
+    fn id(byte: u8) -> EntityId { EntityId::from_bytes([byte; 32]) }
+
+    #[derive(Clone)]
+    struct Item {
+        id: EntityId,
+        values: Arc<Mutex<BTreeMap<PropertyId, Value>>>,
     }
 
-    /// A resolved sort key over a fixture field.
-    fn key(name: &str, direction: OrderDirection) -> OrderByItem<Resolved> { OrderByItem { path: prop(name).into(), direction } }
+    impl Item {
+        fn new(byte: u8, values: impl IntoIterator<Item = (PropertyId, Value)>) -> Self {
+            Self { id: id(byte), values: Arc::new(Mutex::new(values.into_iter().collect())) }
+        }
+    }
 
-    /// Bind a `selection!` literal to the fixture identities used by the query.
-    fn resolve(selection: ankql::ast::Selection<Parsed>) -> ankql::ast::Selection<Resolved> {
-        use crate::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
-        struct FixtureResolver;
-        impl ModelResolver for FixtureResolver {
-            fn resolve_property(&self, _model: &proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
-                let id = prop(name);
-                let value_type = if id == prop("age") { crate::value::ValueType::I32 } else { crate::value::ValueType::String };
-                Ok(Some(ResolvedProperty { id, value_type }))
+    impl Filterable for Item {
+        fn value(&self, property: &PropertyId) -> Option<Value> {
+            if *property == PropertyId::Id {
+                Some(Value::EntityId(self.id))
+            } else {
+                self.values.lock().unwrap().get(property).cloned()
             }
         }
-        let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([0x77; 32]));
-        resolve_selection(&model, &FixtureResolver, selection).unwrap()
     }
 
-    #[derive(Debug, Clone)]
-    struct TestEntity {
-        id: proto::EntityId,
-        data: Arc<Mutex<HashMap<PropertyId, Value>>>,
+    fn selection(order_by: Option<Vec<OrderByItem<Resolved>>>) -> Selection<Resolved> {
+        Selection { predicate: Predicate::True, order_by, limit: Some(5) }
     }
 
-    impl TestEntity {
-        fn new(id: u8, data: HashMap<PropertyId, Value>) -> Self {
-            let mut id_bytes = [0u8; 32];
-            id_bytes[15] = id;
-            Self { id: proto::EntityId::from_bytes(id_bytes), data: Arc::new(Mutex::new(data)) }
-        }
+    fn order(byte: u8, direction: OrderDirection) -> OrderByItem<Resolved> { OrderByItem { path: property(byte).into(), direction } }
+    fn ids(items: &[Item]) -> Vec<EntityId> { items.iter().map(|item| item.id).collect() }
+
+    #[tokio::test]
+    async fn mixed_order_refill_preserves_selection_and_uses_a_strict_boundary() -> anyhow::Result<()> {
+        let selection = selection(Some(vec![order(10, OrderDirection::Asc), order(11, OrderDirection::Desc)]));
+        let items: Vec<_> = [(1, "a", 7), (2, "a", 5), (3, "a", 3), (4, "b", 99)]
+            .into_iter()
+            .map(|(id, label, number)| Item::new(id, [(property(10), Value::String(label.into())), (property(11), Value::I64(number))]))
+            .collect();
+        let boundary = items[1].clone();
+        let expected_selection = selection.clone();
+        let actual = fetch_gap_from(&selection, Some(&boundary), 2, |requested| async move {
+            assert_eq!(requested, expected_selection, "a gap must not create a different maintained Selection");
+            Ok(items)
+        })
+        .await?;
+        assert_eq!(ids(&actual), [id(3), id(4)]);
+        Ok(())
     }
 
-    impl AbstractEntity for TestEntity {
-        fn memberships(&self) -> std::collections::BTreeSet<proto::ModelId> { Default::default() }
-
-        fn id(&self) -> proto::EntityId { self.id }
-
-        fn value(&self, property: &PropertyId) -> Option<Value> { self.data.lock().unwrap().get(property).cloned() }
+    #[tokio::test]
+    async fn implicit_id_order_excludes_the_prefix_before_taking_the_gap() -> anyhow::Result<()> {
+        let selection = selection(None);
+        let items: Vec<_> = [1, 2, 3, 4].map(|id| Item::new(id, [])).into();
+        let boundary = items[1].clone();
+        let actual = fetch_gap_from(&selection, Some(&boundary), 1, |_| async { Ok(items) }).await?;
+        assert_eq!(ids(&actual), [id(3)]);
+        Ok(())
     }
 
-    #[test]
-    fn test_build_gap_predicate_single_column_asc() {
-        let entity = TestEntity::new(1, hashmap!(prop("name") => Value::String("John".to_string())));
-
-        let original_predicate = Predicate::True;
-        let order_by = vec![key("name", OrderDirection::Asc)];
-
-        let gap_predicate = build_continuation_predicate(&original_predicate, &order_by, &entity).unwrap();
-        let expected = resolve(ankurah_derive::selection!("true AND name >= 'John' AND id != {}", entity.id())).predicate;
-
-        assert_eq!(gap_predicate, expected);
+    #[tokio::test]
+    async fn boundary_values_are_captured_before_the_fetch() -> anyhow::Result<()> {
+        let selection = selection(Some(vec![order(10, OrderDirection::Asc)]));
+        let boundary = Item::new(2, [(property(10), Value::I64(5))]);
+        let actual = fetch_gap_from(&selection, Some(&boundary), 1, |_| async {
+            boundary.values.lock().unwrap().insert(property(10), Value::I64(100));
+            Ok(vec![Item::new(1, [(property(10), Value::I64(1))]), Item::new(3, [(property(10), Value::I64(6))])])
+        })
+        .await?;
+        assert_eq!(ids(&actual), [id(3)]);
+        Ok(())
     }
 
-    #[test]
-    fn test_build_gap_predicate_multi_column() {
-        let entity = TestEntity::new(2, hashmap!(prop("name") => Value::String("John".to_string()), prop("age") => Value::I32(30)));
-
-        let original_predicate = Predicate::True;
-        let order_by = vec![key("name", OrderDirection::Asc), key("age", OrderDirection::Desc)];
-
-        let gap_predicate = build_continuation_predicate(&original_predicate, &order_by, &entity).unwrap();
-        let expected = resolve(selection!("true AND name >= 'John' AND age <= 30 AND id != {}", entity.id())).predicate;
-
-        assert_eq!(gap_predicate, expected);
+    #[tokio::test]
+    async fn an_empty_prefix_starts_at_the_beginning_and_zero_gap_skips_the_fetch() -> anyhow::Result<()> {
+        let selection = selection(None);
+        let actual = fetch_gap_from(&selection, None, 1, |_| async { Ok(vec![Item::new(1, []), Item::new(2, [])]) }).await?;
+        assert_eq!(ids(&actual), [id(1)]);
+        let actual = fetch_gap_from::<Item, _>(&selection, None, 0, |_| async { panic!("zero gap must not fetch") }).await?;
+        assert!(actual.is_empty());
+        Ok(())
     }
 }

@@ -16,6 +16,7 @@ use crate::error::RetrievalError;
 use crate::storage::StorageEngine;
 
 mod continuation;
+mod limited;
 mod opening;
 mod preparation;
 

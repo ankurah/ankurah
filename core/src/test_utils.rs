@@ -34,6 +34,8 @@ pub(crate) struct TestStorage {
     /// Pause the page that many calls from now, counting from zero.
     pub hold_state_page: Arc<Mutex<Option<(usize, Pause)>>>,
     pub reject_state_finish: Arc<AtomicBool>,
+    /// Complete limited-query or refill executions, distinct from changed-ID reads.
+    pub state_selection_reads: Arc<AtomicUsize>,
     /// Pauses the next map write part way, after the first of its writes.
     pub hold_map_write: Mutex<Option<Pause>>,
     /// Pauses a transaction's map call before it is answered: the call that
@@ -278,8 +280,13 @@ impl StorageEngine for TestStorage {
     }
 
     async fn state_snapshot(&self, scan: crate::storage::StateScan<'_>) -> Result<Box<dyn crate::storage::StateSnapshot>, RetrievalError> {
-        let snapshot =
-            states::Snapshot::new(&self.data.lock().unwrap(), scan, self.hold_state_page.clone(), self.reject_state_finish.clone())?;
+        let snapshot = states::Snapshot::new(
+            &self.data.lock().unwrap(),
+            scan,
+            self.hold_state_page.clone(),
+            self.reject_state_finish.clone(),
+            self.state_selection_reads.clone(),
+        )?;
         let hold = self.hold_state_snapshot.lock().unwrap().take();
         if let Some((entered, release)) = hold {
             entered.send(()).unwrap();

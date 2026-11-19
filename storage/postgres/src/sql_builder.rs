@@ -408,7 +408,7 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
+    fn order_expression(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
         if order_by.path.is_simple() && order_by.path.column == "id" {
             // In `MaterializationJoin`'s projection, `id` is the entity id.
             self.sql(id_bytes::SQL);
@@ -429,6 +429,11 @@ impl SqlBuilder {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
+        self.order_expression(order_by)?;
         // Add the direction
         match order_by.direction {
             OrderDirection::Asc => self.sql(" ASC"),
@@ -436,6 +441,68 @@ impl SqlBuilder {
         }
 
         Ok(())
+    }
+    /// Strictly after a captured tuple, using the same expressions and NULL
+    /// placement as ORDER BY. This is deliberately separate from predicates.
+    pub(super) fn after_order(&mut self, order: &[OrderByItem<EngineColumns>], values: &[Option<Value>]) -> Result<(), SqlGenerationError> {
+        if order.len() != values.len() {
+            return Err(SqlGenerationError::UnsupportedExpression("order boundary has the wrong number of values"));
+        }
+        let Some((part, rest)) = order.split_first() else {
+            self.sql("FALSE");
+            return Ok(());
+        };
+        let value = &values[0];
+        self.sql("(");
+        match (value, &part.direction) {
+            (None, OrderDirection::Asc) => self.sql("FALSE"),
+            (None, OrderDirection::Desc) => {
+                self.order_expression(part)?;
+                self.sql(" IS NOT NULL");
+            }
+            (Some(value), direction) => {
+                self.sql("(");
+                self.order_expression(part)?;
+                self.sql(if *direction == OrderDirection::Asc { " > " } else { " < " });
+                self.order_argument(part, value)?;
+                // Entity identities are never NULL. Keep their comparison a
+                // direct index bound instead of adding an impossible NULL arm.
+                if *direction == OrderDirection::Asc && !(part.path.is_simple() && part.path.column == "id") {
+                    self.sql(" OR ");
+                    self.order_expression(part)?;
+                    self.sql(" IS NULL");
+                }
+                self.sql(")");
+            }
+        }
+        if !rest.is_empty() {
+            self.sql(" OR (");
+            self.order_expression(part)?;
+            if let Some(value) = value {
+                self.sql(" IS NOT DISTINCT FROM ");
+                self.order_argument(part, value)?;
+            } else {
+                self.sql(" IS NULL");
+            }
+            self.sql(" AND ");
+            self.after_order(rest, &values[1..])?;
+            self.sql(")");
+        }
+        self.sql(")");
+        Ok(())
+    }
+
+    fn order_argument(&mut self, part: &OrderByItem<EngineColumns>, value: &Value) -> Result<(), SqlGenerationError> {
+        if part.path.subpath.is_empty()
+            && (part.path.column == "id" || self.order_types.get(&part.path.column) == Some(&ValueType::EntityId))
+        {
+            let Value::EntityId(value) = value else {
+                return Err(SqlGenerationError::UnsupportedExpression("an entity-id order boundary requires an entity id"));
+            };
+            self.arg(value.to_bytes().to_vec());
+            return Ok(());
+        }
+        self.expr(&Expr::Literal(value.clone()))
     }
 }
 

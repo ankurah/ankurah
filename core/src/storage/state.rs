@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::RetrievalError;
+use crate::selection::ordering::OrderBoundary;
 
 /// An engine's opaque description of a canonical-state read boundary.
 ///
@@ -33,6 +34,10 @@ pub enum StateScan<'a> {
     /// The complete result of a limited query, using the engine's normal query
     /// semantics. The engine prepares its query before acquiring the boundary.
     Selection(&'a Selection<Resolved>),
+    /// Changed states plus query operations at the same boundary. The engine
+    /// prepares this limited selection before acquiring its snapshot; its
+    /// predicate can then test changed identities and refill selected gaps.
+    SelectionChanges { selection: &'a Selection<Resolved>, since: Option<&'a StateCursor> },
 }
 
 /// Canonical entity states from one committed read boundary.
@@ -53,6 +58,23 @@ pub trait StateSnapshot: Send {
 
     /// Read one result per identity, in input order, at this snapshot's boundary.
     async fn get_states(&mut self, ids: &[EntityId]) -> Result<Vec<Option<Attested<EntityState>>>, RetrievalError>;
+
+    /// Identities matching the prepared Selection's predicate, ignoring its
+    /// ORDER BY and LIMIT. Results are a subset of `ids`; order is unspecified.
+    /// Requires a snapshot opened with `StateScan::SelectionChanges`.
+    async fn matching_ids(&mut self, ids: &[EntityId]) -> Result<Vec<EntityId>, RetrievalError>;
+
+    /// The next matching states strictly after `after`, in the prepared
+    /// Selection's total order. `None` starts at the beginning. This operation
+    /// uses `limit` rather than the Selection's original LIMIT, and does not
+    /// consume or replace the change scan. It uses the same committed boundary
+    /// as `next_page` and point reads.
+    /// Requires `StateScan::SelectionChanges`; a mismatched boundary is an error.
+    async fn select_after(
+        &mut self,
+        after: Option<&OrderBoundary>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
     /// Validate and close the read, returning its continuation token.
     ///

@@ -22,3 +22,8 @@ async fn json_path_order_matches_digest_trees() -> anyhow::Result<()> {
 async fn mixed_order_matches_digest_trees() -> anyhow::Result<()> {
     selection_conformance::mixed_ordering(Arc::new(SledStorageEngine::new_test()?)).await
 }
+
+#[tokio::test]
+async fn changes_and_refill_share_a_snapshot() -> anyhow::Result<()> {
+    selection_conformance::selection_changes(Arc::new(SledStorageEngine::new_test()?)).await
+}

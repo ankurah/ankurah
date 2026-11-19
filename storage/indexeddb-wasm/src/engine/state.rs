@@ -3,7 +3,12 @@
 use std::num::NonZeroUsize;
 
 use ankurah_core::{
+    entity::TemporaryEntity,
     error::{MutationError, RetrievalError},
+    selection::{
+        filter::{evaluate_predicate, membership_match},
+        ordering::OrderBoundary,
+    },
     storage::{StateCursor, StateScan, StateSnapshot, StorageEngine},
 };
 use ankurah_proto::{Attested, EntityId, EntityState};
@@ -135,17 +140,24 @@ pub(super) struct IndexedDbStateSnapshot {
     target: CounterCursor,
     after: (String, String),
     selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
+    selection: Option<ankql::ast::Selection<ankql::ast::Resolved>>,
 }
 
 impl IndexedDbStateSnapshot {
     pub(super) async fn begin(engine: &IndexedDBStorageEngine, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
-        let since = match scan {
-            StateScan::Changes(since) => since,
+        let (since, selection) = match scan {
+            StateScan::Changes(since) => (since, None),
+            StateScan::SelectionChanges { selection, since } => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection change snapshot requires LIMIT".into()));
+                }
+                (since, Some(ankql::selection::deterministic_order(selection).into_owned()))
+            }
             StateScan::Selection(selection) => {
                 if selection.limit.is_none() {
                     return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
                 }
-                None
+                (None, None)
             }
         };
         let database = engine.db.clone();
@@ -159,7 +171,7 @@ impl IndexedDbStateSnapshot {
         .await?;
         let since = target.resume(since, ENGINE)?;
         let after = since.map_or((String::new(), String::new()), |position| (format!("{position:016x}"), "\u{ffff}".into()));
-        let mut snapshot = Self { database, target, after, selected: None };
+        let mut snapshot = Self { database, target, after, selected: None, selection };
         if let StateScan::Selection(selection) = scan {
             let selected = engine.fetch_states(selection).await?;
             snapshot.validate().await?;
@@ -188,6 +200,41 @@ impl IndexedDbStateSnapshot {
 
 #[async_trait]
 impl StateSnapshot for IndexedDbStateSnapshot {
+    async fn matching_ids(&mut self, ids: &[EntityId]) -> Result<Vec<EntityId>, RetrievalError> {
+        let selection = self.selection.clone().ok_or_else(|| RetrievalError::InvalidState("snapshot has no prepared selection".into()))?;
+        let states = self.get_states(ids).await?;
+        let result = states
+            .into_iter()
+            .flatten()
+            .filter_map(|state| {
+                if let Some(matches) = membership_match(&selection.predicate, &|model| state.payload.state.memberships.contains(model)) {
+                    return matches.then_some(Ok(state.payload.entity_id));
+                }
+                let entity = match TemporaryEntity::new(state.payload.entity_id, &state.payload.state) {
+                    Ok(entity) => entity,
+                    Err(error) => return Some(Err(error)),
+                };
+                evaluate_predicate(&entity, &selection.predicate).unwrap_or(false).then_some(Ok(state.payload.entity_id))
+            })
+            .collect();
+        self.validate().await?;
+        result
+    }
+
+    async fn select_after(
+        &mut self,
+        boundary: Option<&OrderBoundary>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let mut selection =
+            self.selection.clone().ok_or_else(|| RetrievalError::InvalidState("snapshot has no prepared selection".into()))?;
+        selection.limit = Some(limit.get() as u64);
+        self.validate().await?;
+        let result = super::query::fetch_after(&self.database, &selection, boundary).await;
+        self.validate().await?;
+        result
+    }
+
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         if self.selected.is_some() {
             self.validate().await?;

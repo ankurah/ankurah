@@ -5,6 +5,7 @@ use crate::{
     entity::TemporaryEntity,
     error::RetrievalError,
     selection::filter::{evaluate_predicate, membership_match, Error},
+    selection::ordering::OrderBoundary,
     storage::{StateCursor, StateScan, StateSnapshot},
 };
 use ankql::ast::{Resolved, Selection};
@@ -13,7 +14,7 @@ use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
         Arc, Mutex,
     },
 };
@@ -24,6 +25,8 @@ pub(super) struct Snapshot {
     cursor: StateCursor,
     hold_page: Arc<Mutex<Option<(usize, Pause)>>>,
     reject_finish: Arc<AtomicBool>,
+    selection: Option<Selection<Resolved>>,
+    selection_reads: Arc<AtomicUsize>,
 }
 
 impl Snapshot {
@@ -32,9 +35,10 @@ impl Snapshot {
         scan: StateScan<'_>,
         hold_page: Arc<Mutex<Option<(usize, Pause)>>>,
         reject_finish: Arc<AtomicBool>,
+        selection_reads: Arc<AtomicUsize>,
     ) -> Result<Self, RetrievalError> {
         let since = match scan {
-            StateScan::Changes(since) => since,
+            StateScan::Changes(since) | StateScan::SelectionChanges { since, .. } => since,
             StateScan::Selection(_) => None,
         };
         let since = match since {
@@ -49,13 +53,25 @@ impl Snapshot {
             }
         };
         let changed = match scan {
-            StateScan::Changes(_) => {
+            StateScan::Changes(_) | StateScan::SelectionChanges { .. } => {
                 data.state_revisions.iter().filter_map(|(id, revision)| (*revision > since).then_some(*id)).collect::<Vec<_>>()
             }
-            StateScan::Selection(selection) => select(&data.states, selection)?.into_iter().map(|state| state.payload.entity_id).collect(),
+            StateScan::Selection(selection) => {
+                selection_reads.fetch_add(1, AtomicOrdering::Relaxed);
+                select(&data.states, selection)?.into_iter().map(|state| state.payload.entity_id).collect()
+            }
+        };
+        let selection = match scan {
+            StateScan::SelectionChanges { selection, .. } => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
+                }
+                Some(selection.clone())
+            }
+            _ => None,
         };
         let cursor = StateCursor::new(bincode::serialize(&(data.incarnation, data.revision)).unwrap());
-        Ok(Self { states: data.states.clone(), changed: changed.into_iter(), cursor, hold_page, reject_finish })
+        Ok(Self { states: data.states.clone(), changed: changed.into_iter(), cursor, hold_page, reject_finish, selection, selection_reads })
     }
 }
 
@@ -84,6 +100,33 @@ impl StateSnapshot for Snapshot {
         Ok(ids.iter().map(|id| self.states.get(id).cloned()).collect())
     }
 
+    async fn matching_ids(&mut self, ids: &[EntityId]) -> Result<Vec<EntityId>, RetrievalError> {
+        let selection = self.selection.as_ref().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
+        ids.iter()
+            .filter_map(|id| self.states.get(id))
+            .filter_map(|state| match matches(state, selection) {
+                Ok(true) => Some(Ok(state.payload.entity_id)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    async fn select_after(
+        &mut self,
+        after: Option<&OrderBoundary>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let selection = self.selection.as_ref().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
+        if after.is_some_and(|after| !after.matches_order(selection)) {
+            return Err(RetrievalError::Other("continuation boundary has another order".into()));
+        }
+        self.selection_reads.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut selection = selection.clone();
+        selection.limit = Some(limit.get() as u64);
+        select_after(&self.states, &selection, after)
+    }
+
     async fn finish(self: Box<Self>) -> Result<StateCursor, RetrievalError> {
         if self.reject_finish.load(AtomicOrdering::SeqCst) {
             return Err(crate::error::MutationError::WriteConflict.into());
@@ -96,17 +139,22 @@ pub(super) fn select(
     states: &BTreeMap<EntityId, Attested<EntityState>>,
     selection: &Selection<Resolved>,
 ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    select_after(states, selection, None)
+}
+
+fn select_after(
+    states: &BTreeMap<EntityId, Attested<EntityState>>,
+    selection: &Selection<Resolved>,
+    after: Option<&OrderBoundary>,
+) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
     let limit = selection.limit.ok_or_else(|| RetrievalError::Other("snapshot selection requires LIMIT".into()))?;
     let mut matching = Vec::new();
     for state in states.values() {
-        if membership_match(&selection.predicate, &|model| state.payload.state.memberships.contains(model)) == Some(false) {
-            continue;
-        }
-        let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
-        match evaluate_predicate(&entity, &selection.predicate) {
-            Ok(true) => matching.push((state, entity)),
-            Ok(false) | Err(Error::PropertyNotFound(_)) => {}
-            Err(error) => return Err(error.into()),
+        if matches(state, selection)? {
+            let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
+            if after.is_none_or(|after| after.precedes(&entity)) {
+                matching.push((state, entity));
+            }
         }
     }
     let selection = ankql::selection::deterministic_order(selection);
@@ -114,4 +162,16 @@ pub(super) fn select(
         crate::selection::ordering::compare_items(left, right, selection.order_by.as_deref().unwrap_or_default())
     });
     Ok(matching.into_iter().take(usize::try_from(limit).unwrap_or(usize::MAX)).map(|(state, _)| state.clone()).collect())
+}
+
+fn matches(state: &Attested<EntityState>, selection: &Selection<Resolved>) -> Result<bool, RetrievalError> {
+    if membership_match(&selection.predicate, &|model| state.payload.state.memberships.contains(model)) == Some(false) {
+        return Ok(false);
+    }
+    let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
+    match evaluate_predicate(&entity, &selection.predicate) {
+        Ok(value) => Ok(value),
+        Err(Error::PropertyNotFound(_)) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }

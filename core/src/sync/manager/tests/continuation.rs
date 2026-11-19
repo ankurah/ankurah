@@ -208,55 +208,57 @@ async fn nested_json_limit_tracks_query_membership_and_refills_with_unchanged_st
 
 #[tokio::test]
 async fn interrupted_or_rejected_scans_never_publish_partial_changes_or_a_cursor() -> anyhow::Result<()> {
-    for reject_finish in [false, true] {
-        let fixture = Fixture::<Ristretto255>::new(1)?;
-        defer_writes(&fixture.manager);
-        let before: Vec<_> = (0..300u16)
-            .map(|index| {
-                let mut bytes = [211; 32];
-                bytes[..2].copy_from_slice(&index.to_be_bytes());
-                Version { id: EntityId::from_bytes(bytes), ..version(1, i64::from(index), true) }
-            })
-            .collect();
-        fixture.seed(&before)?;
-        let tree = fixture.manager.open(selection(false, None, false)).await?;
-        let original_cursor = tree.store().buffered().cursor.clone();
-        let backing = durable(&fixture, &tree).await?;
-        let changes: Vec<_> = before
-            .into_iter()
-            .map(|before| {
-                let after = moved(&before, before.score + 1000);
-                (Some(before), Some(after))
-            })
-            .collect();
-        let mut trx = fixture.storage.transaction();
-        write_versions(&mut trx, &changes).await?;
-        fixture.manager.invalidate();
-        trx.commit().await?.committed()?;
+    for limit in [None, Some(300)] {
+        for reject_finish in [false, true] {
+            let fixture = Fixture::<Ristretto255>::new(1)?;
+            defer_writes(&fixture.manager);
+            let before: Vec<_> = (0..300u16)
+                .map(|index| {
+                    let mut bytes = [211; 32];
+                    bytes[..2].copy_from_slice(&index.to_be_bytes());
+                    Version { id: EntityId::from_bytes(bytes), ..version(1, i64::from(index), true) }
+                })
+                .collect();
+            fixture.seed(&before)?;
+            let tree = fixture.manager.open(selection(false, limit, false)).await?;
+            let original_cursor = tree.store().buffered().cursor.clone();
+            let backing = durable(&fixture, &tree).await?;
+            let changes: Vec<_> = before
+                .into_iter()
+                .map(|before| {
+                    let after = moved(&before, before.score + 1000);
+                    (Some(before), Some(after))
+                })
+                .collect();
+            let mut trx = fixture.storage.transaction();
+            write_versions(&mut trx, &changes).await?;
+            fixture.manager.invalidate();
+            trx.commit().await?.committed()?;
 
-        if reject_finish {
-            fixture.storage.reject_state_finish.store(true, Ordering::SeqCst);
-            assert!(fixture.manager.maintain().await.is_err());
-            fixture.storage.reject_state_finish.store(false, Ordering::SeqCst);
-        } else {
-            let (entered, paused) = oneshot::channel();
-            let (_release, resume) = oneshot::channel();
-            *fixture.storage.hold_state_page.lock().unwrap() = Some((1, (entered, resume)));
-            {
-                let mut maintaining = pin!(fixture.manager.maintain());
-                assert!(poll_once(maintaining.as_mut()).is_pending());
-                paused.await?;
+            if reject_finish {
+                fixture.storage.reject_state_finish.store(true, Ordering::SeqCst);
+                assert!(fixture.manager.maintain().await.is_err());
+                fixture.storage.reject_state_finish.store(false, Ordering::SeqCst);
+            } else {
+                let (entered, paused) = oneshot::channel();
+                let (_release, resume) = oneshot::channel();
+                *fixture.storage.hold_state_page.lock().unwrap() = Some((1, (entered, resume)));
+                {
+                    let mut maintaining = pin!(fixture.manager.maintain());
+                    assert!(poll_once(maintaining.as_mut()).is_pending());
+                    paused.await?;
+                }
             }
+            assert_eq!(tree.store().buffered().cursor, original_cursor);
+            assert!(tree.view().count(..).await.is_err(), "an unfinished scan cannot clear the local invalidation");
+            assert_eq!(backing.view().count(0i64..300).await?, 300);
+            assert_eq!(backing.view().count(1000i64..1300).await?, 0);
+            fixture.manager.maintain().await?;
+            assert_ne!(tree.store().buffered().cursor, original_cursor);
+            assert_eq!(tree.view().count(0i64..300).await?, 0);
+            assert_eq!(tree.view().count(1000i64..1300).await?, 300);
+            assert_eq!(tree.audit().await?.members, 300);
         }
-        assert_eq!(tree.store().buffered().cursor, original_cursor);
-        assert!(tree.view().count(..).await.is_err(), "an unfinished scan cannot clear the local invalidation");
-        assert_eq!(backing.view().count(0i64..300).await?, 300);
-        assert_eq!(backing.view().count(1000i64..1300).await?, 0);
-        fixture.manager.maintain().await?;
-        assert_ne!(tree.store().buffered().cursor, original_cursor);
-        assert_eq!(tree.view().count(0i64..300).await?, 0);
-        assert_eq!(tree.view().count(1000i64..1300).await?, 300);
-        assert_eq!(tree.audit().await?.members, 300);
     }
     Ok(())
 }

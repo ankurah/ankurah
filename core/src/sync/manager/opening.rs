@@ -1,10 +1,10 @@
 //! Open an exact Selection and reconcile its tree before serving it.
 
 use super::{DigestTree, TreeManager};
-#[cfg(any(test, feature = "test-helpers"))]
 use crate::entity::TemporaryEntity;
 use crate::error::RetrievalError;
-use crate::storage::StorageEngine;
+use crate::selection::filter::Filterable;
+use crate::storage::{StateSnapshot, StorageEngine};
 use crate::sync::{EngineAdapter, EntityHead, EntityMemberId, TreeProperty};
 use ankql::ast::{OrderDirection, Resolved, Selection};
 use ankurah_core_types::key_spec::{IndexDirection, IndexKeyPart, KeySpec};
@@ -12,6 +12,49 @@ use ankurah_core_types::{PropertyId, ValueType};
 use ankurah_digest_tree::{DigestGroup, DigestTreeView};
 
 impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
+    /// Canonical catalog writes can bypass ordinary immutable registration.
+    /// Never publish members encoded under a type different from this snapshot.
+    pub(super) async fn validate_order_types(
+        &self,
+        tree: &DigestTree<SE, G>,
+        snapshot: &mut dyn StateSnapshot,
+    ) -> Result<(), RetrievalError> {
+        use ankurah_proto::{ModelId, SystemModel, SystemProperty};
+        let parts: Vec<_> = tree
+            .key_spec()
+            .keyparts
+            .iter()
+            // Subpaths always encode their extracted JSON value. The base
+            // property may hold JSON as text or bytes without changing that key.
+            .filter(|part| part.sub_path.is_none())
+            .filter_map(|part| match part.key.0 {
+                PropertyId::EntityId(id) => Some((id, part)),
+                _ => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let states = snapshot.get_states(&parts.iter().map(|(id, _)| *id).collect::<Vec<_>>()).await?;
+        if states.len() != parts.len() {
+            return Err(crate::sync::Error::AnswerMisfit.into());
+        }
+        for ((id, part), state) in parts.into_iter().zip(states) {
+            // A local descriptor may be bound before its catalog row is stored.
+            let Some(state) = state else { continue };
+            let entity = TemporaryEntity::new(id, &state.payload.state)?;
+            let value_type = entity.value(&PropertyId::System(SystemProperty::ValueType));
+            let valid = state.payload.state.memberships.contains(&ModelId::System(SystemModel::Property))
+                && matches!(value_type, Some(crate::value::Value::String(name)) if ValueType::from_property_str(&name) == Some(part.value_type));
+            if !valid {
+                return Err(RetrievalError::InvalidState(format!(
+                    "ordering property {id} changed type; its existing tree cannot be continued"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Order an independent fixture through the production member/key mapping.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) async fn fixture_order(

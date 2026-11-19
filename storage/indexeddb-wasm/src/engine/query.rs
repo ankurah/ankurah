@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ankql::ast::{Resolved, Selection};
 use ankurah_core::error::RetrievalError;
+use ankurah_core::selection::ordering::OrderBoundary;
 use ankurah_proto::{Attested, EntityId, EntityState};
 use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::StateSelection};
 use futures::StreamExt;
@@ -14,6 +15,15 @@ use crate::util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, re
 
 /// Read membership keys and their matching states in one IndexedDB snapshot.
 pub(crate) async fn fetch(database: &Database, selection: &Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    fetch_after(database, selection, None).await
+}
+
+pub(super) async fn fetch_after(
+    database: &Database,
+    selection: &Selection<Resolved>,
+    boundary: Option<&OrderBoundary>,
+) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    let mut selected = StateSelection::new(selection).after(boundary)?;
     let plan = MaterializationPlan::new(selection);
     let mut names = Vec::new();
     for model in &plan.models {
@@ -34,7 +44,6 @@ pub(crate) async fn fetch(database: &Database, selection: &Selection<Resolved>) 
             materializations.insert(model, ids);
         }
         let all = if plan.needs_all_entities() { entity_ids(&entities, "").await? } else { BTreeSet::new() };
-        let mut selected = StateSelection::new(selection);
         for id in plan.candidate_ids(&materializations, all) {
             let request = entities.get(&JsValue::from_str(&id.to_base64())).require("get joined entity")?;
             cb_future(&request, "success", "error").await.require("await joined entity")?;

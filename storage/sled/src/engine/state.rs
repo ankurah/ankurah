@@ -3,7 +3,12 @@
 use std::{num::NonZeroUsize, ops::Bound, sync::Arc};
 
 use ankurah_core::{
+    entity::TemporaryEntity,
     error::{MutationError, RetrievalError},
+    selection::{
+        filter::{evaluate_predicate, membership_match},
+        ordering::OrderBoundary,
+    },
     storage::{StateCursor, StateScan, StateSnapshot, StorageEngine},
 };
 use ankurah_proto::{Attested, EntityId, EntityState, StateFragment};
@@ -98,17 +103,24 @@ pub(super) struct SledStateSnapshot {
     after: Vec<u8>,
     exhausted: bool,
     selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
+    selection: Option<ankql::ast::Selection<ankql::ast::Resolved>>,
 }
 
 impl SledStateSnapshot {
     pub(super) async fn begin(engine: &SledStorageEngine, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
-        let since = match scan {
-            StateScan::Changes(since) => since.cloned(),
+        let (since, selection) = match scan {
+            StateScan::Changes(since) => (since.cloned(), None),
+            StateScan::SelectionChanges { selection, since } => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection change snapshot requires LIMIT".into()));
+                }
+                (since.cloned(), Some(ankql::selection::deterministic_order(selection).into_owned()))
+            }
             StateScan::Selection(selection) => {
                 if selection.limit.is_none() {
                     return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
                 }
-                None
+                (None, None)
             }
         };
         let database = engine.database.lock().unwrap().clone();
@@ -127,7 +139,7 @@ impl SledStateSnapshot {
                 },
             );
             drop(guard);
-            Ok::<_, RetrievalError>(Self { database, target, after, exhausted: false, selected: None })
+            Ok::<_, RetrievalError>(Self { database, target, after, exhausted: false, selected: None, selection })
         })
         .await??;
         if let StateScan::Selection(selection) = scan {
@@ -151,6 +163,41 @@ impl SledStateSnapshot {
 
 #[async_trait]
 impl StateSnapshot for SledStateSnapshot {
+    async fn matching_ids(&mut self, ids: &[EntityId]) -> Result<Vec<EntityId>, RetrievalError> {
+        let selection = self.selection.clone().ok_or_else(|| RetrievalError::InvalidState("snapshot has no prepared selection".into()))?;
+        let states = self.get_states(ids).await?;
+        let result = states
+            .into_iter()
+            .flatten()
+            .filter_map(|state| {
+                if let Some(matches) = membership_match(&selection.predicate, &|model| state.payload.state.memberships.contains(model)) {
+                    return matches.then_some(Ok(state.payload.entity_id));
+                }
+                let entity = match TemporaryEntity::new(state.payload.entity_id, &state.payload.state) {
+                    Ok(entity) => entity,
+                    Err(error) => return Some(Err(error)),
+                };
+                evaluate_predicate(&entity, &selection.predicate).unwrap_or(false).then_some(Ok(state.payload.entity_id))
+            })
+            .collect();
+        self.validate().await?;
+        result
+    }
+
+    async fn select_after(
+        &mut self,
+        boundary: Option<&OrderBoundary>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let mut selection =
+            self.selection.clone().ok_or_else(|| RetrievalError::InvalidState("snapshot has no prepared selection".into()))?;
+        selection.limit = Some(limit.get() as u64);
+        self.validate().await?;
+        let result = super::query::fetch_after(self.database.clone(), selection, boundary).await;
+        self.validate().await?;
+        result
+    }
+
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         if self.selected.is_some() {
             self.validate().await?;

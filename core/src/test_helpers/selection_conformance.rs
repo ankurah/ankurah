@@ -23,7 +23,7 @@ use crate::{
     property::backend::{LWWBackend, PropertyBackend},
     reactor::AbstractEntity,
     resultset::EntityResultSet,
-    selection::filter::Filterable,
+    selection::{filter::Filterable, ordering::OrderBoundary},
     storage::{StateScan, StorageEngine, StorageTransaction},
     sync::{CacheSettings, TreeManager},
     value::Value,
@@ -200,7 +200,73 @@ pub async fn mixed_ordering<SE: StorageEngine + 'static>(storage: Arc<SE>) -> an
             &[8, 208, 2, 1, 4, 3, 6, 7, 5],
         )
         .await?;
+    fixture.check_absent_boundary().await?;
     fixture.finish()
+}
+
+/// Change coverage and unchanged refill candidates share one read boundary.
+pub async fn selection_changes<SE: StorageEngine + 'static>(storage: Arc<SE>) -> anyhow::Result<()> {
+    let members = (1..=4).map(|byte| member(byte, [(score(), Value::I64(i64::from(byte)))])).collect::<anyhow::Result<Vec<_>>>()?;
+    let fixture = Fixture::new(storage.clone(), members).await?;
+    let mut previous = storage.state_snapshot(StateScan::Changes(None)).await?;
+    while !previous.next_page(NonZeroUsize::new(2).unwrap()).await?.is_empty() {}
+    let cursor = previous.finish().await?;
+
+    let moved = member(2, [(score(), Value::I64(100))])?;
+    let excluded = state(id(4), model(), [(score(), Value::I64(4)), (active(), Value::Bool(false))])?;
+    let inserted = member(5, [(score(), Value::I64(50))])?;
+    let mut transaction = storage.transaction();
+    transaction.set_state(&fixture.members[1].payload.state.head, &moved).await?;
+    transaction.set_state(&fixture.members[3].payload.state.head, &excluded).await?;
+    transaction.set_state(&Clock::default(), &inserted).await?;
+    transaction.commit().await?.committed()?;
+
+    let selection = Selection {
+        predicate: Predicate::And(Box::new(Predicate::MemberOf(model())), Box::new(active_predicate())),
+        order_by: Some(vec![order(score().into(), OrderDirection::Asc)]),
+        limit: Some(2),
+    };
+    let mut snapshot = storage.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: Some(&cursor) }).await?;
+    let mut changed = ids(&snapshot.next_page(NonZeroUsize::MIN).await?);
+    let mut matching = snapshot.matching_ids(&[id(5), id(4), id(2), id(1), id(99)]).await?;
+    matching.sort();
+    assert_eq!(matching, [id(1), id(2), id(5)], "predicate membership must ignore LIMIT and retain matching outsiders");
+
+    let first = snapshot.get_states(&[id(1)]).await?.pop().flatten().expect("retained prefix member");
+    let boundary = OrderBoundary::from_item(&selection, &TemporaryEntity::new(id(1), &first.payload.state)?);
+    let refill = snapshot.select_after(Some(&boundary), NonZeroUsize::MIN).await?;
+    assert_eq!(ids(&refill), [id(3)], "an unchanged entity refills the outward move");
+    let page = snapshot.select_after(None, NonZeroUsize::new(3).unwrap()).await?;
+    assert_eq!(ids(&page), [id(1), id(3), id(5)], "the explicit candidate cap replaces the original LIMIT");
+    loop {
+        let page = snapshot.next_page(NonZeroUsize::MIN).await?;
+        if page.is_empty() {
+            break;
+        }
+        changed.extend(ids(&page));
+    }
+    changed.sort();
+    assert_eq!(changed, [id(2), id(4), id(5)], "membership/refill reads must not consume or filter change coverage");
+    let states = snapshot.get_states(&[id(2), id(3)]).await?;
+    assert_eq!(states, [Some(moved), Some(fixture.members[2].clone())]);
+    let cursor = snapshot.finish().await?;
+    let mut caught_up = storage.state_snapshot(StateScan::Changes(Some(&cursor))).await?;
+    assert!(caught_up.next_page(NonZeroUsize::MIN).await?.is_empty());
+    caught_up.finish().await?;
+    let mut wrong_order = storage.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: Some(&cursor) }).await?;
+    let mut reversed = selection.clone();
+    reversed.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
+    let wrong_boundary = OrderBoundary::from_item(&reversed, &TemporaryEntity::new(id(1), &first.payload.state)?);
+    assert!(wrong_order.select_after(Some(&wrong_boundary), NonZeroUsize::MIN).await.is_err(), "a boundary from another order is invalid");
+    Ok(())
+}
+
+fn active_predicate() -> Predicate<Resolved> {
+    Predicate::Comparison {
+        left: Box::new(Expr::Path(active().into())),
+        operator: ComparisonOperator::Equal,
+        right: Box::new(Expr::Literal(Value::Bool(true))),
+    }
 }
 
 fn order(path: PropertyPath, direction: OrderDirection) -> OrderByItem<Resolved> { OrderByItem { path, direction } }
@@ -280,11 +346,7 @@ impl<SE: StorageEngine + 'static> Fixture<SE> {
 
     async fn check(&mut self, name: &str, order_by: Option<Vec<OrderByItem<Resolved>>>, expected: &[u8]) -> anyhow::Result<()> {
         let expected: Vec<_> = expected.iter().copied().map(id).collect();
-        let active = Predicate::Comparison {
-            left: Box::new(Expr::Path(active().into())),
-            operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Literal(Value::Bool(true))),
-        };
+        let active = active_predicate();
         let selection = Selection { predicate: active.clone(), order_by, limit: None };
         self.record(
             format!("{name}: independent full digest tree"),
@@ -314,6 +376,7 @@ impl<SE: StorageEngine + 'static> Fixture<SE> {
             }
             let fetched = self.storage.fetch_states(&unlimited).await.map(|states| ids(&states)).map_err(Into::into);
             self.record(format!("{name}/{route}: unlimited fetch"), fetched, &expected);
+            self.check_snapshot_boundaries(&format!("{name}/{route}"), &selection, &expected).await?;
 
             for limit in 0..=expected.len() + 1 {
                 selection.limit = Some(limit as u64);
@@ -336,6 +399,79 @@ impl<SE: StorageEngine + 'static> Fixture<SE> {
                 .await;
                 self.record(format!("{name}/{route}/LIMIT {limit}: managed tree"), managed, prefix);
             }
+        }
+        Ok(())
+    }
+
+    async fn check_snapshot_boundaries(
+        &mut self,
+        name: &str,
+        selection: &Selection<Resolved>,
+        expected: &[EntityId],
+    ) -> anyhow::Result<()> {
+        let mut selection = selection.clone();
+        // Membership and refill are over the predicate, not the selected top N.
+        selection.limit = Some(0);
+        let mut snapshot = self.storage.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: None }).await?;
+        let mut changed = ids(&snapshot.next_page(NonZeroUsize::MIN).await?);
+        let mut requested: Vec<_> = expected.iter().rev().copied().collect();
+        requested.extend([id(99), id(201), id(250)]);
+        let mut matching = snapshot.matching_ids(&requested).await?;
+        matching.sort();
+        let mut expected_members = expected.to_vec();
+        expected_members.sort();
+        self.record(format!("{name}: predicate matches ignore LIMIT 0"), Ok(matching), &expected_members);
+
+        for offset in 0..=expected.len() {
+            let boundary = if offset == 0 {
+                None
+            } else {
+                let state = self.members.iter().find(|state| state.payload.entity_id == expected[offset - 1]).unwrap();
+                Some(OrderBoundary::from_item(&selection, &TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?))
+            };
+            let selected = snapshot
+                .select_after(boundary.as_ref(), NonZeroUsize::new(2).unwrap())
+                .await
+                .map(|states| ids(&states))
+                .map_err(Into::into);
+            self.record(format!("{name}/after {offset}: strict refill"), selected, &expected[offset..expected.len().min(offset + 2)]);
+        }
+        loop {
+            let page = snapshot.next_page(NonZeroUsize::new(2).unwrap()).await?;
+            anyhow::ensure!(page.len() <= 2, "snapshot exceeded its page limit");
+            if page.is_empty() {
+                break;
+            }
+            changed.extend(ids(&page));
+        }
+        changed.sort();
+        let mut expected_changes = expected.to_vec();
+        expected_changes.extend([id(201), id(202), id(203), id(204), id(205), id(250)]);
+        expected_changes.sort();
+        self.record(format!("{name}: complete independent change scan"), Ok(changed), &expected_changes);
+        snapshot.finish().await?;
+        Ok(())
+    }
+
+    async fn check_absent_boundary(&mut self) -> anyhow::Result<()> {
+        let boundary_state = member(253, [(absent_document(), Value::Json(serde_json::json!(1)))])?;
+        let boundary_entity = TemporaryEntity::new(id(253), &boundary_state.payload.state)?;
+        for (direction, expected) in [(OrderDirection::Asc, vec![id(8), id(208)]), (OrderDirection::Desc, Vec::new())] {
+            let selection = Selection {
+                predicate: Predicate::And(Box::new(Predicate::MemberOf(model())), Box::new(active_predicate())),
+                order_by: Some(vec![
+                    order(absent_document().into(), direction.clone()),
+                    order(group().into(), OrderDirection::Asc),
+                    order(PropertyPath::id(), OrderDirection::Desc),
+                ]),
+                limit: Some(1),
+            };
+            let boundary = OrderBoundary::from_item(&selection, &boundary_entity);
+            let mut snapshot = self.storage.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: None }).await?;
+            let selected =
+                snapshot.select_after(Some(&boundary), NonZeroUsize::new(2).unwrap()).await.map(|states| ids(&states)).map_err(Into::into);
+            self.record(format!("present boundary before absent column {direction:?}"), selected, &expected);
+            snapshot.finish().await?;
         }
         Ok(())
     }

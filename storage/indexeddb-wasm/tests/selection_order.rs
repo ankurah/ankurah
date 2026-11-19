@@ -45,3 +45,13 @@ async fn mixed_order_matches_digest_trees() -> anyhow::Result<()> {
     IndexedDBStorageEngine::cleanup(&name).await?;
     result
 }
+
+#[wasm_bindgen_test]
+async fn changes_and_refill_share_a_snapshot() -> anyhow::Result<()> {
+    let name = format!("selection_changes_{}", ulid::Ulid::new());
+    let engine = Arc::new(IndexedDBStorageEngine::open(&name).await?);
+    let result = selection_conformance::selection_changes(engine.clone()).await;
+    engine.db.close().await;
+    IndexedDBStorageEngine::cleanup(&name).await?;
+    result
+}

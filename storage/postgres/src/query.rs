@@ -1,10 +1,13 @@
+use std::{collections::BTreeMap, num::NonZeroUsize};
+
 use ankql::ast::{Predicate, Resolved, Selection};
-use ankurah_core::{error::RetrievalError, storage::StorageEngine};
+use ankurah_core::{error::RetrievalError, selection::ordering::OrderBoundary, storage::StorageEngine};
 use ankurah_proto::{Attested, EntityId, EntityState, PropertyId};
 use ankurah_storage_common::{
     materialization_join::{property_column, MaterializationJoin, MaterializationTable},
     materialization_plan::MaterializationPlan,
     selection::StateSelection,
+    EngineColumns,
 };
 use tokio_postgres::{types::ToSql, GenericClient};
 
@@ -14,11 +17,17 @@ use crate::{
     Postgres, ENTITY_TABLE,
 };
 
+mod continuation;
+
 /// A selection over joined materializations, with any unsupported predicate retained for Rust.
 pub(super) struct Query {
     sql: String,
     params: Vec<Box<dyn ToSql + Send + Sync>>,
     remaining: Selection<Resolved>,
+    source: String,
+    pushed: Selection<EngineColumns>,
+    selection: Selection<Resolved>,
+    order_types: BTreeMap<String, ankurah_core_types::ValueType>,
 }
 
 impl Postgres {
@@ -94,15 +103,17 @@ impl Query {
             engine.ensure_json_ordering().await?;
         }
         let mut builder = SqlBuilder::new();
-        builder.order_types(types);
+        builder.order_types(types.clone());
         builder.selection(&lowered)?;
         let (predicate_sql, params) = builder.build_where_clause();
+        let source = join.sql(ENTITY_TABLE, &properties, &plan.models);
         Ok(Self {
-            sql: format!(
-                r#"SELECT "id" FROM ({}) AS materialized WHERE {predicate_sql}"#,
-                join.sql(ENTITY_TABLE, &properties, &plan.models)
-            ),
+            sql: format!(r#"SELECT "id" FROM ({}) AS materialized WHERE {predicate_sql}"#, source),
             params,
+            source,
+            pushed: lowered,
+            order_types: types,
+            selection: selection.clone(),
             remaining: Selection {
                 predicate: split.remaining_predicate,
                 order_by: if native_order { None } else { selection.order_by.clone() },

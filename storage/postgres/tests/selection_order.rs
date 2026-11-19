@@ -29,6 +29,12 @@ async fn mixed_order_matches_digest_trees() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn changes_and_refill_share_a_snapshot() -> anyhow::Result<()> {
+    let (_container, engine) = common::create_postgres_container().await?;
+    selection_conformance::selection_changes(Arc::new(engine)).await
+}
+
+#[tokio::test]
 async fn non_c_locale_rejects_json_order_before_limit() -> anyhow::Result<()> {
     use ankql::ast::{OrderByItem, OrderDirection, Predicate, PropertyPath, Selection};
     use ankurah_core::{

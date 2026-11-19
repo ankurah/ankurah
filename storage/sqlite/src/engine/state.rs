@@ -1,10 +1,11 @@
 //! Canonical-state continuation through a WAL read transaction, or validated
 //! short reads on the sole connection of a private-memory database.
 
-use std::{collections::BTreeMap, num::NonZeroUsize};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 use ankurah_core::{
     error::RetrievalError,
+    selection::ordering::OrderBoundary,
     storage::{StateCursor, StateScan, StateSnapshot},
 };
 use ankurah_proto::{Attested, EntityId, EntityState};
@@ -77,6 +78,7 @@ pub(super) struct SqliteStateSnapshot {
     target: CounterCursor,
     after: (u64, String),
     selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
+    query: Option<Arc<Query>>,
 }
 
 enum Source {
@@ -88,18 +90,30 @@ impl SqliteStateSnapshot {
     pub(super) async fn begin(engine: &SqliteStorageEngine, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
         // Query preparation may create catalog/materialization columns. Complete
         // it before the read transaction fixes the schema and state boundary.
-        let (since, query, prepared_at) = match scan {
-            StateScan::Changes(since) => (since, None, None),
+        let (since, selection, selection_changes) = match scan {
+            StateScan::Changes(since) => (since, None, false),
+            StateScan::SelectionChanges { selection, since } => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection change snapshot requires LIMIT".into()));
+                }
+                (since, Some(selection), true)
+            }
             StateScan::Selection(selection) => {
                 if selection.limit.is_none() {
                     return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
                 }
+                (None, Some(selection), false)
+            }
+        };
+        let (query, prepared_at) = match selection {
+            None => (None, None),
+            Some(selection) => {
                 let prepared_at = {
                     let connection = engine.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
                     engine.ensure_shared_tables(&connection).await?;
                     connection.with_connection(current).await?
                 };
-                (None, Some(Query::prepare(engine, selection).await?), Some(prepared_at))
+                (Some(Arc::new(Query::prepare(engine, selection).await?)), Some(prepared_at))
             }
         };
         let (source, target) = if let Some(connection) = engine.maps.memory_connection().await? {
@@ -124,8 +138,12 @@ impl SqliteStateSnapshot {
         }
         let since = target.resume(since, ENGINE)?;
         let after = since.map_or((0, String::new()), |position| (position, "\u{10ffff}".into()));
-        let mut snapshot = Self { source, target, after, selected: None };
+        let mut snapshot = Self { source, target, after, selected: None, query: None };
         if let Some(query) = query {
+            if selection_changes {
+                snapshot.query = Some(query);
+                return Ok(snapshot);
+            }
             let selected = snapshot.read(move |connection| Ok(query.states_in(connection))).await??;
             snapshot.selected = Some(selected.into_iter());
         }
@@ -213,6 +231,22 @@ impl StateSnapshot for SqliteStateSnapshot {
                 Ok(ids.iter().map(|id| states.get(id).cloned()).collect())
             })
             .await?)
+    }
+
+    async fn matching_ids(&mut self, ids: &[EntityId]) -> Result<Vec<EntityId>, RetrievalError> {
+        let query = self.query.clone().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
+        let ids = ids.to_vec();
+        self.read(move |connection| Ok(query.matching_ids_in(connection, &ids))).await?
+    }
+
+    async fn select_after(
+        &mut self,
+        after: Option<&OrderBoundary>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let query = self.query.clone().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
+        let after = after.cloned();
+        self.read(move |connection| Ok(query.select_after_in(connection, after.as_ref(), limit))).await?
     }
 
     async fn finish(mut self: Box<Self>) -> Result<StateCursor, RetrievalError> {

@@ -164,9 +164,9 @@ impl SqlBuilder {
         self
     }
 
-    fn push_sql(&mut self, s: &str) { self.sql.push_str(s); }
+    pub(super) fn push_sql(&mut self, s: &str) { self.sql.push_str(s); }
 
-    fn push_param(&mut self, value: rusqlite::types::Value) {
+    pub(super) fn push_param(&mut self, value: rusqlite::types::Value) {
         self.sql.push('?');
         self.params.push(value);
     }
@@ -338,7 +338,7 @@ impl SqlBuilder {
         Ok(())
     }
 
-    pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
+    fn order_expression(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
         if order_by.path.is_simple() && order_by.path.column == "id" {
             // In `MaterializationJoin`'s projection, `id` is the entity id.
             self.push_sql(id_bytes::SQL);
@@ -358,12 +358,83 @@ impl SqlBuilder {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
+        self.order_expression(order_by)?;
         match order_by.direction {
             OrderDirection::Asc => self.push_sql(" ASC NULLS LAST"),
             OrderDirection::Desc => self.push_sql(" DESC NULLS FIRST"),
         }
 
         Ok(())
+    }
+    /// Strictly after a captured tuple, using the same expressions and NULL
+    /// placement as ORDER BY. This is deliberately separate from predicates.
+    pub(super) fn after_order(&mut self, order: &[OrderByItem<EngineColumns>], values: &[Option<Value>]) -> Result<(), SqlGenerationError> {
+        if order.len() != values.len() {
+            return Err(SqlGenerationError::UnsupportedExpression("order boundary has the wrong number of values"));
+        }
+        let Some((part, rest)) = order.split_first() else {
+            self.push_sql("FALSE");
+            return Ok(());
+        };
+        let value = &values[0];
+        self.push_sql("(");
+        match (value, &part.direction) {
+            (None, OrderDirection::Asc) => self.push_sql("FALSE"),
+            (None, OrderDirection::Desc) => {
+                self.order_expression(part)?;
+                self.push_sql(" IS NOT NULL");
+            }
+            (Some(value), direction) => {
+                self.push_sql("(");
+                self.order_expression(part)?;
+                self.push_sql(if *direction == OrderDirection::Asc { " > " } else { " < " });
+                self.order_argument(part, value)?;
+                // Entity identities are never NULL. Keep their comparison a
+                // direct index bound instead of adding an impossible NULL arm.
+                if *direction == OrderDirection::Asc && !(part.path.is_simple() && part.path.column == "id") {
+                    self.push_sql(" OR ");
+                    self.order_expression(part)?;
+                    self.push_sql(" IS NULL");
+                }
+                self.push_sql(")");
+            }
+        }
+        if !rest.is_empty() {
+            self.push_sql(" OR (");
+            self.order_expression(part)?;
+            if let Some(value) = value {
+                self.push_sql(" IS ");
+                self.order_argument(part, value)?;
+            } else {
+                self.push_sql(" IS NULL");
+            }
+            self.push_sql(" AND ");
+            self.after_order(rest, &values[1..])?;
+            self.push_sql(")");
+        }
+        self.push_sql(")");
+        Ok(())
+    }
+
+    fn order_argument(&mut self, part: &OrderByItem<EngineColumns>, value: &Value) -> Result<(), SqlGenerationError> {
+        if part.path.subpath.is_empty()
+            && (part.path.column == "id" || self.order_types.get(&part.path.column) == Some(&ValueType::EntityId))
+        {
+            let Value::EntityId(value) = value else {
+                return Err(SqlGenerationError::UnsupportedExpression("an entity-id order boundary requires an entity id"));
+            };
+            self.push_param(rusqlite::types::Value::Blob(value.to_bytes().to_vec()));
+            return Ok(());
+        }
+        if !part.path.subpath.is_empty() || self.order_types.get(&part.path.column) == Some(&ValueType::Json) {
+            self.push_param(rusqlite::types::Value::Blob(ankurah_core_types::ordering::value_bytes(value)));
+            return Ok(());
+        }
+        self.expr(&Expr::Literal(value.clone()))
     }
 }
 

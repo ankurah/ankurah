@@ -86,6 +86,36 @@ async fn another_handle_cannot_change_a_paged_snapshot_without_invalidating_it()
 }
 
 #[wasm_bindgen_test]
+async fn refill_reads_reject_another_handles_commits_and_resets() -> anyhow::Result<()> {
+    let name = format!("state_refill_race_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&name).await?;
+    let writer = IndexedDBStorageEngine::open(&name).await?;
+    let (state, _) = entity!(8);
+    put(&engine, &Clock::default(), &state).await?;
+    let selection = Selection { predicate: Predicate::True, order_by: None, limit: Some(1) };
+    for reset in [false, true] {
+        let mut snapshot = engine.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: None }).await?;
+        assert_eq!(snapshot.select_after(None, NonZeroUsize::new(1).unwrap()).await?.len(), 1);
+        gloo_timers::future::TimeoutFuture::new(1).await;
+        if reset {
+            writer.delete_all().await?;
+        } else {
+            put(&writer, &state.payload.state.head, &state).await?;
+        }
+        for result in [
+            snapshot.matching_ids(&[state.payload.entity_id]).await.map(|_| ()),
+            snapshot.select_after(None, NonZeroUsize::new(1).unwrap()).await.map(|_| ()),
+            snapshot.finish().await.map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict)));
+        }
+    }
+    engine.db.close().await;
+    writer.db.close().await;
+    IndexedDBStorageEngine::cleanup(&name).await
+}
+
+#[wasm_bindgen_test]
 async fn state_positions_preserve_integers_above_javascript_number_precision() -> anyhow::Result<()> {
     use ankurah_storage_common::state::CounterCursor;
     use send_wrapper::SendWrapper;

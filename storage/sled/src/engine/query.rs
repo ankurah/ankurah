@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use ankql::ast::{Resolved, Selection};
 use ankurah_core::error::RetrievalError;
+use ankurah_core::selection::ordering::OrderBoundary;
 use ankurah_proto::{Attested, EntityId, EntityState, StateFragment};
 use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::StateSelection};
 
@@ -10,7 +11,17 @@ use crate::{database::Database, error::sled_error};
 /// Join materialization keys before loading state. The one-materialization
 /// indexed path stays in SledModelStore.
 pub(super) async fn fetch(database: Arc<Database>, selection: Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    fetch_after(database, selection, None).await
+}
+
+pub(super) async fn fetch_after(
+    database: Arc<Database>,
+    selection: Selection<Resolved>,
+    boundary: Option<&OrderBoundary>,
+) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    let boundary = boundary.cloned();
     tokio::task::spawn_blocking(move || {
+        let mut selected = StateSelection::new(&selection).after(boundary.as_ref())?;
         let plan = MaterializationPlan::new(&selection);
         let mut materializations = std::collections::BTreeMap::new();
         for model in &plan.models {
@@ -21,7 +32,6 @@ pub(super) async fn fetch(database: Arc<Database>, selection: Selection<Resolved
             materializations.insert(*model, ids);
         }
         let all = if plan.needs_all_entities() { entity_ids(&database.entities_tree)? } else { BTreeSet::new() };
-        let mut selected = StateSelection::new(&selection);
         for id in plan.candidate_ids(&materializations, all) {
             if let Some(bytes) = database.entities_tree.get(id.to_bytes()).map_err(sled_error)? {
                 let fragment: StateFragment = bincode::deserialize(bytes.as_ref())?;

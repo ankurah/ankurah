@@ -7,6 +7,7 @@ use ankurah_core::{
     entity::TemporaryEntity,
     error::RetrievalError,
     selection::filter::{ValueLookup, evaluate_predicate},
+    selection::ordering::OrderBoundary,
 };
 use ankurah_core_types::Value;
 use ankurah_proto::{Attested, EntityState};
@@ -19,11 +20,30 @@ pub struct StateSelection<'a> {
     order: Arc<Vec<OrderByItem<Resolved>>>,
     candidates: BinaryHeap<Candidate>,
     seen: usize,
+    after: Option<OrderBoundary>,
 }
 
 impl<'a> StateSelection<'a> {
     pub fn new(selection: &'a Selection<Resolved>) -> Self {
-        Self { selection, order: Arc::new(selection.order_by.clone().unwrap_or_default()), candidates: BinaryHeap::new(), seen: 0 }
+        Self {
+            selection,
+            order: Arc::new(selection.order_by.clone().unwrap_or_default()),
+            candidates: BinaryHeap::new(),
+            seen: 0,
+            after: None,
+        }
+    }
+
+    /// Keep only candidates strictly after this boundary, before applying LIMIT.
+    pub fn after(mut self, boundary: Option<&OrderBoundary>) -> Result<Self, RetrievalError> {
+        if let Some(boundary) = boundary {
+            if !boundary.matches_order(self.selection) {
+                return Err(RetrievalError::InvalidState("refill boundary does not match selection order".into()));
+            }
+            self.order = Arc::new(boundary.order().to_vec());
+            self.after = Some(boundary.clone());
+        }
+        Ok(self)
     }
 
     pub fn push(&mut self, state: Attested<EntityState>) -> Result<(), RetrievalError> {
@@ -32,6 +52,9 @@ impl<'a> StateSelection<'a> {
         }
         let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
         if !evaluate_predicate(&entity, &self.selection.predicate).unwrap_or(false) {
+            return Ok(());
+        }
+        if self.after.as_ref().is_some_and(|boundary| !boundary.precedes(&entity)) {
             return Ok(());
         }
         let values = self.order.iter().map(|order| entity.order_value_at(&order.path)).collect();
@@ -131,5 +154,22 @@ mod tests {
             selected.finish().iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(),
             vec![state(0).payload.entity_id, state(1).payload.entity_id]
         );
+    }
+
+    #[test]
+    fn refill_filters_before_limit_and_rejects_another_order() {
+        let selection = Selection { predicate: Predicate::True, order_by: None, limit: Some(1) };
+        let at = state(2);
+        let boundary = OrderBoundary::from_item(&selection, &TemporaryEntity::new(at.payload.entity_id, &at.payload.state).unwrap());
+        let mut selected = StateSelection::new(&selection).after(Some(&boundary)).unwrap();
+        for byte in (0..=5).rev() {
+            selected.push(state(byte)).unwrap();
+            assert!(selected.candidates.len() <= 1);
+        }
+        assert_eq!(selected.finish()[0].payload.entity_id, state(3).payload.entity_id);
+
+        let reversed =
+            Selection { order_by: Some(vec![OrderByItem { path: PropertyPath::id(), direction: OrderDirection::Desc }]), ..selection };
+        assert!(StateSelection::new(&reversed).after(Some(&boundary)).is_err());
     }
 }

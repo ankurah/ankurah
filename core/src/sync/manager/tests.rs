@@ -16,6 +16,7 @@ use crate::test_utils::TestStorage;
 
 mod continuation;
 mod lifetime;
+mod limited;
 mod maintenance;
 mod opening;
 

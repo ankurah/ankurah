@@ -28,7 +28,7 @@ async fn test_collection_boundary_excludes_other_collections() -> Result<(), any
 }
 
 #[tokio::test]
-async fn test_prefix_guard_toggle_effect() -> Result<(), anyhow::Error> {
+async fn canonical_filter_preserves_membership_when_prefix_guard_is_disabled() -> Result<(), anyhow::Error> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
@@ -42,18 +42,19 @@ async fn test_prefix_guard_toggle_effect() -> Result<(), anyhow::Error> {
     .await?;
     create_books(&ctx, vec![("Book1", "2001"), ("Book2", "2002")]).await?;
 
-    // 1) Guard enabled (default): equality prefix should constrain results to year=1969 only
-    assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5"]);
+    // Both indexed properties are constrained to present values, so the index
+    // is a complete candidate source even though its guard can be disabled.
+    let query = "year = '1969' AND name >= '' ORDER BY name LIMIT 100";
+    assert_eq!(names(&fetch(&ctx, query).await?), vec!["Album5"]);
 
-    // 2) Disable guard: expect overshoot beyond equality prefix (includes following names)
+    // An overbroad candidate scan must still satisfy the canonical predicate.
     #[cfg(debug_assertions)]
     engine.set_prefix_guard_disabled(true);
-    assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5", "Album6"]);
+    assert_eq!(names(&fetch(&ctx, query).await?), vec!["Album5"]);
 
-    // 3) Re-enable guard: back to constrained results
     #[cfg(debug_assertions)]
     engine.set_prefix_guard_disabled(false);
-    assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5"]);
+    assert_eq!(names(&fetch(&ctx, query).await?), vec!["Album5"]);
 
     Ok(())
 }

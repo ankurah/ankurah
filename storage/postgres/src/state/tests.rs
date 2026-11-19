@@ -81,6 +81,7 @@ async fn contract(tag: &str) -> anyhow::Result<()> {
     cursor_reopen_reset_and_migration(&engine, &pool).await?;
     index_queries(&engine).await?;
     selection_snapshots_match_fetch_and_release_materialization_locks(&engine).await?;
+    selection_queries_share_the_boundary_and_release_materialization_locks(&engine).await?;
     selection_planning_retries_only_for_newly_visible_states(&engine).await?;
     engine.delete_all().await?;
     managed_tree_builds_flush_pages_without_occupying_the_source_connection(engine).await?;
@@ -217,6 +218,45 @@ async fn selected_pages(snapshot: &mut dyn StateSnapshot) -> anyhow::Result<Vec<
         assert_eq!(page.len(), 1);
         states.extend(page);
     }
+}
+
+async fn selection_queries_share_the_boundary_and_release_materialization_locks(engine: &Postgres) -> anyhow::Result<()> {
+    use ankurah_core::entity::TemporaryEntity;
+    use ankurah_proto::ModelId;
+
+    engine.delete_all().await?;
+    let model = ModelId::EntityId(EntityId::from_bytes([112; 32]));
+    let mut seeded = Vec::new();
+    for id in [1, 2, 200] {
+        let mut entity = state(id, 1);
+        entity.payload.state.memberships.insert(model);
+        write(engine, &entity).await?;
+        seeded.push(entity);
+    }
+    let (_, previous) = collect(engine, None).await?;
+    let selection = Selection { predicate: Predicate::MemberOf(model), order_by: None, limit: Some(0) };
+    let mut snapshot = engine.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: Some(&previous) }).await?;
+    let mut later = state(3, 2);
+    later.payload.state.memberships.insert(model);
+    write(engine, &later).await?;
+
+    let ids = [seeded[2].payload.entity_id, seeded[0].payload.entity_id, later.payload.entity_id];
+    assert_eq!(snapshot.matching_ids(&ids).await?, ids[..2], "membership ignores LIMIT and excludes post-boundary commits");
+    assert_eq!(snapshot.select_after(None, NonZeroUsize::new(2).unwrap()).await?, seeded[..2]);
+    let tail = TemporaryEntity::new(seeded[1].payload.entity_id, &seeded[1].payload.state)?;
+    let boundary = OrderBoundary::from_item(&selection, &tail);
+    assert_eq!(snapshot.select_after(Some(&boundary), NonZeroUsize::MIN).await?, seeded[2..]);
+    assert!(snapshot.next_page(NonZeroUsize::MIN).await?.is_empty(), "query operations do not consume or replace change pages");
+
+    // Both helper queries touched a materialization, but neither keeps its
+    // relation lock while the caller updates tree maps or another node resets.
+    tokio::time::timeout(Duration::from_secs(5), engine.delete_all()).await??;
+    assert_eq!(snapshot.get_states(&[seeded[0].payload.entity_id]).await?[0].as_ref(), Some(&seeded[0]));
+    assert!(matches!(snapshot.matching_ids(&ids).await,
+        Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict)));
+    assert!(snapshot.get_states(&ids).await.is_err(), "a rolled-back snapshot cannot resume outside its read boundary");
+    assert!(snapshot.finish().await.is_err(), "a failed query cannot publish its abandoned cursor");
+    Ok(())
 }
 
 async fn selection_snapshots_match_fetch_and_release_materialization_locks(engine: &Postgres) -> anyhow::Result<()> {

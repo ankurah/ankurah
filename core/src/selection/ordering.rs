@@ -1,14 +1,53 @@
 //! Canonical selection ordering and the declared types needed to preserve it.
 
+use ankql::ast::{OrderByItem, Resolved, Selection};
 use ankurah_proto::{ModelId, PropertyId, SystemModel, SystemProperty};
 
 use crate::{
     entity::TemporaryEntity,
     error::RetrievalError,
-    selection::filter::Filterable,
+    selection::filter::{Filterable, ValueLookup},
     storage::StorageEngine,
     value::{Value, ValueType},
 };
+
+/// A strict continuation point in a selection's total order. Values are copied
+/// from one entity version, so later changes cannot move this boundary.
+#[derive(Clone, Debug)]
+pub struct OrderBoundary {
+    order: Vec<OrderByItem<Resolved>>,
+    values: Vec<Option<Value>>,
+}
+
+impl OrderBoundary {
+    /// Capture the effective ORDER BY, including the entity-ID tie-breaker.
+    /// The selection must be ordered or limited to define a continuation point.
+    pub fn from_item(selection: &Selection<Resolved>, item: &impl ValueLookup<Resolved>) -> Self {
+        let order = ankql::selection::deterministic_order(selection).order_by.clone().unwrap_or_default();
+        let values = order.iter().map(|part| item.order_value_at(&part.path)).collect();
+        Self { order, values }
+    }
+
+    pub fn order(&self) -> &[OrderByItem<Resolved>] { &self.order }
+
+    pub fn values(&self) -> &[Option<Value>] { &self.values }
+
+    /// Reject use with another order, or an unordered unlimited selection.
+    pub fn matches_order(&self, selection: &Selection<Resolved>) -> bool {
+        !self.order.is_empty() && ankql::selection::deterministic_order(selection).order_by.as_deref() == Some(self.order.as_slice())
+    }
+
+    /// Whether the candidate lies strictly after this boundary.
+    pub fn precedes(&self, item: &impl ValueLookup<Resolved>) -> bool {
+        for (part, value) in self.order.iter().zip(&self.values) {
+            let comparison = compare_nullable(value.as_ref(), item.order_value_at(&part.path).as_ref(), &part.direction);
+            if !comparison.is_eq() {
+                return comparison.is_lt();
+            }
+        }
+        false
+    }
+}
 
 /// Compare selection keys using PostgreSQL's value order and NULL placement.
 /// Callers supply the effective order, including any entity-ID tie-breaker.
