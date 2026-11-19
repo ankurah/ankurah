@@ -24,6 +24,8 @@ pub enum ReplicationState {
     Comparing,
     /// The receiver covers this source capture. The source may have changed
     /// since; local descendants and retained departed entities are allowed.
+    /// Coverage follows storage-transaction completion; power-loss durability
+    /// depends on the storage engine and its configuration.
     CaughtUp(KnownState),
     /// A refusal requiring changed credentials, limits, or an explicit retry.
     Failed(RetrievalError),
