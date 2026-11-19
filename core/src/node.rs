@@ -3,7 +3,7 @@ use ankql::ast::Resolved;
 use ankurah_proto::Attested;
 use ankurah_signals::{Calculated, Get, Mut, Wait};
 use anyhow::anyhow;
-use futures::TryFutureExt;
+use futures::{FutureExt, TryFutureExt};
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -585,7 +585,7 @@ where
 
         match notification.body {
             proto::NodeUpdateBody::Comparison { comparison, deltas } => {
-                self.receive_comparison_repair(notification.from, comparison, notification.id, deltas).await?;
+                self.receive_comparison_repair(notification.from, comparison, notification.id, deltas).boxed().await?;
                 Ok(())
             }
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
