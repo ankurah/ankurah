@@ -72,8 +72,12 @@ async fn memory_operations_share_the_database_after_pool_connection_expiry() -> 
 
     // Observe the pool retiring its handle; elapsed time alone does not prove
     // that the next checkout must obtain a replacement from the manager.
+    let retired = {
+        let _connection = engine.pool().get().await?;
+        engine.pool().state().statistics.connections_closed_max_lifetime
+    };
     tokio::time::timeout(Duration::from_secs(10), async {
-        while engine.pool().state().statistics.connections_closed_max_lifetime == 0 {
+        while engine.pool().state().statistics.connections_closed_max_lifetime == retired {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
