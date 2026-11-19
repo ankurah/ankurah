@@ -76,6 +76,7 @@ async fn server_edits_subscription() -> Result<()> {
     // Create two nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes
@@ -178,6 +179,7 @@ async fn server_edits_subscription() -> Result<()> {
 async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Query B's id is not known until we build it, but the gate closure needs to
@@ -258,6 +260,7 @@ async fn test_client_server_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
 
     let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
@@ -348,6 +351,7 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
 async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
     client.wait_ready().await?;
@@ -479,6 +483,7 @@ async fn test_lineage_event_bridge() -> Result<()> {
     // The server sends all needed events in the EventBridge response rather than requiring recursive fetches.
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes
@@ -530,6 +535,7 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
     // the write is silently lost while the head claims P is history.
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
     let writer = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let receiver = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
@@ -611,6 +617,7 @@ async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
     // Create server (durable) and client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes

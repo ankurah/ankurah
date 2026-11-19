@@ -54,6 +54,7 @@ async fn test_predicate_update_inter_node() -> Result<()> {
     // Create server (durable) and client (ephemeral) nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     // Connect the nodes
