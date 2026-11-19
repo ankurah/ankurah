@@ -104,13 +104,15 @@ async fn state_read_hook_filters_fetch_cache_and_live_updates() -> Result<()> {
     Ok(())
 }
 
-/// Counts received-event validation and allows tests to deny all reads or selected events.
+/// Records peer requests and allows tests to restrict predicates, states, or events.
 #[derive(Clone)]
 struct BridgePolicyAgent {
     validate_calls: Arc<AtomicUsize>,
     deny_read_events: Arc<Mutex<HashSet<EventId>>>,
     deny_reads: Arc<AtomicBool>,
     deny_read_states: Arc<Mutex<HashSet<proto::EntityId>>>,
+    query_filter: Arc<Mutex<Predicate<ankql::ast::Resolved>>>,
+    query_calls: Arc<AtomicUsize>,
     sent_queries: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -121,6 +123,8 @@ impl BridgePolicyAgent {
             deny_read_events: Arc::new(Mutex::new(HashSet::new())),
             deny_reads: Arc::new(AtomicBool::new(false)),
             deny_read_states: Arc::new(Mutex::new(HashSet::new())),
+            query_filter: Arc::new(Mutex::new(Predicate::True)),
+            query_calls: Arc::new(AtomicUsize::new(0)),
             sent_queries: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -199,10 +203,16 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn query_predicate<C>(&self, _data: &C) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
+    fn query_predicate<C>(&self, data: &C) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        self.retrieval_predicate(data)
+    }
+
+    fn retrieval_predicate<C>(&self, _data: &C) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>
     where C: Iterable<Self::ContextData> {
         self.check_read_access()?;
-        Ok(Predicate::True)
+        Ok(self.query_filter.lock().unwrap().clone())
     }
 
     fn check_reads<C>(
@@ -252,27 +262,43 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
     let trx = writer.begin();
     let visible = trx.create(&Pet { name: "Visible".into(), age: "3".into() }).await?.id();
     let hidden = trx.create(&Pet { name: "Hidden".into(), age: "4".into() }).await?.id();
+    trx.create(&Pet { name: "Outside".into(), age: "5".into() }).await?;
     trx.commit().await?;
 
     let agent = BridgePolicyAgent::new();
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    let _connection = LocalProcessConnection::new(&client, &server).await?;
+    let connection = LocalProcessConnection::new(&client, &server).await?;
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
-    reader.fetch::<PetView>("true").await?;
+    assert_eq!(reader.fetch::<PetView>("true").await?.len(), 3);
+    let model = reader.resolve_model_id::<Pet>().await?;
+    let restriction = client.catalog.resolve_selection(&model, ankql::parser::parse_selection("name != 'Outside'")?)?.predicate;
+    *agent.query_filter.lock().unwrap() = restriction.clone();
     agent.deny_read_states.lock().unwrap().insert(hidden);
     agent.sent_queries.lock().unwrap().clear();
 
+    let scoped_before = agent.query_calls.load(Ordering::SeqCst);
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 1);
-    let _query = reader.query_wait::<PetView>("true").await?;
+    assert_eq!(agent.query_calls.load(Ordering::SeqCst), scoped_before + 2, "fetch scopes once and checks current summary visibility");
+    let query = reader.query_wait::<PetView>("true").await?;
+    assert_eq!(
+        agent.query_calls.load(Ordering::SeqCst),
+        scoped_before + 4,
+        "subscription scopes once, checks summary visibility, and retains that same tree without another policy application"
+    );
+    let (retained_selection, _) = query.selection().value().unwrap();
+    assert!(matches!(&retained_selection.predicate, Predicate::And(_, allowed) if **allowed == restriction));
     let requests = std::mem::take(&mut *agent.sent_queries.lock().unwrap());
     let mut summaries = Vec::new();
     for request in requests {
         let request: proto::NodeRequestBody = bincode::deserialize(&request)?;
-        let (subscription, known_state, known_matches) = match request {
-            proto::NodeRequestBody::Fetch { known_state, known_matches, .. } => (false, known_state, known_matches),
-            proto::NodeRequestBody::SubscribeQuery { known_state, known_matches, .. } => (true, known_state, known_matches),
+        let (subscription, selection, known_state, known_matches) = match request {
+            proto::NodeRequestBody::Fetch { selection, known_state, known_matches } => (false, selection, known_state, known_matches),
+            proto::NodeRequestBody::SubscribeQuery { selection, known_state, known_matches, .. } => {
+                (true, selection, known_state, known_matches)
+            }
             _ => unreachable!(),
         };
+        assert_eq!(selection, retained_selection, "both wire accounts and the retained tree use the same exact selection");
         assert_eq!(known_state.digest.count(), 1);
         assert_eq!(known_matches.len(), 1);
         assert_eq!(known_matches[0].entity_id, visible);
@@ -295,6 +321,40 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
         let proto::NodeRequestBody::Fetch { known_state, .. } = bincode::deserialize(&encoded)? else { panic!("expected fetch") };
         assert_eq!(known_state.digest.count(), 1);
         assert_eq!(known_state != summaries[0].1, changes_summary, "only an allowed member's changed head changes its digest");
+    }
+
+    // A relay retry keeps the installed selection, but policy may have narrowed.
+    // Neither account may disclose a formerly allowed member on reconnect.
+    drop(connection);
+    let missing_property = Predicate::Comparison {
+        left: Box::new(ankql::ast::Expr::Path(proto::PropertyId::EntityId(proto::EntityId::random()).into())),
+        operator: ankql::ast::ComparisonOperator::Equal,
+        right: Box::new(ankql::ast::Expr::Literal("required".into())),
+    };
+    for restriction in
+        [client.catalog.resolve_selection(&model, ankql::parser::parse_selection("name = 'Outside'")?)?.predicate, missing_property]
+    {
+        *agent.query_filter.lock().unwrap() = restriction;
+        agent.sent_queries.lock().unwrap().clear();
+        let _connection = LocalProcessConnection::new(&client, &server).await?;
+        let (selection, known_state, known_matches) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                for bytes in std::mem::take(&mut *agent.sent_queries.lock().unwrap()) {
+                    if let proto::NodeRequestBody::SubscribeQuery { query_id, selection, known_state, known_matches, .. } =
+                        bincode::deserialize(&bytes).unwrap()
+                    {
+                        if query_id == query.query_id() {
+                            return (selection, known_state, known_matches);
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(selection, retained_selection, "a reconnect does not redefine the installed query");
+        assert_eq!(known_state, proto::KnownState::empty());
+        assert!(known_matches.is_empty(), "current discovery restrictions apply even when the additional state hook allows a member");
     }
     Ok(())
 }

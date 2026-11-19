@@ -34,7 +34,7 @@ mod read;
 pub use read::GetStateResult;
 
 mod state;
-pub use state::{StateCursor, StateSnapshot};
+pub use state::{StateCursor, StateScan, StateSnapshot};
 
 mod lock;
 pub use lock::LockName;
@@ -214,11 +214,11 @@ pub trait StorageEngine: Send + Sync {
     /// [`StorageTransaction`] states, and waits on no other map transaction, snapshot or reset.
     async fn map_snapshot(&self, locks: &[LockName]) -> Result<Self::Snapshot, RetrievalError>;
 
-    /// Read canonical entities at one boundary, optionally restricting sequential
-    /// pages to entities changed since `since`. The engine validates the cursor's
+    /// Read changed entities or a complete limited selection at one boundary.
+    /// The engine validates a change cursor's
     /// format and storage incarnation; an unusable cursor requires a full scan.
     /// Events alone do not constitute an entity-state change.
-    async fn state_snapshot(&self, since: Option<&StateCursor>) -> Result<Box<dyn StateSnapshot>, RetrievalError>;
+    async fn state_snapshot(&self, scan: StateScan<'_>) -> Result<Box<dyn StateSnapshot>, RetrievalError>;
 
     /// Retrieve canonical state by entity identity.
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;

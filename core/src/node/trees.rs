@@ -2,11 +2,13 @@
 
 use super::Node;
 use crate::{
+    entity::TemporaryEntity,
     error::RetrievalError,
     policy::{AccessDenied, ContextPolicy, PolicyAgent},
+    selection::filter::{evaluate_predicate, Error as FilterError},
     storage::StorageEngine,
 };
-use ankql::ast::{Resolved, Selection};
+use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_proto::{KnownEntity, KnownState};
 use ankurah_signals::Wait;
 use std::time::Duration;
@@ -30,20 +32,36 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         Ok(Box::new(view))
     }
 
-    /// Prepare both wire accounts from one authorized, stable tree version.
+    /// Prepare both wire accounts for an already policy-scoped selection from
+    /// one stable tree version, checking current discovery and state restrictions.
     pub(crate) async fn prepare_known(
         &self,
         selection: Selection<Resolved>,
         credentials: &Vec<PA::ContextData>,
     ) -> Result<(Box<dyn Send + Sync>, KnownState, Vec<KnownEntity>), RetrievalError> {
         let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
-        let selection = Selection { predicate: policy.filter_predicate(selection.predicate)?, ..selection };
+        // Reconnects reuse the installed selection with current credentials. Gate
+        // disclosure without changing that tree's identity or refilling its LIMIT.
+        let allowed = if crate::schema::is_catalog_read(&selection.predicate) {
+            Predicate::True
+        } else {
+            policy.filter_predicate(Predicate::True)?
+        };
         let (view, state, members) = self
             .trees
-            .prepare_known(selection, |id, state| match policy.check_read_state(&id, state) {
-                Ok(()) => Ok(true),
-                Err(AccessDenied::ByPolicy(_) | AccessDenied::ModelDenied(_)) => Ok(false),
-                Err(error) => Err(error.into()),
+            .prepare_known(selection, |id, state| {
+                if allowed != Predicate::True {
+                    match evaluate_predicate(&TemporaryEntity::new(id, state)?, &allowed) {
+                        Ok(true) => {}
+                        Ok(false) | Err(FilterError::PropertyNotFound(_)) => return Ok(false),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                match policy.check_read_state(&id, state) {
+                    Ok(()) => Ok(true),
+                    Err(AccessDenied::ByPolicy(_) | AccessDenied::ModelDenied(_)) => Ok(false),
+                    Err(error) => Err(error.into()),
+                }
             })
             .await?;
         self.tree_maintenance.notify_one();
@@ -58,7 +76,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     }
 
     pub(super) fn start_tree_maintenance(&self) {
-        let node = self.weak();
+        let trees = std::sync::Arc::downgrade(&self.trees);
         let changed = self.tree_maintenance.clone();
         let run = self.run.clone();
         crate::task::spawn(async move {
@@ -66,9 +84,9 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 // Another Node may write shared storage without sending this Node a
                 // notification. Queries reconcile before serving; retained views also
                 // catch up periodically while any tree remains managed.
-                let delay = node.upgrade().and_then(|node| {
-                    let flush = node.trees.flush_after();
-                    if node.trees.trees().is_empty() {
+                let delay = trees.upgrade().and_then(|trees| {
+                    let flush = trees.flush_after();
+                    if trees.trees().is_empty() {
                         flush
                     } else {
                         Some(flush.map_or(Duration::from_secs(1), |delay| delay.min(Duration::from_secs(1))))
@@ -89,8 +107,8 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 let mut retry_delay = Duration::from_millis(100);
                 loop {
                     let maintain = async {
-                        let Some(node) = node.upgrade() else { return Ok(()) };
-                        node.trees.maintain().await
+                        let Some(trees) = trees.upgrade() else { return Ok(()) };
+                        trees.maintain().await
                     };
                     let result = tokio::select! {
                         biased;
@@ -101,7 +119,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                         Ok(()) => break,
                         Err(error) => tracing::warn!(%error, "Digest-tree maintenance will retry"),
                     }
-                    // Keep no Node reference while waiting; a dropped node stops the worker.
+                    // Dropping the Node cancels an in-flight scan or this retry wait.
                     tokio::select! {
                         biased;
                         _ = run.wait_value(false) => return,

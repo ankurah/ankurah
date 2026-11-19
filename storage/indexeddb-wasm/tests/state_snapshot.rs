@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use ankql::ast::{Predicate, Selection};
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    storage::{StorageEngine, StorageTransaction},
+    storage::{StateScan, StorageEngine, StorageTransaction},
     test_helpers::map_conformance::fixtures::entity,
 };
 use ankurah_proto::{Attested, Clock, EntityState};
@@ -26,15 +26,15 @@ async fn continuation_coalesces_snapshot_writes_but_not_event_receipts() -> anyh
     let (a, event) = entity!(1);
     let (b, _) = entity!(2);
     put(&engine, &Clock::default(), &a).await?;
-    let before = engine.state_snapshot(None).await?.finish().await?;
+    let before = engine.state_snapshot(StateScan::Changes(None)).await?.finish().await?;
     let mut events = engine.transaction();
     events.add_events(&[event]).await?;
     events.commit().await?.committed()?;
-    assert_eq!(engine.state_snapshot(None).await?.finish().await?, before);
+    assert_eq!(engine.state_snapshot(StateScan::Changes(None)).await?.finish().await?, before);
     put(&engine, &a.payload.state.head, &a).await?;
     put(&engine, &a.payload.state.head, &a).await?;
     put(&engine, &Clock::default(), &b).await?;
-    let mut snapshot = engine.state_snapshot(Some(&before)).await?;
+    let mut snapshot = engine.state_snapshot(StateScan::Changes(Some(&before))).await?;
     let mut found = Vec::new();
     loop {
         let page = snapshot.next_page(NonZeroUsize::new(1).unwrap()).await?;
@@ -49,16 +49,20 @@ async fn continuation_coalesces_snapshot_writes_but_not_event_receipts() -> anyh
     expected.sort();
     assert_eq!(found, expected);
     let selection = Selection { predicate: Predicate::True, order_by: None, limit: Some(1) };
-    assert_eq!(snapshot.limited_states(&selection).await?[0].payload.entity_id, expected[0]);
+    let mut selected = engine.state_snapshot(StateScan::Selection(&selection)).await?;
+    assert_eq!(selected.next_page(NonZeroUsize::new(1).unwrap()).await?[0].payload.entity_id, expected[0]);
+    selected.finish().await?;
     let cursor = snapshot.finish().await?;
     engine.db.close().await;
     drop(engine);
     let engine = IndexedDBStorageEngine::open(&name).await?;
-    let mut snapshot = engine.state_snapshot(Some(&cursor)).await?;
+    let mut snapshot = engine.state_snapshot(StateScan::Changes(Some(&cursor))).await?;
     assert!(snapshot.next_page(NonZeroUsize::new(10).unwrap()).await?.is_empty());
     snapshot.finish().await?;
+    let active = engine.state_snapshot(StateScan::Changes(None)).await?;
     engine.delete_all().await?;
-    assert!(matches!(engine.state_snapshot(Some(&cursor)).await, Err(RetrievalError::InvalidStateCursor)));
+    assert!(matches!(active.finish().await, Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict)));
+    assert!(matches!(engine.state_snapshot(StateScan::Changes(Some(&cursor))).await, Err(RetrievalError::InvalidStateCursor)));
     IndexedDBStorageEngine::cleanup(&name).await
 }
 
@@ -69,7 +73,7 @@ async fn another_handle_cannot_change_a_paged_snapshot_without_invalidating_it()
     let writer = IndexedDBStorageEngine::open(&name).await?;
     let (state, _) = entity!(3);
     put(&engine, &Clock::default(), &state).await?;
-    let mut snapshot = engine.state_snapshot(None).await?;
+    let mut snapshot = engine.state_snapshot(StateScan::Changes(None)).await?;
     assert_eq!(snapshot.next_page(NonZeroUsize::new(1).unwrap()).await?.len(), 1);
     // Yield beyond the first native transaction's lifetime, then commit
     // through another handle as another tab would.
@@ -89,7 +93,7 @@ async fn state_positions_preserve_integers_above_javascript_number_precision() -
 
     let name = format!("state_cursor_integer_{}", ulid::Ulid::new());
     let engine = IndexedDBStorageEngine::open(&name).await?;
-    let mut counter = CounterCursor::decode(&engine.state_snapshot(None).await?.finish().await?, b"indexeddb")?;
+    let mut counter = CounterCursor::decode(&engine.state_snapshot(StateScan::Changes(None)).await?.finish().await?, b"indexeddb")?;
     counter.position = (1u64 << 53) + 7;
     let before = counter.encode(b"indexeddb");
     let connection = engine.db.get_connection().await;
@@ -112,9 +116,22 @@ async fn state_positions_preserve_integers_above_javascript_number_precision() -
     .await?;
     let (state, _) = entity!(6);
     put(&engine, &Clock::default(), &state).await?;
-    let mut snapshot = engine.state_snapshot(Some(&before)).await?;
+    let mut snapshot = engine.state_snapshot(StateScan::Changes(Some(&before))).await?;
     assert_eq!(snapshot.next_page(NonZeroUsize::new(1).unwrap()).await?[0].payload.entity_id, state.payload.entity_id);
     let after = CounterCursor::decode(&snapshot.finish().await?, b"indexeddb")?;
     assert_eq!(after.position, counter.position + 1);
+    IndexedDBStorageEngine::cleanup(&name).await
+}
+
+#[path = "../../common/tests/support/state_selection.rs"]
+mod selection_cases;
+
+#[wasm_bindgen_test]
+async fn selection_snapshots_match_fetch_ordering_and_membership() -> anyhow::Result<()> {
+    let name = format!("state_selection_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&name).await?;
+    selection_cases::selection_matches_fetch(&engine).await?;
+    selection_cases::selection_rejects_changed_boundary(&engine).await?;
+    selection_cases::selection_tracks_updated_keys(&engine).await?;
     IndexedDBStorageEngine::cleanup(&name).await
 }

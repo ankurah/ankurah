@@ -2,13 +2,12 @@
 
 use std::{num::NonZeroUsize, ops::Bound, sync::Arc};
 
-use ankql::ast::{Resolved, Selection};
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    storage::{StateCursor, StateSnapshot},
+    storage::{StateCursor, StateScan, StateSnapshot, StorageEngine},
 };
 use ankurah_proto::{Attested, EntityId, EntityState, StateFragment};
-use ankurah_storage_common::{selection::LimitedSelection, state::CounterCursor};
+use ankurah_storage_common::state::CounterCursor;
 use async_trait::async_trait;
 
 use crate::{database::Database, error::sled_error, SledStorageEngine};
@@ -61,10 +60,10 @@ fn current(database: &Database) -> Result<CounterCursor, RetrievalError> {
             .state_changes
             .get(key)
             .map_err(|error| match error {
-                sled::Error::CollectionNotFound(_) => RetrievalError::InvalidStateCursor,
+                sled::Error::CollectionNotFound(_) => MutationError::WriteConflict.into(),
                 error => sled_error(error),
             })?
-            .ok_or(RetrievalError::InvalidStateCursor)
+            .ok_or_else(|| RetrievalError::storage("missing canonical state cursor metadata"))
     };
     let incarnation = read(INCARNATION)?.as_ref().try_into().map_err(RetrievalError::storage)?;
     let position = decode_counter(&read(COUNTER)?)?;
@@ -73,10 +72,7 @@ fn current(database: &Database) -> Result<CounterCursor, RetrievalError> {
 
 fn validate(database: &Database, target: CounterCursor) -> Result<(), RetrievalError> {
     let now = current(database)?;
-    if now.incarnation != target.incarnation {
-        return Err(RetrievalError::InvalidStateCursor);
-    }
-    if now.position != target.position {
+    if now != target {
         return Err(MutationError::WriteConflict.into());
     }
     Ok(())
@@ -101,13 +97,22 @@ pub(super) struct SledStateSnapshot {
     target: CounterCursor,
     after: Vec<u8>,
     exhausted: bool,
+    selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
 }
 
 impl SledStateSnapshot {
-    pub(super) async fn begin(engine: &SledStorageEngine, since: Option<&StateCursor>) -> Result<Self, RetrievalError> {
+    pub(super) async fn begin(engine: &SledStorageEngine, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
+        let since = match scan {
+            StateScan::Changes(since) => since.cloned(),
+            StateScan::Selection(selection) => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
+                }
+                None
+            }
+        };
         let database = engine.database.lock().unwrap().clone();
-        let since = since.cloned();
-        tokio::task::spawn_blocking(move || {
+        let mut snapshot = tokio::task::spawn_blocking(move || {
             let guard = database.index_manager.mutation_lock.lock().unwrap();
             let target = current(&database)?;
             let since = target.resume(since.as_ref(), ENGINE)?;
@@ -122,7 +127,23 @@ impl SledStateSnapshot {
                 },
             );
             drop(guard);
-            Ok(Self { database, target, after, exhausted: false })
+            Ok::<_, RetrievalError>(Self { database, target, after, exhausted: false, selected: None })
+        })
+        .await??;
+        if let StateScan::Selection(selection) = scan {
+            let selected = engine.fetch_states(selection).await?;
+            snapshot.validate().await?;
+            snapshot.selected = Some(selected.into_iter());
+        }
+        Ok(snapshot)
+    }
+
+    async fn validate(&self) -> Result<(), RetrievalError> {
+        let database = self.database.clone();
+        let target = self.target;
+        tokio::task::spawn_blocking(move || {
+            let _guard = database.index_manager.mutation_lock.lock().unwrap();
+            validate(&database, target)
         })
         .await?
     }
@@ -131,6 +152,10 @@ impl SledStateSnapshot {
 #[async_trait]
 impl StateSnapshot for SledStateSnapshot {
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        if self.selected.is_some() {
+            self.validate().await?;
+            return Ok(self.selected.as_mut().unwrap().by_ref().take(limit.get()).collect());
+        }
         let database = self.database.clone();
         let target = self.target;
         let after = self.after.clone();
@@ -165,27 +190,6 @@ impl StateSnapshot for SledStateSnapshot {
             let _guard = database.index_manager.mutation_lock.lock().unwrap();
             validate(&database, target)?;
             ids.into_iter().map(|id| load(&database, id)).collect()
-        })
-        .await?
-    }
-
-    async fn limited_states(&mut self, selection: &Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let database = self.database.clone();
-        let target = self.target;
-        let selection = selection.clone();
-        tokio::task::spawn_blocking(move || {
-            let _guard = database.index_manager.mutation_lock.lock().unwrap();
-            validate(&database, target)?;
-            let mut selected = LimitedSelection::new(&selection)?;
-            if selection.limit == Some(0) {
-                return Ok(selected.finish());
-            }
-            for row in database.entities_tree.iter() {
-                let (key, bytes) = row.map_err(sled_error)?;
-                let id = EntityId::from_bytes(key.as_ref().try_into().map_err(RetrievalError::storage)?);
-                selected.consider(Attested::<EntityState>::from_parts(id, bincode::deserialize::<StateFragment>(&bytes)?))?;
-            }
-            Ok(selected.finish())
         })
         .await?
     }

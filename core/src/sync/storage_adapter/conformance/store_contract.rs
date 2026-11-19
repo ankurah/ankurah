@@ -34,7 +34,7 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeOwner<SE, G> {
     async fn new(db: &impl TestDatabase<Engine = SE>, id: &str) -> anyhow::Result<Self> {
         let engine = &db.engine().await?;
         let (id, incarnation) = (TreeId::new(id), Incarnation::mint());
-        let entry = TreeEntry { incarnation, generation: 0, valid: true };
+        let entry = TreeEntry { incarnation, generation: 0, status: entry::Status::Ready };
 
         let mut trx = engine.transaction();
         trx.map_write(vec![MapWrite::Put { map: trees_map(), key: id.entry_key(), value: entry.encode() }]).await?;

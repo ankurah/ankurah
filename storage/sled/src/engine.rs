@@ -119,9 +119,9 @@ impl StorageEngine for SledStorageEngine {
 
     async fn state_snapshot(
         &self,
-        since: Option<&ankurah_core::storage::StateCursor>,
+        scan: ankurah_core::storage::StateScan<'_>,
     ) -> Result<Box<dyn ankurah_core::storage::StateSnapshot>, RetrievalError> {
-        Ok(Box::new(state::SledStateSnapshot::begin(self, since).await?))
+        Ok(Box::new(state::SledStateSnapshot::begin(self, scan).await?))
     }
 
     async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> { SledStorageEngine::list_models(self) }
@@ -142,7 +142,8 @@ impl StorageEngine for SledStorageEngine {
         &self,
         selection: &ankql::ast::Selection<ankql::ast::Resolved>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let plan = ankurah_storage_common::materialization_plan::MaterializationPlan::new(selection);
+        let selection = ankurah_storage_common::selection::deterministic_limit_order(selection);
+        let plan = ankurah_storage_common::materialization_plan::MaterializationPlan::new(&selection);
         if let Some((model, selection)) = plan.indexed_materialization() {
             return match self.materialization(&model)? {
                 Some(materialization) => materialization.fetch_states(&selection).await,
@@ -150,7 +151,7 @@ impl StorageEngine for SledStorageEngine {
             };
         }
         let database = self.database.lock().unwrap().clone();
-        query::fetch(database, selection.clone()).await
+        query::fetch(database, selection.into_owned()).await
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {

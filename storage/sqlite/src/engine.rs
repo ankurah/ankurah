@@ -376,9 +376,9 @@ impl StorageEngine for SqliteStorageEngine {
 
     async fn state_snapshot(
         &self,
-        since: Option<&ankurah_core::storage::StateCursor>,
+        scan: ankurah_core::storage::StateScan<'_>,
     ) -> Result<Box<dyn ankurah_core::storage::StateSnapshot>, RetrievalError> {
-        Ok(Box::new(state::SqliteStateSnapshot::begin(self, since).await?))
+        Ok(Box::new(state::SqliteStateSnapshot::begin(self, scan).await?))
     }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {

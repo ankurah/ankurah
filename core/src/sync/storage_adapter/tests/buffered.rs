@@ -8,7 +8,7 @@ use super::Tree;
 use crate::storage::{MapRead, MapRows, MapSnapshot, MapWrite, StateCursor, StorageEngine, StorageTransaction};
 use crate::sync::conformance::fixtures::{assert_holds, by_number, cached, created, item, rows_now, stores};
 use crate::sync::conformance::in_both_groups;
-use crate::sync::storage_adapter::layout::log;
+use crate::sync::storage_adapter::layout::{entry::Status, log};
 use crate::sync::TreeId;
 use crate::test_utils::TestStorage;
 
@@ -141,7 +141,7 @@ async fn a_rebased_adapter_reads_the_new_incarnations_cache<G: DigestGroup>() ->
     Ok(())
 }
 
-async fn an_initial_build_stays_invalid_until_its_cursor_is_complete<G: DigestGroup>() -> anyhow::Result<()> {
+async fn an_initial_build_stays_private_until_its_cursor_is_complete<G: DigestGroup>() -> anyhow::Result<()> {
     let engine = Arc::new(TestStorage::default());
     let stores = stores(&engine);
     let tree: Tree<G> = created(&stores, &engine, "tree", [item!(1, 1)]).await?;
@@ -151,16 +151,93 @@ async fn an_initial_build_stays_invalid_until_its_cursor_is_complete<G: DigestGr
     let transaction = store.buffered_transaction().await?;
     let working: Tree<G> = DigestTree::create_in(store.clone(), transaction, by_number(), [item!(2, 2)]).await?.landed();
     store.flush().await?;
-    assert!(!store.buffered().base.valid);
+    assert_eq!(store.buffered().base.status, Status::Building);
     assert_holds(&working, &[item!(2, 2)]).await?;
     let opened: Result<Tree<G>, _> = stores.open(&TreeId::new("tree")).await;
-    assert!(matches!(crate::sync::conformance::fixtures::cause(&opened), Some(crate::sync::Error::Invalid(_))));
+    assert!(matches!(crate::sync::conformance::fixtures::cause(&opened), Some(crate::sync::Error::Building(_))));
 
     store.advance(StateCursor::new(vec![2]), 0, 1);
     store.flush().await?;
-    assert!(store.buffered().base.valid);
+    assert_eq!(store.buffered().base.status, Status::Ready);
     let complete: Tree<G> = stores.open(&TreeId::new("tree")).await?;
     assert_holds(&complete, &[item!(2, 2)]).await?;
+    Ok(())
+}
+
+async fn dropping_a_managed_tree_clears_its_member_lookup_and_cursor<G: DigestGroup>() -> anyhow::Result<()> {
+    let engine = Arc::new(TestStorage::default());
+    let stores = stores(&engine);
+    let tree: Tree<G> = created(&stores, &engine, "tree", [item!(1, 1)]).await?;
+    managed(&tree).await?;
+    tree.store().set_member_rows(vec![(vec![1], Some(vec![2]))]);
+    tree.store().flush().await?;
+    let members = tree.store().buffered().base.incarnation.members();
+    let read = MapRead::Get { map: members, keys: vec![Vec::new(), vec![1]] };
+    let mut snapshot = engine.map_snapshot(&[]).await?;
+    let [MapRows::Got(before)]: [_; 1] = snapshot.map_read(vec![read.clone()]).await?.try_into().unwrap() else { panic!("member lookup") };
+    assert!(before.iter().all(Option::is_some));
+    drop(snapshot);
+    let mut trx = engine.transaction();
+    crate::sync::storage_adapter::drop(&mut trx, tree.store().id()).await?;
+    trx.commit().await?.committed()?;
+    let mut snapshot = engine.map_snapshot(&[]).await?;
+    let [MapRows::Got(after)]: [_; 1] = snapshot.map_read(vec![read]).await?.try_into().unwrap() else { panic!("member lookup") };
+    assert!(after.iter().all(Option::is_none));
+    Ok(())
+}
+
+async fn rebuilding_never_reuses_the_previous_members_or_cursor<G: DigestGroup>() -> anyhow::Result<()> {
+    let engine = Arc::new(TestStorage::default());
+    let stores = stores(&engine);
+    let tree: Tree<G> = created(&stores, &engine, "tree", [item!(1, 1)]).await?;
+    managed(&tree).await?;
+    tree.store().set_member_rows(vec![(vec![1], Some(vec![2]))]);
+    tree.store().flush().await?;
+    let mut trx = engine.transaction();
+    let replacement = crate::sync::storage_adapter::rebuild(
+        engine.clone(),
+        tree.store().inner().cache.clone(),
+        &mut trx,
+        TreeId::new("tree"),
+        by_number(),
+        [item!(2, 2)],
+    )
+    .await?;
+    trx.commit().await?.committed()?;
+    let replacement: Tree<G> = replacement.landed();
+    replacement.store().load_buffered(Arc::new(AtomicU64::new(0))).await?;
+    assert!(replacement.store().buffered().cursor.is_none(), "the replacement needs a complete source scan");
+    let working = replacement.store().working();
+    assert_eq!(working.member_rows(&[vec![1]]).await?, vec![None]);
+    Ok(())
+}
+
+async fn a_stale_initializer_cannot_replace_ready_or_building_rows<G: DigestGroup>() -> anyhow::Result<()> {
+    for building in [false, true] {
+        let engine = Arc::new(TestStorage::default());
+        let stores = stores(&engine);
+        let tree: Tree<G> = created(&stores, &engine, "tree", [item!(1, 1)]).await?;
+        managed(&tree).await?;
+        if building {
+            tree.store().clear_buffered();
+            let trx = tree.store().buffered_transaction().await?;
+            DigestTree::create_in(tree.store().clone(), trx, by_number(), [item!(1, 1)]).await?.landed();
+            tree.store().flush().await?;
+        }
+        let mut trx = engine.transaction();
+        let result = crate::sync::storage_adapter::initialize::<_, _, _, _, G, _>(
+            engine.clone(),
+            tree.store().inner().cache.clone(),
+            &mut trx,
+            TreeId::new("tree"),
+            by_number(),
+            [item!(2, 2)],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::MutationError::WriteConflict)));
+        drop(trx);
+        assert_holds(&tree, &[item!(1, 1)]).await?;
+    }
     Ok(())
 }
 
@@ -170,5 +247,8 @@ in_both_groups!(
     deletes_clears_and_transaction_writes_override_cached_rows,
     a_clear_invalidates_other_readers_cached_rows,
     a_rebased_adapter_reads_the_new_incarnations_cache,
-    an_initial_build_stays_invalid_until_its_cursor_is_complete,
+    an_initial_build_stays_private_until_its_cursor_is_complete,
+    dropping_a_managed_tree_clears_its_member_lookup_and_cursor,
+    rebuilding_never_reuses_the_previous_members_or_cursor,
+    a_stale_initializer_cannot_replace_ready_or_building_rows,
 );

@@ -100,7 +100,8 @@ where PA: PolicyAgent
     pub storage: Arc<SE>,
 
     /// Digest trees created by this node's queries and maintained from canonical state.
-    pub(crate) trees: crate::sync::TreeManager<SE>,
+    /// Shared independently so the maintenance worker never retains the Node.
+    pub(crate) trees: Arc<crate::sync::TreeManager<SE>>,
     tree_maintenance: Arc<tokio::sync::Notify>,
 
     pub(crate) entities: WeakEntitySet,
@@ -231,7 +232,7 @@ where
         let node = Node(Arc::new(NodeInner {
             id,
             storage: engine,
-            trees,
+            trees: Arc::new(trees),
             tree_maintenance: Arc::new(tokio::sync::Notify::new()),
             entities: entityset,
             commit_publication_lock,

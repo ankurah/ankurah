@@ -185,9 +185,9 @@ impl StorageEngine for CountEventReads {
 
     async fn state_snapshot(
         &self,
-        since: Option<&ankurah::core::storage::StateCursor>,
+        scan: ankurah::core::storage::StateScan<'_>,
     ) -> Result<Box<dyn ankurah::core::storage::StateSnapshot>, ankurah::error::RetrievalError> {
-        self.inner.state_snapshot(since).await
+        self.inner.state_snapshot(scan).await
     }
 
     async fn get_state(&self, id: proto::EntityId) -> Result<proto::Attested<proto::EntityState>, ankurah::error::RetrievalError> {

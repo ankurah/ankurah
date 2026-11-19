@@ -5,7 +5,7 @@
 //!
 //! - the engine's trees map is `t` alone, and keys each tree's entry by the
 //!   tree's id, as its UTF-8 bytes;
-//! - a tree's rows map is `r`, and its change log `l`, each followed by the
+//! - a tree's rows map is `r`, its change log `l`, and its member lookup `m`, each followed by the
 //!   tree's incarnation, eight bytes big-endian;
 //! - a tree's lock is `k`, followed by the tree's id as its UTF-8 bytes.
 //!
@@ -22,6 +22,7 @@ use crate::storage::{LockName, MapId};
 const TREES: u8 = b't';
 const ROWS: u8 = b'r';
 const LOG: u8 = b'l';
+const MEMBERS: u8 = b'm';
 const LOCK: u8 = b'k';
 
 /// A tree's name among one engine's digest trees, which its owner chooses.
@@ -67,6 +68,9 @@ impl Incarnation {
 
     /// The map that holds the tree's change log.
     pub(in crate::sync::storage_adapter) fn log(self) -> MapId { MapId::new(tagged(LOG, &self.to_bytes())) }
+
+    /// The manager's member keys, heads and continuation cursor.
+    pub(in crate::sync::storage_adapter) fn members(self) -> MapId { MapId::new(tagged(MEMBERS, &self.to_bytes())) }
 
     /// Its eight bytes, big-endian.
     pub(in crate::sync::storage_adapter) fn to_bytes(self) -> [u8; 8] { self.0.to_be_bytes() }

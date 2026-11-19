@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ankql::ast::{Predicate, Resolved, Selection};
+use ankurah_core::selection::filter::membership_match;
 use ankurah_proto::{EntityId, ModelId};
 
 /// The materializations participating in a selection. Membership checks retain
@@ -54,27 +55,6 @@ impl<'a> MaterializationPlan<'a> {
         let mut selection = self.selection.clone();
         selection.predicate = in_materialization(&selection.predicate, model);
         Some((*model, selection))
-    }
-}
-
-// None means property values are needed. Negation preserves that uncertainty.
-fn membership_match(predicate: &Predicate<Resolved>, member: &impl Fn(&ModelId) -> bool) -> Option<bool> {
-    match predicate {
-        Predicate::MemberOf(model) => Some(member(model)),
-        Predicate::True => Some(true),
-        Predicate::False => Some(false),
-        Predicate::Not(inner) => membership_match(inner, member).map(|value| !value),
-        Predicate::And(left, right) => match (membership_match(left, member), membership_match(right, member)) {
-            (Some(false), _) | (_, Some(false)) => Some(false),
-            (Some(true), Some(true)) => Some(true),
-            _ => None,
-        },
-        Predicate::Or(left, right) => match (membership_match(left, member), membership_match(right, member)) {
-            (Some(true), _) | (_, Some(true)) => Some(true),
-            (Some(false), Some(false)) => Some(false),
-            _ => None,
-        },
-        _ => None,
     }
 }
 

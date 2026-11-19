@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, warn};
 
-use crate::error::{NodeDropped, RequestError, RetrievalError};
+use crate::error::{MutationError, NodeDropped, RequestError, RetrievalError};
 use crate::node::ContextData;
 use crate::session::SessionSet;
 use crate::util::cancel_flag::CancelFlag;
@@ -491,6 +491,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         // Evaluate retriability at failure time
         let is_retryable = match &error {
+            RetrievalError::MutationError(error) if matches!(**error, MutationError::WriteConflict) => true,
             // Retrieval errors from fetching are generally not retryable
             RetrievalError::RequestError(req_err) => match req_err {
                 RequestError::PeerNotConnected => true,
@@ -628,7 +629,7 @@ mod tests {
     /// Mock message sender for testing
     #[derive(Debug)]
     struct MockMessageSender<CD: ContextData> {
-        next_error: Arc<Mutex<Option<RequestError>>>,
+        next_error: Arc<Mutex<Option<RetrievalError>>>,
         sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)>>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
@@ -648,7 +649,7 @@ mod tests {
             }
         }
 
-        fn set_fail_next(&self, error: RequestError) { *self.next_error.lock().unwrap() = Some(error); }
+        fn set_fail_next(&self, error: impl Into<RetrievalError>) { *self.next_error.lock().unwrap() = Some(error.into()); }
 
         fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)> {
             self.sent_requests.lock().unwrap().clone()
@@ -682,7 +683,7 @@ mod tests {
             }
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
-                Err(RetrievalError::RequestError(error))
+                Err(error)
             } else {
                 // Mock successful subscription (fetch, subscribe, apply, store all succeeded)
                 Ok(())
@@ -760,6 +761,26 @@ mod tests {
     async fn settle() {
         for _ in 0..4 {
             tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_conflict_retries_without_retrying_permanent_mutation_errors() {
+        for (error, retry) in [(MutationError::WriteConflict, true), (MutationError::InvalidUpdate("invalid state"), false)] {
+            let (relay, sender, peer) = connected_relay();
+            sender.set_fail_next(error);
+            let query = proto::QueryId::new();
+            subscribe(&relay, query);
+            settle().await;
+            assert_eq!(sender.get_sent_requests().len(), 1);
+            assert!(matches!(relay.get_status(query), Some(Status::PendingRemote)) == retry);
+            assert!(matches!(relay.get_status(query), Some(Status::Failed)) == !retry);
+            relay.setup_remote_subscriptions();
+            settle().await;
+            assert_eq!(sender.get_sent_requests().len(), if retry { 2 } else { 1 });
+            if retry {
+                assert!(matches!(relay.get_status(query), Some(Status::Established(found, 1)) if found == peer));
+            }
         }
     }
 

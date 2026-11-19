@@ -2,13 +2,12 @@
 
 use std::num::NonZeroUsize;
 
-use ankql::ast::{Resolved, Selection};
 use ankurah_core::{
     error::{MutationError, RetrievalError},
-    storage::{StateCursor, StateSnapshot},
+    storage::{StateCursor, StateScan, StateSnapshot, StorageEngine},
 };
 use ankurah_proto::{Attested, EntityId, EntityState};
-use ankurah_storage_common::{selection::LimitedSelection, state::CounterCursor};
+use ankurah_storage_common::state::CounterCursor;
 use async_trait::async_trait;
 use futures::StreamExt;
 use js_sys::{Array, Uint8Array};
@@ -20,6 +19,7 @@ use super::{completed, entity_state_from_object, AbortUnfinishedTransaction};
 use crate::{
     database::Database,
     util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, require::WBGRequire},
+    IndexedDBStorageEngine,
 };
 
 pub(crate) const META: &str = "_ankurah_meta";
@@ -57,10 +57,7 @@ async fn current(transaction: &IdbTransaction) -> Result<CounterCursor, Retrieva
 
 async fn validate(transaction: &IdbTransaction, target: CounterCursor) -> Result<(), RetrievalError> {
     let now = current(transaction).await?;
-    if now.incarnation != target.incarnation {
-        return Err(RetrievalError::InvalidStateCursor);
-    }
-    if now.position != target.position {
+    if now != target {
         return Err(MutationError::WriteConflict.into());
     }
     Ok(())
@@ -137,10 +134,21 @@ pub(super) struct IndexedDbStateSnapshot {
     database: Database,
     target: CounterCursor,
     after: (String, String),
+    selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
 }
 
 impl IndexedDbStateSnapshot {
-    pub(super) async fn begin(database: Database, since: Option<&StateCursor>) -> Result<Self, RetrievalError> {
+    pub(super) async fn begin(engine: &IndexedDBStorageEngine, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
+        let since = match scan {
+            StateScan::Changes(since) => since,
+            StateScan::Selection(selection) => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
+                }
+                None
+            }
+        };
+        let database = engine.db.clone();
         let connection = database.get_connection().await;
         let target = SendWrapper::new(async move {
             let transaction = connection.transaction_with_str(META).require("begin state snapshot")?;
@@ -151,7 +159,24 @@ impl IndexedDbStateSnapshot {
         .await?;
         let since = target.resume(since, ENGINE)?;
         let after = since.map_or((String::new(), String::new()), |position| (format!("{position:016x}"), "\u{ffff}".into()));
-        Ok(Self { database, target, after })
+        let mut snapshot = Self { database, target, after, selected: None };
+        if let StateScan::Selection(selection) = scan {
+            let selected = engine.fetch_states(selection).await?;
+            snapshot.validate().await?;
+            snapshot.selected = Some(selected.into_iter());
+        }
+        Ok(snapshot)
+    }
+
+    async fn validate(&self) -> Result<(), RetrievalError> {
+        let transaction = self.transaction().await?;
+        let target = self.target;
+        SendWrapper::new(async move {
+            let _abort = AbortUnfinishedTransaction((*transaction).clone());
+            validate(&transaction, target).await?;
+            completed(&transaction).await
+        })
+        .await
     }
 
     async fn transaction(&self) -> Result<SendWrapper<IdbTransaction>, RetrievalError> {
@@ -164,6 +189,10 @@ impl IndexedDbStateSnapshot {
 #[async_trait]
 impl StateSnapshot for IndexedDbStateSnapshot {
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        if self.selected.is_some() {
+            self.validate().await?;
+            return Ok(self.selected.as_mut().unwrap().by_ref().take(limit.get()).collect());
+        }
         let transaction = self.transaction().await?;
         let target = self.target;
         let after = self.after.clone();
@@ -215,37 +244,6 @@ impl StateSnapshot for IndexedDbStateSnapshot {
             }
             completed(&transaction).await?;
             Ok(states)
-        })
-        .await
-    }
-
-    async fn limited_states(&mut self, selection: &Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let transaction = self.transaction().await?;
-        let target = self.target;
-        SendWrapper::new(async move {
-            let _abort = AbortUnfinishedTransaction((*transaction).clone());
-            validate(&transaction, target).await?;
-            let mut selected = LimitedSelection::new(selection)?;
-            if selection.limit == Some(0) {
-                completed(&transaction).await?;
-                return Ok(selected.finish());
-            }
-            let request =
-                transaction.object_store("entities").require("get snapshot entities")?.open_cursor().require("scan snapshot entities")?;
-            let mut stream = cb_stream(&request, "success", "error");
-            while let Some(result) = stream.next().await {
-                let value = result.require("read snapshot entity")?;
-                if value.is_null() || value.is_undefined() {
-                    break;
-                }
-                let cursor = value.dyn_into::<IdbCursorWithValue>().require("cast snapshot entity cursor")?;
-                let key = cursor.key().require("get entity key")?.as_string().require("entity key is text")?;
-                let id = EntityId::from_base64(key).map_err(RetrievalError::storage)?;
-                selected.consider(entity_state_from_object(id, &Object::new(cursor.value().require("get snapshot entity")?))?)?;
-                cursor.continue_().require("advance snapshot entities")?;
-            }
-            completed(&transaction).await?;
-            Ok(selected.finish())
         })
         .await
     }

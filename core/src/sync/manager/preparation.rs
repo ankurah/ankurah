@@ -42,8 +42,8 @@ impl<SE: StorageEngine + 'static> TreeManager<SE, Ristretto255> {
         let tree = self.open_locked(selection.clone(), false).await?;
         for attempt in 0..3 {
             let result = async {
-                let (working, mut snapshot, full, initial) = self.begin_reconciliation(&tree, false).await?;
-                let changed = self.apply_snapshot(&working, &selection, &mut *snapshot, full, initial).await?;
+                let (working, mut snapshot, _full, initial) = self.begin_reconciliation(&tree, &selection, false).await?;
+                let changed = self.apply_snapshot(&working, &selection, &mut *snapshot, initial).await?;
                 let mut stream = working.view().range(..).map_err(open_failure)?;
                 let mut known_matches = Vec::new();
                 let mut spans = Vec::new();

@@ -4,9 +4,9 @@ use ankurah_proto::{Attested, EntityId, EntityState, PropertyId};
 use ankurah_storage_common::{
     materialization_join::{MaterializationJoin, MaterializationTable},
     materialization_plan::MaterializationPlan,
-    selection::select_states,
+    selection::{deterministic_limit_order, select_states},
 };
-use tokio_postgres::types::ToSql;
+use tokio_postgres::{types::ToSql, GenericClient};
 
 use crate::{
     load_states, read_snapshot,
@@ -23,6 +23,8 @@ pub(super) struct Query {
 
 impl Query {
     pub async fn prepare(engine: &Postgres, selection: &Selection<Resolved>) -> Result<Self, RetrievalError> {
+        let selection = deterministic_limit_order(selection);
+        let selection = selection.as_ref();
         let plan = MaterializationPlan::new(selection);
         let properties: Vec<_> = selection.referenced_properties().into_iter().collect();
         let existing = engine.list_materializations().await?;
@@ -63,7 +65,7 @@ impl Query {
         })
     }
 
-    async fn read_ids(&self, snapshot: &tokio_postgres::Transaction<'_>) -> Result<Vec<EntityId>, RetrievalError> {
+    async fn read_ids<C: GenericClient + Sync>(&self, snapshot: &C) -> Result<Vec<EntityId>, RetrievalError> {
         let params: Vec<&(dyn ToSql + Sync)> = self.params.iter().map(|value| value.as_ref() as _).collect();
         snapshot
             .query(&self.sql, &params)
@@ -78,8 +80,13 @@ impl Query {
         let mut client = engine.pool.get().await.map_err(RetrievalError::storage)?;
         engine.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
         let snapshot = read_snapshot(&mut client).await?;
-        let ids = self.read_ids(&snapshot).await?;
-        select_states(load_states(&snapshot, &ids).await?, &self.remaining)
+        self.states_in(&snapshot).await
+    }
+
+    /// Run the prepared query and hydrate its states in the caller's read view.
+    pub(super) async fn states_in<C: GenericClient + Sync>(&self, snapshot: &C) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let ids = self.read_ids(snapshot).await?;
+        select_states(load_states(snapshot, &ids).await?, &self.remaining)
     }
 }
 

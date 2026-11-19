@@ -160,6 +160,7 @@ impl LiveQueryInner {
     /// Install or refresh the resolved query in the reactor using local storage.
     /// Used for local initialization and after a peer's initial rows are applied; ignores superseded versions.
     pub(super) async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
+        self.context.node()?.check_not_halted()?;
         let Some((selection, stored_version)) = self.selection.value() else {
             return Err(RetrievalError::Other("live query activated before its selection was resolved".into()));
         };

@@ -1,5 +1,4 @@
-//! An owner's storage transaction, lent to one digest tree as the crate's
-//! store transaction, once the tree's lock is held.
+//! One digest-tree transaction over locked storage or a private managed version.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -12,16 +11,15 @@ use super::{EngineAdapter, TreeLanding};
 use crate::storage::{MapRead, MapWrite, ScanDirection, StorageEngine, StorageTransaction};
 use crate::sync::error::transaction_store_failure;
 use crate::sync::storage_adapter::cache::admits;
-use crate::sync::storage_adapter::layout::entry::TreeEntry;
+use crate::sync::storage_adapter::layout::entry::{Status, TreeEntry};
 use crate::sync::storage_adapter::layout::log::{self, Changed};
 use crate::sync::storage_adapter::layout::names::trees_map;
 use crate::sync::{Error, TreePart};
 
 /// Adapts the owner's storage transaction to [`StoreTrx`] for one tree's
-/// creation or commit, once the transaction holds the tree's lock. Its reads
-/// see the tree's rows as the last landed commit left them, from the cache
-/// where it keeps them at that generation, and then as its own write leaves
-/// them, which only storage holds.
+/// creation or commit. Direct writes hold the tree's storage lock; managed
+/// writes modify a private version whose durable base is checked again at
+/// flush. Both read their own writes over one consistent starting version.
 pub struct StorageEngineTrx<'a, SE: StorageEngine, K, L, G> {
     store: EngineAdapter<SE, K, L, G>,
     trx: Option<&'a mut (dyn StorageTransaction + 'a)>,
@@ -180,7 +178,7 @@ where
             });
         }
 
-        let entry = TreeEntry { incarnation: tree.incarnation, generation, valid: true };
+        let entry = TreeEntry { incarnation: tree.incarnation, generation, status: Status::Ready };
         writes.push(MapWrite::Put { map: trees_map(), key: tree.id.entry_key(), value: entry.encode() });
 
         if self.generation.is_some() {

@@ -98,13 +98,62 @@ where
     G: DigestGroup,
     M: Member<K, Id = I, Payload = L>,
 {
+    replace(storage, cache, trx, id, key_spec, members, false).await
+}
+
+/// Initialize a missing or invalid managed tree. A concurrent completed or
+/// partial build wins; it must never be replaced by an earlier observation.
+pub(in crate::sync) async fn initialize<SE, K, I, L, G, M>(
+    storage: Arc<SE>,
+    cache: Arc<StorageCache>,
+    trx: &mut SE::Transaction<'_>,
+    id: TreeId,
+    key_spec: KeySpec<K>,
+    members: impl IntoIterator<Item = M>,
+) -> Result<Created<K, I, L, G, EngineAdapter<SE, K, L, G>>, MutationError>
+where
+    SE: StorageEngine + 'static,
+    K: Encode + Clone + PartialEq + Send + Sync + 'static,
+    I: MemberId,
+    L: Encode + Payload,
+    G: DigestGroup,
+    M: Member<K, Id = I, Payload = L>,
+{
+    replace(storage, cache, trx, id, key_spec, members, true).await
+}
+
+async fn replace<SE, K, I, L, G, M>(
+    storage: Arc<SE>,
+    cache: Arc<StorageCache>,
+    trx: &mut SE::Transaction<'_>,
+    id: TreeId,
+    key_spec: KeySpec<K>,
+    members: impl IntoIterator<Item = M>,
+    only_invalid: bool,
+) -> Result<Created<K, I, L, G, EngineAdapter<SE, K, L, G>>, MutationError>
+where
+    SE: StorageEngine + 'static,
+    K: Encode + Clone + PartialEq + Send + Sync + 'static,
+    I: MemberId,
+    L: Encode + Payload,
+    G: DigestGroup,
+    M: Member<K, Id = I, Payload = L>,
+{
     let members: Vec<M> = members.into_iter().collect();
     let mut trx = PoisonGuard::new(trx);
 
     let found = trx.map_lock_and_read(&[id.lock()], vec![entry::read([&id])]).await?;
     let previous = entry::found_one(&id, found)?;
+    if only_invalid && previous.is_some_and(|entry| entry.status != entry::Status::Invalid) {
+        return Err(MutationError::WriteConflict);
+    }
     let incarnation = previous.map_or_else(Incarnation::mint, |entry| entry.incarnation);
-    let store = EngineAdapter::new(Inner::new(storage, cache, id, incarnation));
+    if previous.is_some() {
+        // Replacement rows no longer represent the old member lookup or cursor.
+        // Clear them in this commit, including if the manager stops before catch-up.
+        trx.map_write(vec![MapWrite::Clear { map: incarnation.members() }]).await?;
+    }
+    let store = EngineAdapter::new(Inner::new(storage, cache, id.clone(), incarnation));
     let lent = StorageEngineTrx::new(store.clone(), &mut *trx, previous.map(|entry| entry.generation), BTreeMap::new());
     let rebuilding = match previous {
         Some(_) => DigestTree::rebuild_in(store, lent, key_spec, members).await,
@@ -112,15 +161,24 @@ where
     };
 
     match rebuilding {
-        Ok(created) => Ok(trx.complete(created)),
+        Ok(created) => {
+            if only_invalid {
+                let found = trx.map_read(vec![entry::read([&id])]).await?;
+                let entry = entry::found_one(&id, found)?.ok_or_else(|| Error::NoSuchTree(id.clone()))?;
+                let entry = entry::TreeEntry { status: entry::Status::Building, ..entry };
+                trx.map_write(vec![MapWrite::Put { map: trees_map(), key: id.entry_key(), value: entry.encode() }]).await?;
+            }
+            Ok(trx.complete(created))
+        }
         Err(error) => Err(change_failure(error)),
     }
 }
 
 /// The tree named `id`, at its current incarnation, read in a snapshot of
 /// its own: [`Error::NoSuchTree`] where there is none, and
-/// [`Error::Invalid`] for a tree marked invalid, which doesn't
-/// open. A snapshot that fails retryably fails the opening with the
+/// [`Error::Invalid`] after refused maintenance, and [`Error::Building`] for
+/// incomplete initial membership. Neither opens for ordinary reads.
+/// A snapshot that fails retryably fails the opening with the
 /// engine's own error.
 pub async fn open<SE, K, I, L, G>(
     storage: Arc<SE>,
@@ -143,15 +201,50 @@ where
     };
 
     let entry = entry::found_one(id, found)?.ok_or_else(|| Error::NoSuchTree(id.clone()))?;
-    if !entry.valid {
-        return Err(Error::Invalid(id.clone()).into());
+    match entry.status {
+        entry::Status::Ready => {}
+        entry::Status::Invalid => return Err(Error::Invalid(id.clone()).into()),
+        entry::Status::Building => return Err(Error::Building(id.clone()).into()),
     }
 
     let store = EngineAdapter::new(Inner::new(storage, cache, id.clone(), entry.incarnation));
     DigestTree::open(store).await.map_err(open_failure)
 }
 
-/// Drop the tree named `id` through `trx`: its entry, rows and change log
+/// Attach a manager to Ready or resumable Building membership. Invalid trees
+/// still require initialization. The caller must reconcile before publishing
+/// the returned tree to readers.
+pub(in crate::sync) async fn open_managed<SE, K, I, L, G>(
+    storage: Arc<SE>,
+    cache: Arc<StorageCache>,
+    id: &TreeId,
+    publication: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<DigestTree<K, I, L, G, EngineAdapter<SE, K, L, G>>, RetrievalError>
+where
+    SE: StorageEngine + 'static,
+    K: Encode + Clone + Send + Sync + 'static,
+    I: MemberId,
+    L: Encode + Payload,
+    G: DigestGroup,
+{
+    let found = {
+        let mut snapshot = storage.map_snapshot(&[id.lock()]).await?;
+        snapshot.map_read(vec![entry::read([id])]).await?
+    };
+    let entry = entry::found_one(id, found)?.ok_or_else(|| Error::NoSuchTree(id.clone()))?;
+    if entry.status == entry::Status::Invalid {
+        return Err(Error::Invalid(id.clone()).into());
+    }
+    let store = EngineAdapter::new(Inner::new(storage, cache, id.clone(), entry.incarnation));
+    store.load_buffered(publication.clone()).await?;
+    // Opening metadata is internal maintenance, before the manager has made
+    // this version current for readers. Restore its publication guard after it opens.
+    let tree = DigestTree::open(store.working()).await.map_err(open_failure)?;
+    *tree.store().inner.publication.lock().unwrap() = Some(publication);
+    Ok(tree)
+}
+
+/// Drop the tree named `id` through `trx`: its entry, rows, change log and member lookup
 /// go when `trx` commits, and its open handles fail their next use.
 ///
 /// It takes the tree's lock, and finds a tree under `id`, or fails with
@@ -169,6 +262,7 @@ pub async fn drop(trx: &mut dyn StorageTransaction, id: &TreeId) -> Result<(), M
         Ok(Some(entry)) => {
             writes.push(MapWrite::Clear { map: entry.incarnation.rows() });
             writes.push(MapWrite::Clear { map: entry.incarnation.log() });
+            writes.push(MapWrite::Clear { map: entry.incarnation.members() });
         }
 
         Err(Error::Damaged { .. }) => {}

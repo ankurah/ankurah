@@ -39,7 +39,7 @@ pub(crate) trait DynContextInner: LocalEntitySource {
     /// Shared by `Context::fetch` and livequery gap filling.
     async fn fetch_entities(&self, args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError>;
 
-    /// Retain the existing digest-tree view while a live query uses this selection.
+    /// Retain the digest-tree view for a live query's already policy-scoped selection.
     /// Its concrete storage engine is erased at the same boundary as this context.
     async fn digest_tree(&self, selection: Selection<Resolved>) -> Result<Box<dyn Send + Sync>, RetrievalError>;
 

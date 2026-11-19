@@ -1,8 +1,8 @@
 //! A tree's entry in the engine's trees map: which incarnation of the tree is
-//! current, the generation its rows are at, and whether it is valid.
+//! current, the generation its rows are at, and its maintenance status.
 //!
 //! An entry is seventeen bytes: one that says whether the tree is valid (0)
-//! or marked invalid (1), then its incarnation, then its generation, each
+//! invalid (1), or still being built (2), then its incarnation and generation, each
 //! eight bytes big-endian.
 
 use super::names::{trees_map, Incarnation, TreeId};
@@ -21,26 +21,31 @@ pub(in crate::sync::storage_adapter) struct TreeEntry {
     /// is generation 0.
     pub(in crate::sync::storage_adapter) generation: u64,
 
-    /// Whether the tree is in step with its owner. A tree that refused a
-    /// change is marked invalid, and normal reads and changes are refused
-    /// until it is rebuilt or dropped and created again.
-    pub(in crate::sync::storage_adapter) valid: bool,
+    pub(in crate::sync::storage_adapter) status: Status,
 }
 
-const VALID: u8 = 0;
-const INVALID: u8 = 1;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(in crate::sync::storage_adapter) enum Status {
+    Ready = 0,
+    /// Refused maintenance requires replacement, not continuation.
+    Invalid = 1,
+    /// Partial initial membership can be resumed by a full canonical scan.
+    /// Ordinary readers cannot use it until a completed cursor is published.
+    Building = 2,
+}
 
 impl TreeEntry {
     /// `entry`, the tree's entry as a read found it, if a handle of
     /// `incarnation` may read and change the tree: `None` when the tree is
-    /// retired, its entry absent, of another incarnation, or marked invalid.
+    /// retired, its entry absent, of another incarnation, invalid, or still building.
     pub(in crate::sync::storage_adapter) fn current(entry: Option<Self>, incarnation: Incarnation) -> Option<Self> {
-        entry.filter(|entry| entry.incarnation == incarnation && entry.valid)
+        entry.filter(|entry| entry.incarnation == incarnation && entry.status == Status::Ready)
     }
 
     pub(in crate::sync::storage_adapter) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(17);
-        bytes.push(if self.valid { VALID } else { INVALID });
+        bytes.push(self.status as u8);
         bytes.extend_from_slice(&self.incarnation.to_bytes());
         bytes.extend_from_slice(&self.generation.to_be_bytes());
 
@@ -53,13 +58,14 @@ impl TreeEntry {
         let (incarnation, generation) = rest.split_first_chunk::<8>()?;
         let generation: [u8; 8] = generation.try_into().ok()?;
 
-        let valid = match validity {
-            VALID => true,
-            INVALID => false,
+        let status = match validity {
+            0 => Status::Ready,
+            1 => Status::Invalid,
+            2 => Status::Building,
             _ => return None,
         };
 
-        Some(Self { incarnation: Incarnation::from_bytes(*incarnation), generation: u64::from_be_bytes(generation), valid })
+        Some(Self { incarnation: Incarnation::from_bytes(*incarnation), generation: u64::from_be_bytes(generation), status })
     }
 }
 
@@ -104,7 +110,7 @@ mod tests {
 
     #[test]
     fn an_entry_decodes_to_itself_and_nothing_else_decodes() {
-        let entry = TreeEntry { incarnation: Incarnation::from_bytes([1, 2, 3, 4, 5, 6, 7, 8]), generation: 9, valid: false };
+        let entry = TreeEntry { incarnation: Incarnation::from_bytes([1, 2, 3, 4, 5, 6, 7, 8]), generation: 9, status: Status::Invalid };
         let bytes = entry.encode();
 
         assert_eq!(bytes, [1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 9]);
@@ -112,6 +118,7 @@ mod tests {
 
         assert_eq!(TreeEntry::decode(&bytes[..16]), None, "a truncated entry");
         assert_eq!(TreeEntry::decode(&[bytes.as_slice(), &[0]].concat()), None, "an entry with a byte to spare");
-        assert_eq!(TreeEntry::decode(&[[2].as_slice(), &bytes[1..]].concat()), None, "an entry neither valid nor invalid");
+        assert_eq!(TreeEntry::decode(&[[2].as_slice(), &bytes[1..]].concat()), Some(TreeEntry { status: Status::Building, ..entry }));
+        assert_eq!(TreeEntry::decode(&[[3].as_slice(), &bytes[1..]].concat()), None, "an unknown status");
     }
 }

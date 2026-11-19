@@ -433,17 +433,19 @@ mod tests {
             storage.set_state(state);
             let (entered, entered_rx) = tokio::sync::oneshot::channel();
             let (release, release_rx) = tokio::sync::oneshot::channel();
-            storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
+            *storage.hold_state_snapshot.lock().unwrap() = Some((entered, release_rx));
             let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
             node.system.wait_system_ready().await?;
             // A context built directly skips the readiness check, so this query waits on the catalog.
             let query = Context::new(node.clone(), DEFAULT_CONTEXT).query::<PublicationModelView>(CACHED_TRUE)?;
             entered_rx.await?;
+            let mut initialized = Box::pin(query.wait_initialized());
+            assert!(futures::poll!(&mut initialized).is_pending());
             release.send(()).unwrap();
 
             let error = tokio::time::timeout(Duration::from_secs(2), node.wait_ready()).await?.unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
-            let error = tokio::time::timeout(Duration::from_secs(2), query.wait_initialized()).await?.unwrap_err();
+            let error = tokio::time::timeout(Duration::from_secs(2), initialized).await?.unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
             assert!(node.context(DEFAULT_CONTEXT).is_err());
             assert!(matches!(node.state().value(), crate::NodeState::Halted(crate::error::NodeHaltReason::CatalogLoad(_))));

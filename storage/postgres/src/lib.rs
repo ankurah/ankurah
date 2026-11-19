@@ -15,7 +15,7 @@ use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     schema::CatalogResolver,
     storage::{
-        transaction_call, CommittedEntityWrite, LockName, MapRead, MapRows, MapWrite, StateCursor, StateSnapshot, StorageCommitOutcome,
+        transaction_call, CommittedEntityWrite, LockName, MapRead, MapRows, MapWrite, StateScan, StateSnapshot, StorageCommitOutcome,
         StorageCommitResult, StorageEngine, StorageTransaction,
     },
 };
@@ -489,8 +489,8 @@ impl StorageEngine for Postgres {
         query::Query::prepare(self, selection).await?.states(self).await
     }
 
-    async fn state_snapshot(&self, since: Option<&StateCursor>) -> Result<Box<dyn StateSnapshot>, RetrievalError> {
-        Ok(Box::new(state::Snapshot::begin(self, since).await?))
+    async fn state_snapshot(&self, scan: StateScan<'_>) -> Result<Box<dyn StateSnapshot>, RetrievalError> {
+        Ok(Box::new(state::Snapshot::begin(self, scan).await?))
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
@@ -662,7 +662,7 @@ async fn read_snapshot(client: &mut tokio_postgres::Client) -> Result<tokio_post
         .map_err(RetrievalError::storage)
 }
 
-async fn load_states(client: &tokio_postgres::Transaction<'_>, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+async fn load_states<C: GenericClient + Sync>(client: &C, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }

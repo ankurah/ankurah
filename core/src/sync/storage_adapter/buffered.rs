@@ -33,15 +33,13 @@ pub(in crate::sync) struct Buffered {
 impl Buffered {
     pub(in crate::sync) fn has_writes(&self) -> bool { !self.writes.is_empty() }
 
+    pub(in crate::sync) fn is_building(&self) -> bool { self.base.status == entry::Status::Building }
+
     fn empty(base: TreeEntry, cursor: Option<StateCursor>, epoch: u64) -> Self {
         Self { base, writes: PendingWrites::default(), cursor, epoch, changes: 0, dirty_since: None }
     }
 
-    fn members(&self) -> MapId {
-        let mut name = vec![b'm'];
-        name.extend(self.base.incarnation.to_bytes());
-        MapId::new(name)
-    }
+    fn members(&self) -> MapId { self.base.incarnation.members() }
 }
 
 impl<SE, K, L, G> EngineAdapter<SE, K, L, G>
@@ -56,10 +54,11 @@ where
     pub(in crate::sync) async fn load_buffered(&self, publication: Arc<AtomicU64>) -> Result<(), RetrievalError> {
         let mut read = self.inner.storage.map_snapshot(&[self.inner.lock.clone()]).await?;
         let found = read.map_read(vec![entry::read([&self.inner.id])]).await?;
-        let base = entry::found_one(&self.inner.id, found)?.ok_or_else(|| Error::NoSuchTree(self.inner.id.clone()))?;
-        if !base.valid {
-            return Err(Error::Invalid(self.inner.id.clone()).into());
-        }
+        // The manager has just opened or rebuilt this tree. Losing that base
+        // before loading it is competing maintenance, not a permanent failure.
+        let base = entry::found_one(&self.inner.id, found)?
+            .filter(|base| base.status != entry::Status::Invalid)
+            .ok_or(MutationError::WriteConflict)?;
         // Loading a durable base does not establish that it has caught up.
         let mut buffered = Buffered::empty(base, None, publication.load(Ordering::Acquire).wrapping_sub(1));
         let answers = read.map_read(vec![MapRead::Get { map: buffered.members(), keys: vec![Vec::new()] }]).await?;
@@ -184,10 +183,14 @@ where
         }
         let generation =
             version.base.generation.checked_add(1).ok_or_else(|| RetrievalError::InvalidState("tree generation exhausted".into()))?;
-        // Initial builds may flush bounded batches before their source scan
-        // finishes. Only the private working adapter may read those generations;
-        // a durable cursor makes the completed tree available to other openers.
-        let base = TreeEntry { generation, valid: version.cursor.is_some(), ..version.base };
+        // Initial builds persist resumable batches. Only manager-owned adapters
+        // may read them; a complete cursor makes the tree available to ordinary
+        // openers. Another builder continues these rows instead of erasing them.
+        let base = TreeEntry {
+            generation,
+            status: if version.cursor.is_some() { entry::Status::Ready } else { entry::Status::Building },
+            ..version.base
+        };
         let mut pending = version.writes.clone();
         let mut writes = Vec::new();
         let mut changed = Vec::new();

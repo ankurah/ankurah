@@ -73,6 +73,28 @@ impl<T: Filterable> ValueLookup<Resolved> for T {
     }
 }
 
+/// The predicate result when membership alone determines it; `None` means
+/// property values are still needed. Negation preserves that uncertainty.
+pub fn membership_match(predicate: &Predicate<Resolved>, member: &impl Fn(&ankurah_proto::ModelId) -> bool) -> Option<bool> {
+    match predicate {
+        Predicate::MemberOf(model) => Some(member(model)),
+        Predicate::True => Some(true),
+        Predicate::False => Some(false),
+        Predicate::Not(inner) => membership_match(inner, member).map(|value| !value),
+        Predicate::And(left, right) => match (membership_match(left, member), membership_match(right, member)) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        },
+        Predicate::Or(left, right) => match (membership_match(left, member), membership_match(right, member)) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn evaluate_expr<S: Stage, I: ValueLookup<S>>(item: &I, expr: &Expr<S>) -> Result<ExprOutput<Value>, Error> {
     match expr {
         Expr::Placeholder => Err(Error::UnsupportedExpression("Placeholder values must be replaced before filtering")),

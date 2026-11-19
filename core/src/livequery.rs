@@ -1,5 +1,6 @@
 use crate::context::DynContextInner;
 use crate::internal::prelude::*;
+use crate::reactor::PreNotifyHook;
 use ankql::ast::{Resolved, Selection};
 use ankurah_signals::Read;
 use futures::FutureExt;
@@ -85,13 +86,9 @@ impl EntityLiveQuery {
         self.0.selection.set_before_notify(Some((selection.clone(), version)), || {
             let has_relay = self.0.context.subscribe_remote_query(self, selection, version)?;
             if cached || !has_relay {
-                let inner = self.0.clone();
+                let query = self.weak();
                 crate::task::spawn(async move {
-                    match inner.activate(version).await {
-                        Ok(()) if !has_relay => inner.mark_durable_answered(version),
-                        Ok(()) => {}
-                        Err(error) => inner.fail_initialization(version, error),
-                    }
+                    query.activate(version, !has_relay).await;
                 });
             }
             drop(state);
@@ -134,22 +131,39 @@ pub struct WeakEntityLiveQuery(Weak<LiveQueryInner>);
 
 impl WeakEntityLiveQuery {
     pub fn upgrade(&self) -> Option<EntityLiveQuery> { self.0.upgrade().map(EntityLiveQuery) }
+
+    /// Snapshot conflicts leave initialization pending. Wait without retaining
+    /// the query, so dropping or replacing it also ends its retries.
+    async fn activate(&self, version: u32, durable: bool) {
+        let mut delay = std::time::Duration::from_millis(50);
+        loop {
+            let Some(inner) = self.0.upgrade() else { return };
+            if !inner.as_ref().is_current(version) {
+                return;
+            }
+            match inner.activate(version).await {
+                Ok(()) => {
+                    if durable {
+                        inner.mark_durable_answered(version);
+                    }
+                    return;
+                }
+                Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict) => {}
+                Err(error) => {
+                    inner.fail_initialization(version, error);
+                    return;
+                }
+            }
+            drop(inner);
+            futures_timer::Delay::new(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
-    async fn subscription_established(&self, version: u32) {
-        if let Some(inner) = self.0.upgrade() {
-            tracing::debug!("Subscription established for query {}: {}", inner.query_id, version);
-            match inner.activate(version).await {
-                Ok(()) => inner.mark_durable_answered(version),
-                Err(e) => {
-                    tracing::error!("Failed to activate subscription for query {}: {}", inner.query_id, e);
-                    inner.fail_initialization(version, e);
-                }
-            }
-        }
-    }
+    async fn subscription_established(&self, version: u32) { self.activate(version, true).await; }
 
     fn set_last_error(&self, version: u32, error: RetrievalError) {
         if let Some(inner) = self.0.upgrade() {

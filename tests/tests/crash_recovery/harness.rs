@@ -189,9 +189,9 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
 
     async fn state_snapshot(
         &self,
-        since: Option<&ankurah::core::storage::StateCursor>,
+        scan: ankurah::core::storage::StateScan<'_>,
     ) -> Result<Box<dyn ankurah::core::storage::StateSnapshot>, RetrievalError> {
-        self.inner.state_snapshot(since).await
+        self.inner.state_snapshot(scan).await
     }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { self.inner.get_state(id).await }

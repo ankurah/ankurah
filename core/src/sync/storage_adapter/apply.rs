@@ -9,7 +9,7 @@ use ankurah_digest_tree::{
 };
 
 use super::guard::PoisonGuard;
-use super::layout::entry::{self, TreeEntry};
+use super::layout::entry::{self, Status, TreeEntry};
 use super::layout::log;
 use super::layout::names::trees_map;
 use super::{EngineAdapter, Error, StorageEngineTrx, TreeId};
@@ -236,7 +236,7 @@ where
             },
         };
 
-        let invalid = TreeEntry { valid: false, ..entry };
+        let invalid = TreeEntry { status: Status::Invalid, ..entry };
         trx.map_write(vec![MapWrite::Put { map: trees_map(), key: store.inner().id.entry_key(), value: invalid.encode() }]).await?;
         applied.refused.push((store.inner().id.clone(), refused));
     }

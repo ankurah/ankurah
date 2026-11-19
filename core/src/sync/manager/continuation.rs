@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use super::{selection_key, DigestTree, TreeManager};
 use crate::entity::TemporaryEntity;
 use crate::error::{MutationError, RetrievalError};
-use crate::selection::filter::{evaluate_predicate, Error as FilterError};
-use crate::storage::{StateSnapshot, StorageEngine, StorageTransaction};
+use crate::selection::filter::{evaluate_predicate, membership_match, Error as FilterError};
+use crate::storage::{StateScan, StateSnapshot, StorageEngine, StorageTransaction};
 use crate::sync::error::open_failure;
 use crate::sync::member::EntityMember;
 use crate::sync::{storage_adapter, EntityHead, EntityMemberId, TreeId};
@@ -52,33 +52,44 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
             return Ok(tree);
         }
         let id = TreeId::new(format!("selection-v2-{}-{}", G::ROW_VERSION, URL_SAFE_NO_PAD.encode(Sha256::digest(&key))));
-        let (tree, rebuilding) = self.open_backing(id, &selection).await?;
-        tree.store().load_buffered(self.epoch.clone()).await?;
-        if rebuilding {
-            tree.store().clear_buffered();
-        }
+        let tree = self.open_backing(id, &selection).await?;
         self.reconcile(&tree, &selection, rebuild, false).await?;
         self.remember(selection, key, tree.clone());
         Ok(tree)
     }
 
-    async fn open_backing(&self, id: TreeId, selection: &Selection<Resolved>) -> Result<(DigestTree<SE, G>, bool), RetrievalError> {
-        match storage_adapter::open(self.storage.clone(), self.cache.clone(), &id).await {
-            Ok(tree) => Ok((tree, false)),
+    async fn open_backing(&self, id: TreeId, selection: &Selection<Resolved>) -> Result<DigestTree<SE, G>, RetrievalError> {
+        match storage_adapter::open_managed(self.storage.clone(), self.cache.clone(), &id, self.epoch.clone()).await {
+            Ok(tree) => Ok(tree),
             Err(error) if missing_or_invalid(&error) => {
                 let key_spec = self.key_spec(selection).await?;
                 let mut trx = self.storage.transaction();
-                let created = storage_adapter::rebuild(
+                let created = storage_adapter::initialize::<_, _, _, _, G, _>(
                     self.storage.clone(),
                     self.cache.clone(),
                     &mut trx,
-                    id,
+                    id.clone(),
                     key_spec,
                     std::iter::empty::<EntityMember<'_, TemporaryEntity>>(),
                 )
-                .await?;
-                trx.commit().await?.committed()?;
-                Ok((created.landed(), true))
+                .await;
+                match created {
+                    Ok(created) => {
+                        trx.commit().await?.committed()?;
+                        drop(created.landed());
+                    }
+                    Err(MutationError::WriteConflict) => drop(trx),
+                    Err(error) => return Err(error.into()),
+                }
+                storage_adapter::open_managed(self.storage.clone(), self.cache.clone(), &id, self.epoch.clone()).await.map_err(|error| {
+                    // The entry existed when initialization completed or lost
+                    // to another opener. Losing it now is a concurrent reset.
+                    if missing_or_invalid(&error) {
+                        MutationError::WriteConflict.into()
+                    } else {
+                        error
+                    }
+                })
             }
             Err(error) => Err(error),
         }
@@ -95,11 +106,8 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
             match self.reconcile_once(tree, selection, rebuild, force_flush).await {
                 Ok(()) => return Ok(()),
                 Err(error) if retryable(&error) && attempt + 1 < ATTEMPTS => {
-                    let (_, rebuilding) = self.open_backing(tree.store().id().clone(), selection).await?;
+                    let _ = self.open_backing(tree.store().id().clone(), selection).await?;
                     tree.store().load_buffered(self.epoch.clone()).await?;
-                    if rebuilding {
-                        tree.store().clear_buffered();
-                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -114,8 +122,8 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         rebuild: bool,
         force_flush: bool,
     ) -> Result<(), RetrievalError> {
-        let (working, mut snapshot, full, initial) = self.begin_reconciliation(tree, rebuild).await?;
-        let changed = self.apply_snapshot(&working, selection, &mut *snapshot, full, initial).await?;
+        let (working, mut snapshot, full, initial) = self.begin_reconciliation(tree, selection, rebuild).await?;
+        let changed = self.apply_snapshot(&working, selection, &mut *snapshot, initial).await?;
         let cursor = snapshot.finish().await?;
         working.store().advance(cursor, self.epoch.load(Ordering::Acquire), changed);
         let version = working.store().buffered();
@@ -135,6 +143,7 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
     pub(super) async fn begin_reconciliation(
         &self,
         tree: &DigestTree<SE, G>,
+        selection: &Selection<Resolved>,
         rebuild: bool,
     ) -> Result<(DigestTree<SE, G>, Box<dyn StateSnapshot>, bool, bool), RetrievalError> {
         let store = tree.store().working();
@@ -147,14 +156,31 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         let base = store.buffered();
         let initial = base.cursor.is_none();
         let mut full = rebuild || initial;
-        let snapshot = match self.storage.state_snapshot(if full { None } else { base.cursor.as_ref() }).await {
+        // Only an explicit Building entry promises resumable member lookup.
+        // A Ready tree rebuilt through the public adapter may contain arbitrary
+        // members without their lookup/cursor, so it needs full replacement.
+        let mut clear = rebuild || (initial && !base.is_building());
+        let scan = if selection.limit.is_some() {
+            StateScan::Selection(selection)
+        } else {
+            StateScan::Changes(if full { None } else { base.cursor.as_ref() })
+        };
+        let snapshot = match self.storage.state_snapshot(scan).await {
             Err(RetrievalError::InvalidStateCursor) => {
                 full = true;
-                self.storage.state_snapshot(None).await?
+                clear = true;
+                let scan = match scan {
+                    StateScan::Changes(_) => StateScan::Changes(None),
+                    selection => selection,
+                };
+                self.storage.state_snapshot(scan).await?
             }
             result => result?,
         };
-        let working = if full {
+        // A Building tree keeps its completed batches. The full scan corrects
+        // changed keys and membership in place; physical deletion only occurs
+        // through reset, which also retires this tree's base.
+        let working = if clear {
             let key_spec = tree.key_spec().clone();
             store.clear_buffered();
             let trx = store.buffered_transaction().await.map_err(|error| open_failure(error.into()))?;
@@ -173,30 +199,33 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         tree: &DigestTree<SE, G>,
         selection: &Selection<Resolved>,
         snapshot: &mut dyn StateSnapshot,
-        full: bool,
         initial: bool,
     ) -> Result<usize, RetrievalError> {
         let mut page = snapshot.next_page(PAGE_SIZE).await?;
         if selection.limit.is_some() {
-            if page.is_empty() && !full {
-                return Ok(0);
+            let mut selected = Vec::new();
+            while !page.is_empty() {
+                selected.extend(page);
+                page = snapshot.next_page(PAGE_SIZE).await?;
             }
-            let selected = snapshot.limited_states(selection).await?;
-            // Limited membership is bounded by LIMIT; a full replacement also
-            // covers unchanged candidates entering after the old boundary moves.
+            // A complete selected set includes unchanged candidates that refill
+            // the boundary. Keep unchanged leaves, and remove only former members.
+            let selected_ids: std::collections::HashSet<_> = selected.iter().map(|state| state.payload.entity_id).collect();
             let held: Vec<_> = tree.view().range(..).map_err(open_failure)?.try_collect().await.map_err(open_failure)?;
             let mut changes = tree.transaction();
-            let removed = held.iter().map(|leaf| (leaf.id.0.to_bytes().to_vec(), None)).collect();
+            let mut removed = Vec::new();
             for leaf in held {
-                changes.remove_leaf(leaf).map_err(open_failure)?;
+                if !selected_ids.contains(&leaf.id.0) {
+                    removed.push((leaf.id.0.to_bytes().to_vec(), None));
+                    changes.remove_leaf(leaf).map_err(open_failure)?;
+                }
             }
+            let count = removed.len();
             let prepared = changes.prepare().await;
             let trx = tree.store().buffered_transaction().await.map_err(|error| open_failure(error.into()))?;
             prepared.apply(trx).await.map_err(open_failure)?.landed();
             tree.store().set_member_rows(removed);
-            let count = selected.len().max(1);
-            self.apply_states(tree, selection, selected).await?;
-            return Ok(count);
+            return Ok(count + self.apply_states(tree, selection, selected).await?);
         }
         let mut count = 0;
         while !page.is_empty() {
@@ -204,8 +233,9 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
             self.apply_states(tree, selection, page).await?;
             if initial && tree.store().buffered().has_writes() {
                 // No completed backing tree exists yet. Persist bounded build
-                // batches as invalid, with no recovery cursor; only finish's
-                // successful validation permits the final valid publication.
+                // batches as Building, with no recovery cursor. Another builder
+                // resumes them through an idempotent full scan. Only finish's
+                // successful validation permits the final Ready publication.
                 tree.store().flush().await?;
             }
             page = snapshot.next_page(PAGE_SIZE).await?;
@@ -218,24 +248,37 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         tree: &DigestTree<SE, G>,
         selection: &Selection<Resolved>,
         states: Vec<Attested<EntityState>>,
-    ) -> Result<(), RetrievalError> {
+    ) -> Result<usize, RetrievalError> {
         let ids: Vec<_> = states.iter().map(|state| state.payload.entity_id).collect();
         let keys: Vec<_> = ids.iter().map(|id| id.to_bytes().to_vec()).collect();
         let held = tree.store().member_rows(&keys).await?;
         let mut changes = tree.transaction();
         let mut members = Vec::new();
         for ((state, id), old) in states.into_iter().zip(ids).zip(held) {
-            let entity = TemporaryEntity::new(id, &state.payload.state)?;
-            let matches = match evaluate_predicate(&entity, &selection.predicate) {
-                Ok(value) => value,
-                Err(FilterError::PropertyNotFound(_)) => false,
-                Err(error) => return Err(error.into()),
-            };
-            let new = if matches { Some(tree.leaf(&EntityMember(&entity)).map_err(open_failure)?) } else { None };
             let old = old
                 .map(|bytes| bincode::deserialize::<(Vec<u8>, ankurah_proto::Clock)>(&bytes))
                 .transpose()?
                 .map(|(key, head)| Leaf { key, id: EntityMemberId(id), payload: EntityHead(head) });
+            // Membership can exclude an unrelated model without decoding its
+            // property backends. A former member still needs its old leaf removed.
+            if membership_match(&selection.predicate, &|model| state.payload.state.memberships.contains(model)) == Some(false) {
+                if let Some(old) = old {
+                    changes.remove_leaf(old).map_err(open_failure)?;
+                    members.push((id.to_bytes().to_vec(), None));
+                }
+                continue;
+            }
+            let entity = TemporaryEntity::new(id, &state.payload.state)?;
+            let matches = if selection.limit.is_some() {
+                true
+            } else {
+                match evaluate_predicate(&entity, &selection.predicate) {
+                    Ok(value) => value,
+                    Err(FilterError::PropertyNotFound(_)) => false,
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            let new = if matches { Some(tree.leaf(&EntityMember(&entity)).map_err(open_failure)?) } else { None };
             if old == new {
                 continue;
             }
@@ -250,8 +293,9 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
         let prepared = changes.prepare().await;
         let trx = tree.store().buffered_transaction().await.map_err(|error| open_failure(error.into()))?;
         prepared.apply(trx).await.map_err(open_failure)?.landed();
+        let count = members.len();
         tree.store().set_member_rows(members);
-        Ok(())
+        Ok(count)
     }
 }
 

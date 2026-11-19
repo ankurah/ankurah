@@ -1,5 +1,6 @@
 //! A digest-tree Store over StorageEngine. Reads use engine snapshots;
-//! mutations use the caller's transaction, with cache publication after commit.
+//! Mutations use an owner's storage transaction or a private managed overlay;
+//! cache publication follows the corresponding commit.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -29,10 +30,11 @@ pub(in crate::sync) use buffered::Buffered;
 pub use cache::{CacheSettings, StorageCache};
 pub use layout::names::TreeId;
 pub use lifecycle::{create, drop, open, rebuild};
+pub(in crate::sync) use lifecycle::{initialize, open_managed};
 pub use read::StorageEngineSnapshot;
 pub use trx::StorageEngineTrx;
 
-/// A Store for one tree at a fixed incarnation. Clones share the same store.
+/// A Store scoped to one tree. Clones share its reads and buffered version.
 /// Each handle selects only that tree's maps, so store operations need no tree
 /// id and unbounded ranges stay within that tree. Stores can share a
 /// StorageCache to pool their byte budget; records remain scoped to the tree.
@@ -41,8 +43,8 @@ pub struct EngineAdapter<SE, K, L, G> {
     _rows: PhantomData<fn() -> (K, L, G)>,
 }
 
-/// Shared adapter state for one tree incarnation: storage, cache, identity,
-/// and the names of its lock and maps.
+/// Shared adapter state. Direct storage operations use the opening incarnation;
+/// a managed buffer identifies its current durable base, including after reset.
 pub(super) struct Inner<SE> {
     storage: Arc<SE>,
     cache: Arc<StorageCache>,
@@ -170,8 +172,8 @@ where
     /// A snapshot of the engine's maps under the tree's lock, whose first
     /// request reads the tree's entry, and the change log after the
     /// generation the cache keeps its rows at, to bring them up to date. A
-    /// tree dropped, created again or marked invalid since this handle was
-    /// opened fails the read.
+    /// direct adapter fails after its incarnation is retired. Managed reads
+    /// validate their buffered version's durable base and publication epoch.
     async fn begin_read(&self) -> Result<StorageEngineSnapshot<SE, K, L, G>, StoreError> {
         let tree = self.inner();
         let buffered = tree.buffered.lock().unwrap().clone();

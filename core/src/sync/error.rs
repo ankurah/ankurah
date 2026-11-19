@@ -26,6 +26,10 @@ pub enum Error {
     #[error("tree {0} is marked invalid")]
     Invalid(TreeId),
 
+    /// Initial membership has not reached a complete canonical-state boundary.
+    #[error("tree {0} is still being built")]
+    Building(TreeId),
+
     /// A read found the tree dropped, created again or marked invalid since
     /// its handle was opened.
     #[error("tree {0} was dropped, created again or marked invalid since it was opened")]

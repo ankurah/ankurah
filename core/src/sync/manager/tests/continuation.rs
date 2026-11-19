@@ -259,3 +259,43 @@ async fn interrupted_or_rejected_scans_never_publish_partial_changes_or_a_cursor
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn an_interrupted_initial_build_resumes_and_reconciles_changed_members() -> anyhow::Result<()> {
+    let fixture = Fixture::<Ristretto255>::new(0)?;
+    let before: Vec<_> = (0..600u16)
+        .map(|index| {
+            let mut bytes = [211; 32];
+            bytes[..2].copy_from_slice(&index.to_be_bytes());
+            Version { id: EntityId::from_bytes(bytes), ..version(1, i64::from(index), true) }
+        })
+        .collect();
+    fixture.seed(&before)?;
+    let selected = selection(true, None, false);
+    let (entered, paused) = oneshot::channel();
+    let (_release, resume) = oneshot::channel();
+    *fixture.storage.hold_state_page.lock().unwrap() = Some((1, (entered, resume)));
+    {
+        let mut opening = pin!(fixture.manager.open(selected.clone()));
+        assert!(poll_once(opening.as_mut()).is_pending());
+        paused.await?; // The first page is durable, but no cursor is published.
+    }
+    assert!(fixture.manager.trees().is_empty());
+
+    let removed = Version { active: Some(false), ..moved(&before[0], 10000) };
+    let changed = moved(&before[1], 10001);
+    fixture.seed(&[removed, changed.clone()])?;
+    let resumed = TreeManager::<_, Ristretto255>::new(
+        fixture.storage.clone(),
+        Arc::new(tokio::sync::Mutex::new(())),
+        CacheSettings { bytes: 1 << 20 },
+        0,
+    );
+    let tree = resumed.open(selected).await?;
+    assert_eq!(tree.audit().await?.members, 599);
+    let expected: Vec<_> = before[2..].iter().map(|version| version.id).chain([changed.id]).collect();
+    assert_eq!(ids(&tree.view()).await?, expected, "the rescan removes obsolete membership and its previous ordered key");
+    let leaves: Vec<_> = tree.view().range(10001i64..=10001)?.try_collect().await?;
+    assert_eq!(leaves[0].payload.0, changed.head);
+    Ok(())
+}

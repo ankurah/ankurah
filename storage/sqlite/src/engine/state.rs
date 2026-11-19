@@ -3,20 +3,16 @@
 
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
-use ankql::ast::{Resolved, Selection};
 use ankurah_core::{
     error::RetrievalError,
-    storage::{StateCursor, StateSnapshot},
+    storage::{StateCursor, StateScan, StateSnapshot},
 };
 use ankurah_proto::{Attested, EntityId, EntityState};
-use ankurah_storage_common::{selection::LimitedSelection, state::CounterCursor};
+use ankurah_storage_common::state::CounterCursor;
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
 
-use super::{
-    decode_state_row, load_states, maps::Lease, memberships_from_sqlite_connection, raw_state_from_sqlite_row, SqliteStorageEngine,
-    ENTITY_TABLE, META_TABLE,
-};
+use super::{load_states, maps::Lease, query::Query, SqliteStorageEngine, ENTITY_TABLE, META_TABLE};
 use crate::error::SqliteError;
 
 pub(super) const CHANGES_TABLE: &str = "_ankurah_state_changes";
@@ -80,6 +76,7 @@ pub(super) struct SqliteStateSnapshot {
     source: Source,
     target: CounterCursor,
     after: (u64, String),
+    selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
 }
 
 enum Source {
@@ -88,7 +85,23 @@ enum Source {
 }
 
 impl SqliteStateSnapshot {
-    pub(super) async fn begin(engine: &SqliteStorageEngine, since: Option<&StateCursor>) -> Result<Self, RetrievalError> {
+    pub(super) async fn begin(engine: &SqliteStorageEngine, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
+        // Query preparation may create catalog/materialization columns. Complete
+        // it before the read transaction fixes the schema and state boundary.
+        let (since, query, prepared_at) = match scan {
+            StateScan::Changes(since) => (since, None, None),
+            StateScan::Selection(selection) => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
+                }
+                let prepared_at = {
+                    let connection = engine.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
+                    engine.ensure_shared_tables(&connection).await?;
+                    connection.with_connection(current).await?
+                };
+                (None, Some(Query::prepare(engine, selection).await?), Some(prepared_at))
+            }
+        };
         let (source, target) = if let Some(connection) = engine.maps.memory_connection().await? {
             engine.ensure_shared_tables(&connection).await?;
             let target = connection.with_connection(current).await?;
@@ -104,9 +117,19 @@ impl SqliteStateSnapshot {
                 .await?;
             (Source::File(lease), target)
         };
+        // A commit during planning may introduce a materialization the query
+        // did not include. It cannot be certified by the later source cursor.
+        if prepared_at.is_some_and(|prepared_at| prepared_at != target) {
+            return Err(SqliteError::SnapshotChanged.into());
+        }
         let since = target.resume(since, ENGINE)?;
         let after = since.map_or((0, String::new()), |position| (position, "\u{10ffff}".into()));
-        Ok(Self { source, target, after })
+        let mut snapshot = Self { source, target, after, selected: None };
+        if let Some(query) = query {
+            let selected = snapshot.read(move |connection| Ok(query.states_in(connection))).await??;
+            snapshot.selected = Some(selected.into_iter());
+        }
+        Ok(snapshot)
     }
 
     async fn read<T: Send + 'static>(
@@ -120,11 +143,16 @@ impl SqliteStateSnapshot {
                 connection
                     .with_connection_mut(move |connection| {
                         let snapshot = connection.transaction()?;
-                        let now = current(&snapshot)?;
-                        if now.incarnation != target.incarnation {
-                            return Err(SqliteError::InvalidStateCursor);
-                        }
-                        if now.position != target.position {
+                        let now = match current(&snapshot) {
+                            // Reset removes both the cursor and its index. A
+                            // missing cursor with the index intact is damage,
+                            // not a reason to retry a moved read boundary.
+                            Err(SqliteError::InvalidStateCursor) if !super::table_exists(&snapshot, CHANGES_TABLE)? => {
+                                return Err(SqliteError::SnapshotChanged);
+                            }
+                            result => result?,
+                        };
+                        if now != target {
                             return Err(SqliteError::SnapshotChanged);
                         }
                         call(&snapshot)
@@ -138,6 +166,10 @@ impl SqliteStateSnapshot {
 #[async_trait]
 impl StateSnapshot for SqliteStateSnapshot {
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        if self.selected.is_some() {
+            self.read(|_| Ok(())).await?;
+            return Ok(self.selected.as_mut().unwrap().by_ref().take(limit.get()).collect());
+        }
         let after = self.after.clone();
         let (states, last) = self
             .read(move |connection| {
@@ -181,26 +213,6 @@ impl StateSnapshot for SqliteStateSnapshot {
                 Ok(ids.iter().map(|id| states.get(id).cloned()).collect())
             })
             .await?)
-    }
-
-    async fn limited_states(&mut self, selection: &Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let selection = selection.clone();
-        self.read(move |connection| {
-            let mut selected = LimitedSelection::new(&selection).map_err(|error| SqliteError::CorruptRecord(error.to_string()))?;
-            if selection.limit == Some(0) {
-                return Ok(selected.finish());
-            }
-            let mut statement =
-                connection.prepare(&format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{ENTITY_TABLE}""#))?;
-            for row in statement.query_map([], raw_state_from_sqlite_row)? {
-                let row = row?;
-                let memberships = memberships_from_sqlite_connection(connection, &row.0)?;
-                selected.consider(decode_state_row(row, memberships)?).map_err(|error| SqliteError::CorruptRecord(error.to_string()))?;
-            }
-            Ok(selected.finish())
-        })
-        .await
-        .map_err(Into::into)
     }
 
     async fn finish(mut self: Box<Self>) -> Result<StateCursor, RetrievalError> {

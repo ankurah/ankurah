@@ -6,21 +6,19 @@
 
 use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
 
-use ankql::ast::{Resolved, Selection};
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
-    storage::{StateCursor, StateSnapshot},
+    storage::{StateCursor, StateScan, StateSnapshot},
 };
 use ankurah_proto::{Attested, EntityId, EntityState};
 use async_trait::async_trait;
 use bincode::Options;
 use tokio_postgres::{Client, NoTls, Row};
 
-use crate::{state_from_row, Postgres, ENTITY_MODEL_TABLE, ENTITY_TABLE, META_TABLE};
+use crate::{query::Query, state_from_row, Postgres, ENTITY_MODEL_TABLE, ENTITY_TABLE, META_TABLE};
 
 const CURSOR_FORMAT: &[u8] = b"ankurah:postgres:state:1\0";
 const INCARNATION: &str = "state_incarnation";
-const PAGE_SIZE: usize = 512;
 
 /// Add continuation metadata to an existing store under its shared DDL lock.
 /// PostgreSQL 11's bigint/txid_snapshot functions also work on newer servers.
@@ -77,6 +75,7 @@ pub(super) struct Snapshot {
     cursor: StateCursor,
     scopes: VecDeque<WriterScope>,
     after: (i64, String),
+    selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
     ended: bool,
 }
 
@@ -88,14 +87,43 @@ enum WriterScope {
 }
 
 impl Snapshot {
-    pub(super) async fn begin(engine: &Postgres, since: Option<&StateCursor>) -> Result<Self, RetrievalError> {
+    pub(super) async fn begin(engine: &Postgres, scan: StateScan<'_>) -> Result<Self, RetrievalError> {
+        let (since, selection) = match scan {
+            StateScan::Changes(since) => (since, None),
+            StateScan::Selection(selection) => {
+                if selection.limit.is_none() {
+                    return Err(RetrievalError::Other("a selection snapshot requires LIMIT".into()));
+                }
+                (None, Some(selection))
+            }
+        };
         let client = tokio::time::timeout(Duration::from_secs(crate::DEFAULT_CONNECTION_TIMEOUT_SECS), engine.pool.dedicated_connection())
             .await
             .map_err(RetrievalError::storage)?
             .map_err(RetrievalError::storage)?;
-        let mut snapshot =
-            Self { client, cursor: StateCursor::new(Vec::new()), scopes: VecDeque::new(), after: (0, String::new()), ended: false };
+        let mut snapshot = Self {
+            client,
+            cursor: StateCursor::new(Vec::new()),
+            scopes: VecDeque::new(),
+            after: (0, String::new()),
+            selected: None,
+            ended: false,
+        };
         engine.ensure_shared_tables(&snapshot.client).await.map_err(RetrievalError::storage)?;
+        // Planning may prepare materializations and their columns. Do that
+        // before opening the fixed read view or holding its relation locks.
+        // Capture coverage before planning: a later canonical commit can add
+        // materializations/properties the prepared query did not include.
+        let prepared = if let Some(selection) = selection {
+            let (incarnation, boundary) = read_boundary(&snapshot.client).await?;
+            let query = match Query::prepare(engine, selection).await {
+                Ok(query) => query,
+                Err(error) => return Err(after_possible_reset(&snapshot.client, &incarnation, error).await),
+            };
+            Some((incarnation, boundary, query))
+        } else {
+            None
+        };
         // Take relation locks before reading the cursor metadata. A reset
         // cannot remove these relations between the boundary and its pages.
         snapshot
@@ -106,25 +134,25 @@ impl Snapshot {
             ))
             .await
             .map_err(RetrievalError::storage)?;
-        let row = snapshot
-            .client
-            .query_one(
-                &format!(r#"SELECT "value", txid_current_snapshot()::text AS snapshot FROM "{META_TABLE}" WHERE "key" = $1"#),
-                &[&INCARNATION],
-            )
-            .await
-            .map_err(RetrievalError::storage)?;
-        let incarnation: String = row.get("value");
-        let target: String = row.get("snapshot");
+        let (incarnation, target) = read_boundary(&snapshot.client).await?;
+        if prepared.as_ref().is_some_and(|(before, _, _)| *before != incarnation) {
+            return Err(MutationError::WriteConflict.into());
+        }
 
-        if let Some(since) = since {
+        let previous = if let Some(since) = since {
             let bytes = since.as_bytes().strip_prefix(CURSOR_FORMAT).ok_or(RetrievalError::InvalidStateCursor)?;
-            let (old_incarnation, old_snapshot): (String, String) = bincode::DefaultOptions::new()
-                .with_fixint_encoding()
-                .with_limit(bytes.len() as u64)
-                .reject_trailing_bytes()
-                .deserialize(bytes)
-                .map_err(|_| RetrievalError::InvalidStateCursor)?;
+            Some(
+                bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .with_limit(bytes.len() as u64)
+                    .reject_trailing_bytes()
+                    .deserialize::<(String, String)>(bytes)
+                    .map_err(|_| RetrievalError::InvalidStateCursor)?,
+            )
+        } else {
+            prepared.as_ref().map(|(incarnation, boundary, _)| (incarnation.clone(), boundary.clone()))
+        };
+        if let Some((old_incarnation, old_snapshot)) = previous {
             if old_incarnation != incarnation {
                 return Err(RetrievalError::InvalidStateCursor);
             }
@@ -144,25 +172,74 @@ impl Snapshot {
         let mut encoded = CURSOR_FORMAT.to_vec();
         encoded.extend(bincode::serialize(&(incarnation, target))?);
         snapshot.cursor = StateCursor::new(encoded);
+        if let Some((incarnation, _, query)) = prepared {
+            // Compare canonical changes, not raw snapshot text: planning DDL
+            // and unrelated transactions can allocate IDs without changing any
+            // state. The ordinary change scan also catches older late commits.
+            if !snapshot.next_page(NonZeroUsize::MIN).await?.is_empty() {
+                return Err(MutationError::WriteConflict.into());
+            }
+            // Reset drops materialization tables. Keep their read locks only
+            // while collecting the bounded selection, so reset cannot wait on
+            // this source snapshot while its later tree-map flush waits on reset.
+            // Canonical relation locks and the read boundary precede this savepoint.
+            snapshot.client.batch_execute("SAVEPOINT selected_states").await.map_err(RetrievalError::storage)?;
+            let states = match query.states_in(&snapshot.client).await {
+                Ok(states) => states,
+                Err(error) => {
+                    // Outside the failed snapshot, distinguish a real reset
+                    // from SQL/query errors that must keep their original cause.
+                    if snapshot.client.batch_execute("ROLLBACK").await.is_ok() {
+                        snapshot.ended = true;
+                        return Err(after_possible_reset(&snapshot.client, &incarnation, error).await);
+                    }
+                    return Err(error);
+                }
+            };
+            snapshot
+                .client
+                .batch_execute("ROLLBACK TO SAVEPOINT selected_states; RELEASE SAVEPOINT selected_states")
+                .await
+                .map_err(RetrievalError::storage)?;
+            snapshot.selected = Some(states.into_iter());
+        }
         Ok(snapshot)
     }
+}
 
-    async fn all_page(&self, after: &str, limit: usize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let rows = self
-            .client
-            .query(
-                &format!(r#"{} WHERE e."id" > $1 ORDER BY e."id" LIMIT $2"#, select_states()),
-                &[&after, &(i64::try_from(limit).unwrap_or(i64::MAX))],
-            )
-            .await
-            .map_err(RetrievalError::storage)?;
-        rows.into_iter().map(decode_state).collect()
+async fn read_boundary(client: &Client) -> Result<(String, String), RetrievalError> {
+    let row = client
+        .query_one(
+            &format!(r#"SELECT "value", txid_current_snapshot()::text AS snapshot FROM "{META_TABLE}" WHERE "key" = $1"#),
+            &[&INCARNATION],
+        )
+        .await
+        .map_err(RetrievalError::storage)?;
+    Ok((row.get("value"), row.get("snapshot")))
+}
+
+async fn current_incarnation(client: &Client) -> Result<String, RetrievalError> {
+    Ok(client
+        .query_one(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = $1"#), &[&INCARNATION])
+        .await
+        .map_err(RetrievalError::storage)?
+        .get(0))
+}
+
+async fn after_possible_reset(client: &Client, before: &str, error: RetrievalError) -> RetrievalError {
+    if current_incarnation(client).await.is_ok_and(|current| current != before) {
+        MutationError::WriteConflict.into()
+    } else {
+        error
     }
 }
 
 #[async_trait]
 impl StateSnapshot for Snapshot {
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        if let Some(selected) = &mut self.selected {
+            return Ok(selected.by_ref().take(limit.get()).collect());
+        }
         let mut states = Vec::new();
         while states.len() < limit.get() {
             let Some(scope) = self.scopes.front() else { break };
@@ -215,29 +292,6 @@ impl StateSnapshot for Snapshot {
             states.insert(state.payload.entity_id, state);
         }
         Ok(ids.iter().map(|id| states.get(id).cloned()).collect())
-    }
-
-    async fn limited_states(&mut self, selection: &Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let mut selected = ankurah_storage_common::selection::LimitedSelection::new(selection)?;
-        if selection.limit == Some(0) {
-            return Ok(selected.finish());
-        }
-        // The target set is bounded by LIMIT. Reading canonical states here
-        // also handles predicates that cannot be pushed into materializations.
-        let mut after = String::new();
-        loop {
-            let page = self.all_page(&after, PAGE_SIZE).await?;
-            let exhausted = page.len() < PAGE_SIZE;
-            if let Some(last) = page.last() {
-                after = last.payload.entity_id.to_base64();
-            }
-            for state in page {
-                selected.consider(state)?;
-            }
-            if exhausted {
-                return Ok(selected.finish());
-            }
-        }
     }
 
     async fn finish(mut self: Box<Self>) -> Result<StateCursor, RetrievalError> {

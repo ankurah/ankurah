@@ -126,6 +126,29 @@ async fn unrelated_and_repeated_states_leave_the_membership_digest_unchanged() -
 }
 
 #[tokio::test]
+async fn unrelated_corrupt_backends_do_not_prevent_opening_or_removal() -> anyhow::Result<()> {
+    let fixture = Fixture::<Ristretto255>::new(2)?;
+    let member = version(1, 10, true);
+    fixture.seed(std::slice::from_ref(&member))?;
+    let mut unrelated = member.state()?;
+    unrelated.payload.entity_id = EntityId::from_bytes([2; 32]);
+    unrelated.payload.state.memberships.clear();
+    unrelated.payload.state.state_buffers.0.insert("unknown".into(), vec![255]);
+    fixture.storage.set_state(unrelated);
+    let tree = fixture.manager.open(selection(false, None, false)).await?;
+    assert_eq!(ids(&tree.view()).await?, [member.id]);
+
+    let mut leaving = member.state()?;
+    leaving.payload.state.memberships.clear();
+    leaving.payload.state.state_buffers.0.insert("unknown".into(), vec![255]);
+    fixture.storage.set_state(leaving);
+    fixture.manager.invalidate();
+    fixture.manager.maintain().await?;
+    assert!(ids(&tree.view()).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_unreadable_tree_does_not_stop_maintenance_of_the_other_trees() -> anyhow::Result<()> {
     let fixture = Fixture::<Ristretto255>::new(2)?;
     let before = version(1, 10, true);

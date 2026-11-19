@@ -4,6 +4,41 @@ use ankql::ast::Predicate;
 use std::time::Duration;
 
 #[tokio::test]
+async fn local_query_activation_retries_snapshot_conflicts_without_retaining_a_dropped_query() -> anyhow::Result<()> {
+    for recover in [false, true] {
+        let storage = Arc::new(TestStorage::default());
+        let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+        node.system.create().await?;
+        node.wait_ready().await?;
+        storage.reject_state_finish.store(true, std::sync::atomic::Ordering::SeqCst);
+        let context = node.context(DEFAULT_CONTEXT)?;
+        let query = crate::livequery::EntityLiveQuery::new(
+            context.0,
+            crate::node::CachePolicy::Local,
+            crate::livequery::QueryResolution::Resolved(Predicate::MemberOf(proto::ModelId::EntityId(proto::EntityId::random())).into()),
+        )?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), query.wait_initialized()).await.is_err(),
+            "snapshot conflicts leave initialization pending rather than publishing a permanent error"
+        );
+        if recover {
+            storage.reject_state_finish.store(false, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(2), query.wait_initialized()).await??;
+        } else {
+            let weak = query.weak();
+            drop(query);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_commits_leave_views_unavailable_until_storage_is_reconciled() -> anyhow::Result<()> {
     for committed in [false, true] {
         let storage = Arc::new(TestStorage::default());
@@ -53,16 +88,21 @@ async fn cancelled_commits_leave_views_unavailable_until_storage_is_reconciled()
 }
 
 #[tokio::test]
-async fn maintenance_wakes_do_not_keep_the_node_alive() -> anyhow::Result<()> {
-    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.wait_loaded().await?;
-    let publication = node.commit_publication_lock.clone().lock_owned().await;
+async fn in_flight_maintenance_does_not_keep_the_node_alive() -> anyhow::Result<()> {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let (entered, entering) = oneshot::channel();
+    let (_release, released) = oneshot::channel();
+    *storage.hold_state_snapshot.lock().unwrap() = Some((entered, released));
     node.invalidate_trees();
+    entering.await?;
     let weak = node.weak();
     drop(node);
-    drop(publication);
+    assert!(weak.upgrade().is_none(), "maintenance may own its manager, but must never retain the Node during a scan");
     tokio::time::timeout(Duration::from_secs(2), async {
-        while weak.upgrade().is_some() {
+        while Arc::strong_count(&storage) != 1 {
             tokio::task::yield_now().await;
         }
     })

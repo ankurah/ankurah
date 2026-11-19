@@ -481,7 +481,7 @@ pub async fn a_rebuild_refuses_generation_overflow<G: DigestGroup, D: TestDataba
     let old: Tree<D::Engine, G> = created(&trees, &engine, "tree", [item!(1, 1)]).await?;
     let before = rows_now(&engine, &old).await?;
     let id = old.store().id();
-    let entry = entry::TreeEntry { incarnation: old.store().inner().incarnation, generation: u64::MAX, valid: true };
+    let entry = entry::TreeEntry { incarnation: old.store().inner().incarnation, generation: u64::MAX, status: entry::Status::Ready };
     let mut damaging = engine.transaction();
     damaging.map_write(vec![MapWrite::Put { map: trees_map(), key: id.entry_key(), value: entry.encode() }]).await?;
     damaging.commit().await?.committed()?;

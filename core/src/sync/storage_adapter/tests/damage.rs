@@ -11,7 +11,7 @@ use super::Tree;
 use crate::storage::{MapWrite, StorageEngine, StorageTransaction};
 use crate::sync::conformance::fixtures::{assert_holds, cached, cause, commit, created, item, rows_now, stores, Carries, Item, Rows};
 use crate::sync::conformance::in_both_groups;
-use crate::sync::storage_adapter::layout::entry::TreeEntry;
+use crate::sync::storage_adapter::layout::entry::{Status, TreeEntry};
 use crate::sync::storage_adapter::layout::log::{self, Changed};
 use crate::sync::storage_adapter::layout::names::trees_map;
 use crate::sync::{Error, TreeChange, TreeId, TreePart};
@@ -115,7 +115,7 @@ async fn a_tree_at_the_last_generation_refuses_its_next_commit<G: DigestGroup>()
     let trees = stores(&engine);
     let tree: Tree<G> = created(&trees, &engine, "tree", [item!(1, 1)]).await?;
 
-    let last = TreeEntry { incarnation: tree.store().inner().incarnation, generation: u64::MAX, valid: true };
+    let last = TreeEntry { incarnation: tree.store().inner().incarnation, generation: u64::MAX, status: Status::Ready };
     let mut damage = engine.transaction();
     damage.map_write(vec![MapWrite::Put { map: trees_map(), key: tree.store().id().entry_key(), value: last.encode() }]).await?;
     damage.commit().await?.committed()?;
