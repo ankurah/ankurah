@@ -143,14 +143,19 @@ impl SledModelStoreInner {
                 keypart.value_type = ValueType::EntityId;
             }
         }
-        // The planner uses String when an ORDER BY property's type is unknown.
-        // Those index bytes can put 10 before 5. Keep the candidate index, but
-        // compare actual values in the sort/top-K stage before applying LIMIT.
-        if order_by_spill
-            .presort
-            .iter()
-            .any(|order| index_spec.keyparts.iter().any(|part| part.key == order.path.column && part.value_type == ValueType::String))
-        {
+        // String is also the planner's unknown-type placeholder. Trust that
+        // ordering only when the property's canonical definition declares String;
+        // otherwise numeric values such as 10 and 5 need actual-value sorting.
+        let mut unproven_order = false;
+        for order in &order_by_spill.presort {
+            if index_spec.keyparts.iter().any(|part| part.full_path() == order.path.to_string() && part.value_type == ValueType::String)
+                && (!order.path.is_simple() || !self.declares_string(&order.path.column)?)
+            {
+                unproven_order = true;
+                break;
+            }
+        }
+        if unproven_order {
             order_by_spill.spill = std::mem::take(&mut order_by_spill.presort).into_iter().chain(order_by_spill.spill).collect();
         }
         let column = crate::materialization::MATERIALIZATION_COLUMN.to_owned();
@@ -186,6 +191,30 @@ impl SledModelStoreInner {
         // primary-tree point reads are the native index-to-record access path.
         let projected = SledMaterializationLookup::new(&self.tree, ids);
         self.finish_projected_scan(projected, remaining_predicate, order_by_spill, limit)
+    }
+
+    /// Predicate literals can be cast, so only the durable definition proves a
+    /// String index preserves this property's value ordering.
+    fn declares_string(&self, column: &str) -> Result<bool, RetrievalError> {
+        use ankurah_core::{
+            entity::TemporaryEntity,
+            selection::filter::Filterable,
+            value::{Value, ValueType},
+        };
+        use ankurah_proto::{StateFragment, SystemModel, SystemProperty};
+
+        let Some(slot) = crate::property::slot_from_planner_column(column) else { return Ok(false) };
+        let Some(PropertyId::EntityId(id)) = self.database.property_manager.property_for_slot(slot)? else { return Ok(false) };
+        let Some(bytes) = self.database.entities_tree.get(id.to_bytes()).map_err(crate::error::sled_error)? else { return Ok(false) };
+        let definition: StateFragment = bincode::deserialize(&bytes)?;
+        if !definition.state.memberships.contains(&ModelId::System(SystemModel::Property)) {
+            return Ok(false);
+        }
+        let entity = TemporaryEntity::new(id, &definition.state)?;
+        let Some(Value::String(value_type)) = entity.value(&PropertyId::System(SystemProperty::ValueType)) else {
+            return Err(RetrievalError::storage(format!("property definition {id} has no string value_type")));
+        };
+        Ok(ValueType::from_property_str(&value_type) == Some(ValueType::String))
     }
 
     /// Reject nonmembers before loading state, preserving index order and LIMIT after filtering.
@@ -489,6 +518,75 @@ mod tests {
         commit_canonical_state(&engine, Clock::default(), state.clone()).await;
         let stored = engine.get_state(entity).await.unwrap().payload.state;
         assert_eq!(stored.head, state.payload.state.head);
+    }
+
+    #[tokio::test]
+    async fn declared_string_limit_does_not_read_later_candidates() {
+        use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Selection};
+        use ankurah_proto::{SystemModel, SystemProperty};
+
+        let engine = crate::SledStorageEngine::new_test().unwrap();
+        let model = ModelId::EntityId(entity_id(101));
+        let property_id = entity_id(201);
+        let property = PropertyId::EntityId(property_id);
+        let definition = state_with_strings(
+            property_id,
+            9,
+            &[
+                (PropertyId::System(SystemProperty::Name), "name"),
+                (PropertyId::System(SystemProperty::Backend), "lww"),
+                (PropertyId::System(SystemProperty::ValueType), "string"),
+            ],
+        );
+        commit_state(&engine, Clock::default(), ModelId::System(SystemModel::Property), definition).await;
+        for (byte, name) in [(1, "B"), (2, "M"), (3, "Z")] {
+            commit_state(&engine, Clock::default(), model, state_with_strings(entity_id(byte), byte, &[(property, name)])).await;
+        }
+        let mut selection = Selection {
+            predicate: Predicate::Comparison {
+                left: Box::new(Expr::Path(property.into())),
+                operator: ComparisonOperator::GreaterThan,
+                right: Box::new(Expr::Literal(Value::String("A".into()))),
+            },
+            order_by: Some(vec![OrderByItem { path: property.into(), direction: OrderDirection::Asc }]),
+            limit: Some(1),
+        }
+        .and_member_of(model);
+        // Build both ordered indexes before damaging a matching nonwinner.
+        for direction in [OrderDirection::Asc, OrderDirection::Desc] {
+            selection.order_by.as_mut().unwrap()[0].direction = direction;
+            engine.fetch_states(&selection).await.unwrap();
+        }
+        let (entities, projected, slot) = {
+            let database = engine.database.lock().unwrap();
+            (
+                database.entities_tree.clone(),
+                database.materialization(&model).unwrap().unwrap(),
+                database.property_manager.slot_of(&property).unwrap().unwrap(),
+            )
+        };
+        let later = entities.insert(entity_id(2).to_bytes(), b"invalid canonical state").unwrap().unwrap();
+        let projection = projected.get(entity_id(2).to_bytes()).unwrap().unwrap();
+        for (direction, winner, sentinel) in [(OrderDirection::Asc, 1, "AA"), (OrderDirection::Desc, 3, "ZZ")] {
+            // A full projected-value scan would promote this nonwinner and try
+            // to read its corrupt state. A bounded index scan never reaches it.
+            projected.insert(entity_id(2).to_bytes(), bincode::serialize(&vec![(slot, Value::String(sentinel.into()))]).unwrap()).unwrap();
+            selection.order_by.as_mut().unwrap()[0].direction = direction;
+            assert_eq!(engine.fetch_states(&selection).await.unwrap()[0].payload.entity_id, entity_id(winner));
+            let mut unlimited = selection.clone();
+            unlimited.limit = None;
+            assert!(engine.fetch_states(&unlimited).await.is_err(), "an unlimited scan must encounter the damaged candidate");
+        }
+        // Without a declaration, even a String predicate literal cannot prove
+        // ordering: the conservative scan reaches the damaged candidate.
+        let definition = entities.remove(property_id.to_bytes()).unwrap().unwrap();
+        assert!(engine.fetch_states(&selection).await.is_err());
+        entities.insert(property_id.to_bytes(), definition).unwrap();
+        // A corrupt definition must not silently degrade into an untyped scan.
+        entities.insert(entity_id(2).to_bytes(), later).unwrap();
+        projected.insert(entity_id(2).to_bytes(), projection).unwrap();
+        entities.insert(property_id.to_bytes(), b"invalid property definition").unwrap();
+        assert!(engine.fetch_states(&selection).await.is_err());
     }
 
     #[tokio::test]
