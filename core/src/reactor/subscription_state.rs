@@ -131,26 +131,28 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
     /// Clear current results when the reactor closes.
     pub fn close(&self) {
-        let (update_items, broadcast) = {
-            let state = &mut *self.state.lock().unwrap();
-            let mut update_items = Vec::new();
-            for (query_id, query_state) in std::mem::take(&mut state.queries) {
-                for entity_id in query_state.resultset.keys() {
-                    if let Some(entity) = state.entities.get(&entity_id).filter(|entity| query_state.source.can_read(entity)) {
-                        update_items.push(ReactorUpdateItem {
-                            entity: entity.clone(),
-                            events: vec![],
-                            predicate_relevance: vec![(query_id, MembershipChange::Remove)],
-                        });
-                    }
-                }
-                query_state.resultset.set_loaded(false);
-                query_state.resultset.clear();
-            }
+        let (queries, entities, broadcast) = {
+            let mut state = self.state.lock().unwrap();
             state.entity_subscriptions.clear();
-            state.entities.clear();
-            (update_items, state.broadcast.clone())
+            (std::mem::take(&mut state.queries), std::mem::take(&mut state.entities), state.broadcast.clone())
         };
+
+        // Resultset listeners can drop subscription handles and reenter cleanup.
+        // Detach the state before notifying them or dropping query-owned values.
+        let mut update_items = Vec::new();
+        for (query_id, query_state) in queries {
+            for entity_id in query_state.resultset.keys() {
+                if let Some(entity) = entities.get(&entity_id).filter(|entity| query_state.source.can_read(entity)) {
+                    update_items.push(ReactorUpdateItem {
+                        entity: entity.clone(),
+                        events: vec![],
+                        predicate_relevance: vec![(query_id, MembershipChange::Remove)],
+                    });
+                }
+            }
+            query_state.resultset.set_loaded(false);
+            query_state.resultset.clear();
+        }
 
         if !update_items.is_empty() {
             broadcast.send(ReactorUpdate { items: update_items });
@@ -641,5 +643,62 @@ impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::
             }
             Entry::Occupied(o) => o.get().resultset.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{entity::Entity, reactor::fetch_gap::GapFetcher};
+    use ankurah_signals::{broadcast::Broadcast, Signal};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    struct EmptySource;
+
+    #[async_trait::async_trait]
+    impl LocalEntitySource<Entity> for EmptySource {
+        async fn fetch_entities_from_local(&self, _selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GapFetcher<Entity> for EmptySource {
+        async fn fetch_gap(
+            &self,
+            _selection: &ankql::ast::Selection<Resolved>,
+            _last_entity: Option<&Entity>,
+            _gap_size: usize,
+        ) -> Result<Vec<Entity>, RetrievalError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn close_listeners_can_reenter_subscription_cleanup() {
+        let subscription = Subscription::<Entity, ()>::new(Broadcast::new(), Arc::new(Mutex::new(crate::reactor::WatcherSet::new())));
+        let resultset = EntityResultSet::empty();
+        resultset.set_loaded(true);
+        subscription.ensure_query_registered(proto::QueryId::new(), resultset.clone(), Arc::new(EmptySource), Arc::new(EmptySource));
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let _listener = resultset.listen(Arc::new({
+            let subscription = subscription.clone();
+            let notifications = notifications.clone();
+            move |_| {
+                // Use try_lock so a regression fails instead of hanging the test runner.
+                let state = subscription.state.try_lock().expect("close must release state before notifying listeners");
+                assert!(state.queries.is_empty());
+                drop(state);
+                assert!(subscription.take_all_queries().is_empty());
+                notifications.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        subscription.close();
+        assert!(!resultset.is_loaded());
+        assert!(notifications.load(Ordering::SeqCst) > 0);
     }
 }
