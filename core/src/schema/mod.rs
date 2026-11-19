@@ -44,9 +44,9 @@ pub(crate) fn is_catalog_read<S: ankql::ast::Stage<ModelId = ModelId>>(predicate
 pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) -> bool {
     use ankurah_proto::NodeRequestBody;
     match request {
-        NodeRequestBody::Fetch { selection, .. } | NodeRequestBody::SubscribeQuery { selection, .. } => {
-            is_catalog_read(&selection.predicate)
-        }
+        NodeRequestBody::Fetch { selection, .. }
+        | NodeRequestBody::SubscribeQuery { selection, .. }
+        | NodeRequestBody::Compare { selection, .. } => is_catalog_read(&selection.predicate),
         NodeRequestBody::Get { .. }
         | NodeRequestBody::GetEvents { .. }
         | NodeRequestBody::CommitTransaction { .. }
@@ -115,15 +115,22 @@ mod request_policy_tests {
             let requests = [
                 NodeRequestBody::Fetch {
                     selection: Predicate::MemberOf(model).into(),
-                    known_matches: Vec::new(),
+                    comparison: ankurah_proto::ComparisonId::new(),
+                    key_spec: ankurah_core_types::key_spec::KeySpec::new(Vec::new()),
                     known_state: ankurah_proto::KnownState::empty(),
                 },
                 NodeRequestBody::SubscribeQuery {
                     query_id: QueryId::new(),
                     selection: Predicate::MemberOf(model).into(),
                     version: 1,
-                    known_matches: Vec::new(),
+                    comparison: ankurah_proto::ComparisonId::new(),
+                    key_spec: ankurah_core_types::key_spec::KeySpec::new(Vec::new()),
                     known_state: ankurah_proto::KnownState::empty(),
+                },
+                NodeRequestBody::Compare {
+                    comparison: ankurah_proto::ComparisonId::new(),
+                    selection: Predicate::MemberOf(model).into(),
+                    request: ankurah_proto::ComparisonRequest::Pages { spans: vec![ankurah_digest_tree::Span::all()] },
                 },
             ];
             for request in requests {

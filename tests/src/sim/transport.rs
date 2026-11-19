@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 /// keys everything on `src`/`dst` logical indices instead.)
 pub struct Outbound {
     pub src: usize,
+    pub recipient: proto::EntityId,
     pub message: proto::NodeMessage,
 }
 
@@ -66,7 +67,7 @@ impl SimSender {
 #[async_trait::async_trait]
 impl PeerSender for SimSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-        self.captured.push(Outbound { src: self.src, message });
+        self.captured.push(Outbound { src: self.src, recipient: self.recipient, message });
         Ok(())
     }
 
@@ -108,13 +109,16 @@ fn semantic_descriptor(message: &proto::NodeMessage) -> String {
             format!("RESP {}", response_descriptor(&response.body))
         }
         proto::NodeMessage::Update(update) => {
-            let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
-            let mut parts: Vec<String> = items.iter().map(update_item_descriptor).collect();
+            let mut parts: Vec<String> = match &update.body {
+                proto::NodeUpdateBody::SubscriptionUpdate { items } => items.iter().map(update_item_descriptor).collect(),
+                proto::NodeUpdateBody::Comparison { deltas, .. } => deltas.iter().map(delta_descriptor).collect(),
+            };
             parts.sort();
             format!("UPD [{}]", parts.join(","))
         }
         proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
         proto::NodeMessage::UnsubscribeQuery { .. } => "UNSUB".to_string(),
+        proto::NodeMessage::ReleaseComparison { .. } => "RELEASECOMPARISON".to_string(),
     }
 }
 
@@ -139,6 +143,12 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
         proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
+        proto::NodeRequestBody::Compare { selection, request, .. } => match request {
+            proto::ComparisonRequest::Pages { spans } => format!("compare {selection} pages {spans:?}"),
+            proto::ComparisonRequest::Repair { members, events_only, .. } => {
+                format!("compare {selection} repair {events_only} {members:?}")
+            }
+        },
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
         }
@@ -151,7 +161,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         proto::NodeResponseBody::SchemaRegistered { model } => {
             format!("schemaregistered {} {}p", model.label, model.properties.len())
         }
-        proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
+        proto::NodeResponseBody::Fetch(target) => format!("fetch {:?} {:?}", target.known_state, target.page),
         proto::NodeResponseBody::Get(results) => {
             let mut ss: Vec<String> = results
                 .iter()
@@ -165,12 +175,26 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
             format!("get [{}]", ss.join("+"))
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
-        proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
+        proto::NodeResponseBody::QuerySubscribed { target, .. } => format!("subscribed {:?} {:?}", target.known_state, target.page),
+        proto::NodeResponseBody::Compared(reply) => match reply {
+            Ok(proto::ComparisonReply::Pages(pages)) => format!("pages {pages:?}"),
+            Ok(proto::ComparisonReply::Repaired { unavailable, .. }) => format!("repaired {unavailable:?}"),
+            Err(error) => format!("comparison error:{error}"),
+        },
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).
         proto::NodeResponseBody::Error(e) => format!("error:{e}"),
     }
+}
+
+fn delta_descriptor(delta: &proto::EntityDelta) -> String {
+    let content = match &delta.content {
+        proto::DeltaContent::StateSnapshot { state } => format!("state:{}", state.state.head),
+        proto::DeltaContent::EventBridge { events } => format!("events:{}", fragment_ids(delta.entity_id, events)),
+        proto::DeltaContent::StateAndRelation { state, relation } => format!("state:{} relation:{relation:?}", state.state.head),
+    };
+    format!("{}:{content}", delta.entity_id)
 }
 
 fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {

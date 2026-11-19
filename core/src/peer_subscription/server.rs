@@ -19,7 +19,8 @@ use std::collections::HashMap;
 
 /// Owns one peer's reactor subscription and per-query credential sources.
 pub struct SubscriptionHandler<CD: ContextData> {
-    _peer_id: proto::EntityId,
+    peer_id: proto::EntityId,
+    release_comparison: Box<dyn Fn(proto::ComparisonId) + Send + Sync>,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
     /// Tracks each standing query's version and the credential source shared with its gap fetcher.
@@ -32,6 +33,17 @@ struct StandingQuery<CD: ContextData> {
     /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
     sessions: SessionSet<CD>,
     version: u32,
+    comparison: Option<proto::ComparisonId>,
+}
+
+impl<CD: ContextData> Drop for SubscriptionHandler<CD> {
+    fn drop(&mut self) {
+        for query in self.queries.get_mut().values() {
+            if let Some(id) = query.comparison {
+                (self.release_comparison)(id);
+            }
+        }
+    }
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
@@ -42,6 +54,12 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     {
         let subscription = node.reactor.subscribe();
         let weak_node = node.weak();
+        let comparison_node = weak_node.clone();
+        let release_comparison = Box::new(move |id| {
+            if let Some(node) = comparison_node.upgrade() {
+                node.release_comparison(peer_id, id);
+            }
+        });
 
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
@@ -57,7 +75,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             }
         });
 
-        Self { _peer_id: peer_id, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
+        Self { peer_id, release_comparison, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
     }
 
     /// Get the subscription ID for this peer.
@@ -72,7 +90,11 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // Reactor removal is synchronous and does not call back into this handler.
         let mut queries = self.queries.lock().await;
         let removed = self.subscription.remove_predicate(query_id);
-        queries.remove(&query_id);
+        if let Some(standing) = queries.remove(&query_id) {
+            if let Some(id) = standing.comparison {
+                (self.release_comparison)(id);
+            }
+        }
         removed
     }
 
@@ -84,7 +106,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         mut selection: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
-        known_matches: Vec<proto::KnownEntity>,
+        comparison: proto::ComparisonId,
+        key_spec: ankurah_core_types::key_spec::KeySpec<proto::PropertyId>,
+        known_state: proto::KnownState,
     ) -> anyhow::Result<proto::NodeResponseBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -96,6 +120,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         }
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
+        let requested = selection.clone();
         // Re-subscribes revalidate; #426 owns denied-update claw-back.
         selection.predicate = policy.filter_predicate(selection.predicate)?;
 
@@ -106,7 +131,16 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 if version < standing.version {
                     anyhow::bail!("stale subscription version {version} for query {query_id}; current version is {}", standing.version);
                 }
+                if standing.comparison == Some(comparison) {
+                    return Err(crate::error::RetrievalError::storage(proto::ComparisonFailure::InvalidRequest(
+                        "comparison identity is already in use".into(),
+                    ))
+                    .into());
+                }
                 standing.version = version;
+                if let Some(old) = standing.comparison.replace(comparison) {
+                    (self.release_comparison)(old);
+                }
                 (standing.sessions.clone(), false)
             }
             Entry::Vacant(v) => {
@@ -114,77 +148,55 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                     Some(cdata) => cdata.clone().into(),
                     None => SessionSet::new(),
                 };
-                v.insert(StandingQuery { sessions: sessions.clone(), version });
+                v.insert(StandingQuery { sessions: sessions.clone(), version, comparison: Some(comparison) });
                 (sessions, true)
             }
         };
 
-        let response = self.subscribe_query_inner(node, query_id, selection, &sessions, &credentials, version, known_matches).await;
-
-        if response.is_err() && query_created {
-            queries.remove(&query_id);
-            let _ = self.subscription.remove_predicate(query_id);
+        let mut installation = Installation {
+            queries: &mut queries,
+            subscription: &self.subscription,
+            query: query_id,
+            created: query_created,
+            completed: false,
+        };
+        let response = async {
+            let context = crate::context::Context::new_weak(node, sessions);
+            let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(context.clone()));
+            let included_entities = context.0.fetch_entities_from_local(&selection).await?;
+            // Install future updates before fixing the initial comparison target.
+            self.subscription.upsert_query(query_id, selection.clone(), included_entities, gap_fetcher, context.0, version).await?;
+            let target =
+                node.begin_scoped_comparison(self.peer_id, comparison, requested, selection, key_spec, known_state, &credentials).await?;
+            Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target })
         }
+        .await;
+        installation.completed = response.is_ok();
         response
     }
+}
 
-    /// Install the query and build its versioned initial delta response.
-    async fn subscribe_query_inner<SE, PA>(
-        &self,
-        node: &Node<SE, PA>,
-        query_id: proto::QueryId,
-        selection: ankql::ast::Selection<Resolved>,
-        sessions: &SessionSet<CD>,
-        credentials: &Vec<CD>,
-        version: u32,
-        known_matches: Vec<proto::KnownEntity>,
-    ) -> anyhow::Result<proto::NodeResponseBody>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
-    {
-        let context = crate::context::Context::new_weak(node, sessions.clone());
-        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(context.clone()));
+/// Keep failure and cancellation cleanup identical while the handler's query
+/// lock prevents an unsubscribe or newer installation from racing this one.
+struct Installation<'a, CD: ContextData> {
+    queries: &'a mut HashMap<proto::QueryId, StandingQuery<CD>>,
+    subscription: &'a ReactorSubscription,
+    query: proto::QueryId,
+    created: bool,
+    completed: bool,
+}
 
-        let included_entities = context.0.fetch_entities_from_local(&selection).await?;
-        let matching_entities =
-            self.subscription.upsert_query(query_id, selection.clone(), included_entities, gap_fetcher, context.0, version).await?;
-
-        // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
-
-        // TASK: Optimize to avoid re-attesting entities fetched from storage https://github.com/ankurah/ankurah/issues/148
-        let initial_states: Vec<_> = matching_entities
-            .into_iter()
-            .filter_map(|e| {
-                let entity_state = e.to_entity_state().ok()?;
-                let attestation = node.policy_agent.attest_state(node, &entity_state);
-                Some(Attested::opt(entity_state, attestation))
-            })
-            .collect();
-
-        let expanded_states = crate::util::expand_states::expand_states(
-            initial_states,
-            known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-            node.storage.as_ref(),
-        )
-        .await?;
-
-        let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
-
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-        let mut deltas = Vec::with_capacity(expanded_states.len());
-        for state in expanded_states {
-            // `known_matches` may resurface rows outside the current policy.
-            if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
-                continue;
-            }
-
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, credentials).await? {
-                deltas.push(delta);
-            }
+impl<CD: ContextData> Drop for Installation<'_, CD> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
         }
-
-        Ok(proto::NodeResponseBody::QuerySubscribed { query_id, deltas })
+        if self.created {
+            self.queries.remove(&self.query);
+            let _ = self.subscription.remove_predicate(self.query);
+        } else if let Some(query) = self.queries.get_mut(&self.query) {
+            query.comparison = None;
+        }
     }
 }
 
@@ -233,3 +245,6 @@ where
     // Create subscription update item
     Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), content, predicate_relevance })
 }
+
+#[cfg(test)]
+mod tests;

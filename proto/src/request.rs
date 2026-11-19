@@ -39,9 +39,7 @@ pub struct KnownEntity {
 
 /// The digest of the requester's locally known members of this request's Selection.
 ///
-/// Sent alongside `known_matches` for verification. Receivers currently use only
-/// `known_matches` to select responses; this digest neither suppresses transfers
-/// nor establishes query completion.
+/// Compared only when both peers agree on the Selection and key specification.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct KnownState {
     pub digest: ankurah_digest_tree::Digest<ankurah_digest_tree::Ristretto255>,
@@ -114,15 +112,15 @@ pub struct CausalAssertionFragment {
 /// Content for entity initialization - either bridge, state, or attested state
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DeltaContent {
-    /// Entity not in known_matches; send full state snapshot
+    /// Current state for an entity whose requester has no known head.
     StateSnapshot { state: StateFragment },
-    /// Entity present in known matches with a small event gap
+    /// Verified events that repair a known entity version.
     EventBridge { events: Vec<EventFragment> },
-    /// Entity present in known matches with a large event gap; send state + causal assertion
+    /// State plus an attested causal relation; reserved for a future repair strategy.
     StateAndRelation { state: StateFragment, relation: CausalAssertionFragment },
 }
 
-/// Entity initialization data returned in QuerySubscribed and Fetch
+/// Entity repair delivered through the peer update channel.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
@@ -146,15 +144,23 @@ pub enum NodeRequestBody {
     },
     Fetch {
         selection: ast::Selection<ast::Resolved>,
-        known_matches: Vec<KnownEntity>,
+        comparison: crate::ComparisonId,
+        key_spec: ankurah_core_types::key_spec::KeySpec<crate::PropertyId>,
         known_state: KnownState,
     },
     SubscribeQuery {
         query_id: QueryId,
         selection: ast::Selection<ast::Resolved>,
         version: u32,
-        known_matches: Vec<KnownEntity>,
+        comparison: crate::ComparisonId,
+        key_spec: ankurah_core_types::key_spec::KeySpec<crate::PropertyId>,
         known_state: KnownState,
+    },
+    /// Every request is authenticated and remains bound to the original selection.
+    Compare {
+        comparison: crate::ComparisonId,
+        selection: ast::Selection<ast::Resolved>,
+        request: crate::ComparisonRequest,
     },
     /// Register one model's schema: an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
@@ -185,14 +191,15 @@ pub enum NodeResponseBody {
     CommitComplete {
         id: TransactionId,
     },
-    Fetch(Vec<EntityDelta>),
+    Fetch(crate::ComparisonTarget),
     /// One outcome per requested identity, in request order.
     Get(Vec<GetResult>),
     GetEvents(Vec<Attested<Event>>),
     QuerySubscribed {
         query_id: QueryId,
-        deltas: Vec<EntityDelta>,
+        target: crate::ComparisonTarget,
     },
+    Compared(Result<crate::ComparisonReply, crate::ComparisonFailure>),
     /// The resolved schema, with build ids echoed for descriptor binding.
     SchemaRegistered {
         model: RegisteredModel,
@@ -273,12 +280,13 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::GetEvents { event_ids } => {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
-            NodeRequestBody::Fetch { selection: query, known_matches, .. } => {
-                write!(f, "Fetch {query} known:{}", known_matches.len())
+            NodeRequestBody::Fetch { selection: query, comparison, .. } => {
+                write!(f, "Fetch {query} comparison:{comparison:?}")
             }
-            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_matches, .. } => {
-                write!(f, "Subscribe {query_id} {query} v{version} known:{}", known_matches.len())
+            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, comparison, .. } => {
+                write!(f, "Subscribe {query_id} {query} v{version} comparison:{comparison:?}")
             }
+            NodeRequestBody::Compare { comparison, .. } => write!(f, "Compare {comparison:?}"),
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
@@ -289,8 +297,8 @@ impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
-            NodeResponseBody::Fetch(deltas) => {
-                write!(f, "Fetch [{}]", deltas.len()) // TODO display deltas
+            NodeResponseBody::Fetch(target) => {
+                write!(f, "Fetch comparison:{:?}", target.id)
             }
             NodeResponseBody::Get(states) => {
                 write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
@@ -298,7 +306,8 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
+            NodeResponseBody::QuerySubscribed { query_id, target } => write!(f, "Subscribed {query_id} comparison:{:?}", target.id),
+            NodeResponseBody::Compared(reply) => write!(f, "Compared {}", if reply.is_ok() { "ok" } else { "refused" }),
             NodeResponseBody::SchemaRegistered { model } => {
                 write!(f, "SchemaRegistered {} properties:{}", model.label, model.properties.len())
             }
@@ -333,32 +342,32 @@ mod tests {
     use ankurah_digest_tree::{Digest, LtHash16};
 
     #[test]
-    fn query_requests_round_trip_both_accounts() {
-        let known = KnownEntity { entity_id: EntityId::from_bytes([7; 32]), head: Clock::default() };
+    fn query_requests_round_trip_comparison_identity_and_known_state() {
+        let comparison = crate::ComparisonId::new();
         for request in [
             NodeRequestBody::Fetch {
                 selection: ast::Predicate::True.into(),
-                known_matches: vec![known.clone()],
+                comparison,
+                key_spec: ankurah_core_types::key_spec::KeySpec::new(vec![]),
                 known_state: KnownState::empty(),
             },
             NodeRequestBody::SubscribeQuery {
                 query_id: QueryId::new(),
                 selection: ast::Predicate::True.into(),
                 version: 1,
-                known_matches: vec![known.clone()],
+                comparison,
+                key_spec: ankurah_core_types::key_spec::KeySpec::new(vec![]),
                 known_state: KnownState::empty(),
             },
         ] {
             let encoded = bincode::serialize(&request).unwrap();
             let decoded: NodeRequestBody = bincode::deserialize(&encoded).unwrap();
-            let (known_matches, known_state) = match decoded {
-                NodeRequestBody::Fetch { known_matches, known_state, .. }
-                | NodeRequestBody::SubscribeQuery { known_matches, known_state, .. } => (known_matches, known_state),
+            let (actual, known_state) = match decoded {
+                NodeRequestBody::Fetch { comparison, known_state, .. }
+                | NodeRequestBody::SubscribeQuery { comparison, known_state, .. } => (comparison, known_state),
                 _ => panic!("query request changed kind"),
             };
-            assert_eq!(known_matches.len(), 1);
-            assert_eq!(known_matches[0].entity_id, known.entity_id);
-            assert_eq!(known_matches[0].head, known.head);
+            assert_eq!(actual, comparison);
             assert_eq!(known_state, KnownState::empty());
         }
     }

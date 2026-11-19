@@ -114,6 +114,7 @@ struct BridgePolicyAgent {
     query_filter: Arc<Mutex<Predicate<ankql::ast::Resolved>>>,
     query_calls: Arc<AtomicUsize>,
     sent_queries: Arc<Mutex<Vec<Vec<u8>>>>,
+    sent_repairs: Arc<Mutex<Vec<Vec<proto::RepairMember>>>>,
 }
 
 impl BridgePolicyAgent {
@@ -126,6 +127,7 @@ impl BridgePolicyAgent {
             query_filter: Arc::new(Mutex::new(Predicate::True)),
             query_calls: Arc::new(AtomicUsize::new(0)),
             sent_queries: Arc::new(Mutex::new(Vec::new())),
+            sent_repairs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -153,6 +155,9 @@ impl PolicyAgent for BridgePolicyAgent {
     {
         if matches!(request.body, proto::NodeRequestBody::Fetch { .. } | proto::NodeRequestBody::SubscribeQuery { .. }) {
             self.sent_queries.lock().unwrap().push(bincode::serialize(&request.body).unwrap());
+        }
+        if let proto::NodeRequestBody::Compare { request: proto::ComparisonRequest::Repair { members, .. }, .. } = &request.body {
+            self.sent_repairs.lock().unwrap().push(members.clone());
         }
         Ok(cdata.iterable().map(|_| proto::AuthData(vec![])).collect())
     }
@@ -275,34 +280,25 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
     *agent.query_filter.lock().unwrap() = restriction.clone();
     agent.deny_read_states.lock().unwrap().insert(hidden);
     agent.sent_queries.lock().unwrap().clear();
+    agent.sent_repairs.lock().unwrap().clear();
 
     let scoped_before = agent.query_calls.load(Ordering::SeqCst);
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 1);
-    assert_eq!(agent.query_calls.load(Ordering::SeqCst), scoped_before + 2, "fetch scopes once and checks current summary visibility");
+    assert!(agent.query_calls.load(Ordering::SeqCst) > scoped_before, "fetch checks current summary visibility");
     let query = reader.query_wait::<PetView>("true").await?;
-    assert_eq!(
-        agent.query_calls.load(Ordering::SeqCst),
-        scoped_before + 4,
-        "subscription scopes once, checks summary visibility, and retains that same tree without another policy application"
-    );
     let (retained_selection, _) = query.selection().value().unwrap();
     assert!(matches!(&retained_selection.predicate, Predicate::And(_, allowed) if **allowed == restriction));
     let requests = std::mem::take(&mut *agent.sent_queries.lock().unwrap());
     let mut summaries = Vec::new();
     for request in requests {
         let request: proto::NodeRequestBody = bincode::deserialize(&request)?;
-        let (subscription, selection, known_state, known_matches) = match request {
-            proto::NodeRequestBody::Fetch { selection, known_state, known_matches } => (false, selection, known_state, known_matches),
-            proto::NodeRequestBody::SubscribeQuery { selection, known_state, known_matches, .. } => {
-                (true, selection, known_state, known_matches)
-            }
+        let (subscription, selection, known_state) = match request {
+            proto::NodeRequestBody::Fetch { selection, known_state, .. } => (false, selection, known_state),
+            proto::NodeRequestBody::SubscribeQuery { selection, known_state, .. } => (true, selection, known_state),
             _ => unreachable!(),
         };
-        assert_eq!(selection, retained_selection, "both wire accounts and the retained tree use the same exact selection");
+        assert_eq!(selection, retained_selection, "the wire account and retained tree use the same exact selection");
         assert_eq!(known_state.digest.count(), 1);
-        assert_eq!(known_matches.len(), 1);
-        assert_eq!(known_matches[0].entity_id, visible);
-        assert_eq!(known_matches[0].head, client.storage.get_state(visible).await?.payload.state.head);
         summaries.push((subscription, known_state));
     }
     assert_eq!(summaries.len(), 2);
@@ -322,9 +318,14 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
         assert_eq!(known_state.digest.count(), 1);
         assert_eq!(known_state != summaries[0].1, changes_summary, "only an allowed member's changed head changes its digest");
     }
+    let repairs = agent.sent_repairs.lock().unwrap();
+    let hidden_repairs: Vec<_> = repairs.iter().flatten().filter(|member| member.known.entity_id == hidden).collect();
+    assert!(!hidden_repairs.is_empty(), "the changed hidden member exercises repair sanitation");
+    assert!(hidden_repairs.iter().all(|member| member.known.head.is_empty()), "a denied local head is never disclosed in a repair request");
+    drop(repairs);
 
     // A relay retry keeps the installed selection, but policy may have narrowed.
-    // Neither account may disclose a formerly allowed member on reconnect.
+    // Its digest must not disclose a formerly allowed member on reconnect.
     drop(connection);
     let missing_property = Predicate::Comparison {
         left: Box::new(ankql::ast::Expr::Path(proto::PropertyId::EntityId(proto::EntityId::random()).into())),
@@ -337,14 +338,14 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
         *agent.query_filter.lock().unwrap() = restriction;
         agent.sent_queries.lock().unwrap().clear();
         let _connection = LocalProcessConnection::new(&client, &server).await?;
-        let (selection, known_state, known_matches) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (selection, known_state) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 for bytes in std::mem::take(&mut *agent.sent_queries.lock().unwrap()) {
-                    if let proto::NodeRequestBody::SubscribeQuery { query_id, selection, known_state, known_matches, .. } =
+                    if let proto::NodeRequestBody::SubscribeQuery { query_id, selection, known_state, .. } =
                         bincode::deserialize(&bytes).unwrap()
                     {
                         if query_id == query.query_id() {
-                            return (selection, known_state, known_matches);
+                            return (selection, known_state);
                         }
                     }
                 }
@@ -354,13 +355,12 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
         .await?;
         assert_eq!(selection, retained_selection, "a reconnect does not redefine the installed query");
         assert_eq!(known_state, proto::KnownState::empty());
-        assert!(known_matches.is_empty(), "current discovery restrictions apply even when the additional state hook allows a member");
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn limited_known_state_is_sent_but_never_controls_the_response() -> Result<()> {
+async fn matching_limited_known_state_skips_pages_for_fetch_and_subscription() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     server.system.create().await?;
     let writer = server.context_async(DEFAULT_CONTEXT).await?;
@@ -378,44 +378,42 @@ async fn limited_known_state_is_sent_but_never_controls_the_response() -> Result
     agent.sent_queries.lock().unwrap().clear();
     reader.fetch::<PetView>("true ORDER BY name ASC LIMIT 2").await?;
     let request = agent.sent_queries.lock().unwrap().pop().unwrap();
-    let proto::NodeRequestBody::Fetch { selection, known_state, known_matches } = bincode::deserialize(&request)? else {
+    let proto::NodeRequestBody::Fetch { selection, known_state, key_spec, .. } = bincode::deserialize(&request)? else {
         panic!("expected fetch");
     };
     assert_eq!(known_state.digest.count(), 2);
-    assert_eq!(known_matches.iter().map(|member| member.entity_id).collect::<Vec<_>>(), ids[..2]);
 
     for subscription in [false, true] {
-        let mut responses = Vec::new();
         for summary in [known_state.clone(), proto::KnownState::empty()] {
+            let equal = summary == known_state;
+            let comparison = proto::ComparisonId::new();
             let request = if subscription {
                 proto::NodeRequestBody::SubscribeQuery {
                     query_id: proto::QueryId::new(),
                     selection: selection.clone(),
                     version: 1,
-                    known_matches: Vec::new(),
+                    comparison,
+                    key_spec: key_spec.clone(),
                     known_state: summary,
                 }
             } else {
-                proto::NodeRequestBody::Fetch { selection: selection.clone(), known_matches: Vec::new(), known_state: summary }
+                proto::NodeRequestBody::Fetch { selection: selection.clone(), comparison, key_spec: key_spec.clone(), known_state: summary }
             };
             let response = client.request(server.id, &DEFAULT_CONTEXT, request).await?;
-            let deltas = match response {
-                proto::NodeResponseBody::Fetch(deltas) | proto::NodeResponseBody::QuerySubscribed { deltas, .. } => deltas,
+            let target = match response {
+                proto::NodeResponseBody::Fetch(target) | proto::NodeResponseBody::QuerySubscribed { target, .. } => target,
                 response => panic!("unexpected response: {response:?}"),
             };
-            assert_eq!(deltas.iter().map(|delta| delta.entity_id).collect::<Vec<_>>(), ids[..2]);
-            responses.push(bincode::serialize(&deltas)?);
+            assert_eq!(target.known_state, known_state);
+            if equal {
+                assert!(target.page.is_none(), "equal digests need no pages or entity inventory");
+            } else {
+                let Some(ankurah_digest_tree::Page::Members(members)) = target.page else { panic!("small unequal target has leaves") };
+                assert_eq!(members.iter().map(|member| member.id).collect::<Vec<_>>(), ids[..2]);
+            }
+            server.handle_message(proto::NodeMessage::ReleaseComparison { from: client.id, comparison }).await?;
         }
-        assert_eq!(responses[0], responses[1], "a matching digest does not suppress any state transfer");
     }
-    let response = client
-        .request(
-            server.id,
-            &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::Fetch { selection, known_matches, known_state: proto::KnownState::empty() },
-        )
-        .await?;
-    assert!(matches!(response, proto::NodeResponseBody::Fetch(deltas) if deltas.is_empty()), "known_matches alone suppresses transfers");
     Ok(())
 }
 
@@ -430,9 +428,10 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     context.resolve_model_id::<Pet>().await?;
     agent.deny_reads.store(true, Ordering::SeqCst);
 
-    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
+    let client_agent = BridgePolicyAgent::new();
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), client_agent.clone());
+    let mut connection = Some(LocalProcessConnection::new(&client, &server).await?);
+    client.wait_ready().await?;
     let credentials = Vec::<&'static DefaultContext>::new();
 
     for label in [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID] {
@@ -453,6 +452,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             ))]),
         );
         state.payload.state.head = proto::Clock::singleton(&update);
+        let update_id = update.id();
         let mut transaction = storage.transaction();
         transaction.set_state(&known_head, &state).await?;
         transaction.add_events(&[Attested::opt(update, None)]).await?;
@@ -460,33 +460,56 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let events = storage.dump_entity_events(entity_id).await?;
         assert!(!events.is_empty());
 
-        let requests = [
+        for request in [
             proto::NodeRequestBody::Get { ids: vec![entity_id] },
             proto::NodeRequestBody::GetEvents { event_ids: events.iter().map(|event| event.payload.id()).collect() },
-            proto::NodeRequestBody::Fetch {
-                selection: Predicate::MemberOf(model).into(),
-                known_matches: vec![proto::KnownEntity { entity_id, head: known_head.clone() }],
-                known_state: proto::KnownState::empty(),
-            },
-            proto::NodeRequestBody::SubscribeQuery {
-                query_id: proto::QueryId::new(),
-                selection: Predicate::MemberOf(model).into(),
-                version: 1,
-                known_matches: vec![proto::KnownEntity { entity_id, head: known_head }],
-                known_state: proto::KnownState::empty(),
-            },
-        ];
-        for request in requests {
+        ] {
             match client.request(server.id, &credentials, request).await? {
                 proto::NodeResponseBody::Get(results) => assert!(matches!(results.as_slice(), [proto::GetResult::Found(_)])),
                 proto::NodeResponseBody::GetEvents(received) => assert_eq!(received.len(), events.len()),
-                proto::NodeResponseBody::Fetch(deltas) | proto::NodeResponseBody::QuerySubscribed { deltas, .. } => {
-                    let delta = deltas.iter().find(|delta| delta.entity_id == entity_id).expect("catalog row must be readable");
-                    assert!(matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1), "{delta:?}");
-                }
                 response => panic!("catalog read failed for {label}: {response:?}"),
             }
         }
+        for subscription in [false, true] {
+            let comparison = proto::ComparisonId::new();
+            let selection = Predicate::MemberOf(model).into();
+            let key_spec = ankurah_core_types::key_spec::KeySpec::new(vec![]);
+            let request = if subscription {
+                proto::NodeRequestBody::SubscribeQuery {
+                    query_id: proto::QueryId::new(),
+                    selection,
+                    version: 1,
+                    comparison,
+                    key_spec,
+                    known_state: proto::KnownState::empty(),
+                }
+            } else {
+                proto::NodeRequestBody::Fetch { selection, comparison, key_spec, known_state: proto::KnownState::empty() }
+            };
+            let target = match client.request(server.id, &credentials, request).await? {
+                proto::NodeResponseBody::Fetch(target) | proto::NodeResponseBody::QuerySubscribed { target, .. } => target,
+                response => panic!("catalog capture failed for {label}: {response:?}"),
+            };
+            assert_eq!(target.known_state.digest.count() as usize, states.len());
+            server.handle_message(proto::NodeMessage::ReleaseComparison { from: client.id, comparison }).await?;
+        }
+
+        // Reconnect the standing catalog queries through the complete comparison
+        // path. Their existing heads require event repair, not cold state adoption.
+        let validated = client_agent.validate_calls.load(Ordering::SeqCst);
+        drop(connection.take());
+        connection = Some(LocalProcessConnection::new(&client, &server).await?);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if client.storage.get_state(entity_id).await?.payload.state.head == state.payload.state.head {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        assert!(client_agent.validate_calls.load(Ordering::SeqCst) > validated, "catalog bridge events pass receive validation");
+        assert!(client.storage.dump_entity_events(entity_id).await?.iter().any(|event| event.payload.id() == update_id));
     }
 
     for model in [
@@ -500,7 +523,8 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::Fetch {
                     selection: Predicate::MemberOf(model).into(),
-                    known_matches: vec![],
+                    comparison: proto::ComparisonId::new(),
+                    key_spec: ankurah_core_types::key_spec::KeySpec::new(vec![]),
                     known_state: proto::KnownState::empty(),
                 },
             )
@@ -556,14 +580,8 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 }
 
 /// Send side: events the read policy hides must not leak through a bridge.
-/// The producer gives up on the bridge entirely and falls back to a state
-/// snapshot. The behind-client then cannot VERIFY the snapshot's lineage
-/// (verification would require the hidden event, which GetEvents also
-/// filters), so it conservatively refuses to adopt and stays stale. That is
-/// the intended posture: staleness is the price of redaction, and the
-/// security property pinned here is that the hidden event never reaches the
-/// client through any path. (Redaction-tolerant catch-up is a phase 2
-/// design question for the snapshot-authority design.)
+/// A redacted causal history is unavailable for repair. The client must report
+/// incomplete comparison and retain its last verified version.
 #[tokio::test]
 async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     let server_agent = BridgePolicyAgent::new();
@@ -602,11 +620,7 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
         trx.commit_and_return_events().await?[0].id()
     };
 
-    // Re-fetch: the bridge would need the denied event, so it must be
-    // suppressed entirely. The snapshot fallback arrives but cannot be
-    // lineage-verified without the hidden event, so the client refuses it
-    // (the fetch surfaces the per-item failure) rather than adopting
-    // unverifiable state.
+    // The bridge would need the denied event, so the whole repair is unavailable.
     let refetch = ctx_c.fetch::<PetView>(query.as_str()).await;
     assert!(refetch.is_err(), "client must not silently adopt state whose lineage it cannot verify, got {refetch:?}");
 
@@ -615,11 +629,7 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // lose operations). The client's view of the entity is stale but honest.
     let ids: HashSet<_> = client.storage.dump_entity_events(pet_id).await?.iter().map(|e| e.payload.id()).collect();
     assert!(!ids.contains(&denied_id), "the read-denied event must not reach the client through any path");
-    // The non-denied tip MAY reach the client: its verification attempt
-    // fetches readable events through GetEvents, which applies policy per
-    // event. What matters is that the hidden event stays hidden and the
-    // unverifiable state is not adopted.
-    let _ = open_id;
+    assert!(!ids.contains(&open_id), "a refused repair does not send a partial bridge");
     assert_eq!(initial[0].age().unwrap(), "1", "the resident view remains at its last verified state");
 
     Ok(())

@@ -90,6 +90,9 @@ pub struct Scheduler {
     max_rounds: usize,
     /// Load-bearing request ids whose responses carry no collection.
     catalog_requests: std::collections::BTreeSet<proto::RequestId>,
+    /// Catalog comparison pages and repairs are part of the same readiness work.
+    catalog_comparisons: std::collections::HashSet<proto::ComparisonId>,
+    catalog_deliveries: std::collections::HashSet<proto::UpdateId>,
     /// Event retrieval must be able to finish while its requesting update is pending.
     retrieval_requests: std::collections::BTreeSet<proto::RequestId>,
 }
@@ -104,6 +107,8 @@ impl Scheduler {
             node_ids,
             max_rounds: 100_000,
             catalog_requests: std::collections::BTreeSet::new(),
+            catalog_comparisons: std::collections::HashSet::new(),
+            catalog_deliveries: std::collections::HashSet::new(),
             retrieval_requests: std::collections::BTreeSet::new(),
         }
     }
@@ -136,7 +141,11 @@ impl Scheduler {
     /// Readiness traffic is load-bearing; other node traffic may rely on retries.
     fn absorb_captured(&mut self) {
         for out in self.captured.drain() {
-            let Some(dst) = recipient_id(&out.message).and_then(|id| self.index_of(&id)) else { continue };
+            let recipient = match out.message {
+                proto::NodeMessage::ReleaseComparison { .. } => Some(out.recipient),
+                _ => recipient_id(&out.message),
+            };
+            let Some(dst) = recipient.and_then(|id| self.index_of(&id)) else { continue };
             let digest = message_digest(&out.message);
             let catalog_read = self.is_catalog_read(&out.message);
             if let proto::NodeMessage::Request { request, .. } = &out.message {
@@ -164,10 +173,23 @@ impl Scheduler {
         match message {
             proto::NodeMessage::Request { request, .. } => {
                 let protected = match &request.body {
-                    proto::NodeRequestBody::Fetch { selection, .. } => {
-                        selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy)
+                    proto::NodeRequestBody::Fetch { selection, comparison, .. } => {
+                        let catalog = selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy);
+                        if catalog {
+                            self.catalog_comparisons.insert(*comparison);
+                        }
+                        catalog
                     }
-                    proto::NodeRequestBody::SubscribeQuery { .. } => true,
+                    proto::NodeRequestBody::SubscribeQuery { comparison, .. } => {
+                        self.catalog_comparisons.insert(*comparison);
+                        true
+                    }
+                    proto::NodeRequestBody::Compare { comparison, request, .. } if self.catalog_comparisons.contains(comparison) => {
+                        if let proto::ComparisonRequest::Repair { delivery, .. } = request {
+                            self.catalog_deliveries.insert(delivery.clone());
+                        }
+                        true
+                    }
                     _ => return false,
                 };
                 if !protected {
@@ -177,6 +199,8 @@ impl Scheduler {
                 true
             }
             proto::NodeMessage::Response(response) => self.catalog_requests.contains(&response.request_id),
+            proto::NodeMessage::Update(update) => self.catalog_deliveries.contains(&update.id),
+            proto::NodeMessage::UpdateAck(ack) => self.catalog_deliveries.contains(&ack.id),
             _ => false,
         }
     }
@@ -413,7 +437,7 @@ fn recipient_id(message: &proto::NodeMessage) -> Option<proto::EntityId> {
         proto::NodeMessage::Response(response) => Some(response.to),
         proto::NodeMessage::Update(update) => Some(update.to),
         proto::NodeMessage::UpdateAck(ack) => Some(ack.to),
-        proto::NodeMessage::UnsubscribeQuery { .. } => None,
+        proto::NodeMessage::UnsubscribeQuery { .. } | proto::NodeMessage::ReleaseComparison { .. } => None,
     }
 }
 

@@ -163,7 +163,8 @@ async fn standing_query_membership_can_change_but_version_cannot_regress() -> an
         query_id,
         selection: selection.clone().and_member_of(proto::ModelId::System(model)),
         version,
-        known_matches: Vec::new(),
+        comparison: proto::ComparisonId::new(),
+        key_spec: ankurah_core_types::key_spec::KeySpec::new(vec![]),
         known_state: proto::KnownState::empty(),
     };
 

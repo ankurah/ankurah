@@ -14,7 +14,11 @@ async fn ordered_queries_use_validated_bindings_before_catalog_subscription_deli
         let hold = Arc::new(AtomicBool::new(false));
         let gated = hold.clone();
         let (connection, _gate) = GatedConnection::new(&server, &client, move |message| {
-            gated.load(Ordering::SeqCst) && matches!(message, proto::NodeMessage::Update(_))
+            gated.load(Ordering::SeqCst)
+                && matches!(
+                    message,
+                    proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::SubscriptionUpdate { .. }, .. })
+                )
         })
         .await;
         let server_ctx = server.context_async(DEFAULT_CONTEXT).await?;

@@ -26,6 +26,7 @@ pub enum NodeMessage {
     Update(NodeUpdate),
     UpdateAck(NodeUpdateAck),
     UnsubscribeQuery { from: EntityId, query_id: QueryId },
+    ReleaseComparison { from: EntityId, comparison: crate::ComparisonId },
 }
 
 impl std::fmt::Display for Message {
@@ -46,6 +47,7 @@ impl std::fmt::Display for NodeMessage {
             NodeMessage::Update(update) => write!(f, "Update: {}", update),
             NodeMessage::UpdateAck(update_ack) => write!(f, "UpdateAck: {}", update_ack),
             NodeMessage::UnsubscribeQuery { from, query_id } => write!(f, "Unsubscribe: {} {}", from, query_id),
+            NodeMessage::ReleaseComparison { from, comparison } => write!(f, "Release comparison: {from} {comparison:?}"),
         }
     }
 }

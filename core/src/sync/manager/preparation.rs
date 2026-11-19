@@ -2,53 +2,16 @@
 use std::sync::atomic::Ordering;
 
 use ankql::ast::{Resolved, Selection};
-use ankurah_digest_tree::{DigestTreeView, Ristretto255};
-use ankurah_proto::{EntityId, KnownEntity, KnownState, State};
+use ankurah_digest_tree::Ristretto255;
+use ankurah_proto::{EntityId, State};
 use futures::TryStreamExt;
 
 use super::{continuation::retryable, DigestTree, TreeManager};
 use crate::error::{MutationError, RetrievalError};
 use crate::storage::StorageEngine;
 use crate::sync::error::open_failure;
-use crate::sync::{EngineAdapter, EntityHead, EntityMemberId, TreeProperty};
 
 impl<SE: StorageEngine + 'static> TreeManager<SE, Ristretto255> {
-    /// Calculate the legacy inventory and digest together. Authorization reads
-    /// canonical states from the same snapshot as maintenance, never mutable
-    /// resident Entity handles. The returned whole-tree view is a lifetime
-    /// reference, not an authorized result view. Only the two summaries contain
-    /// the authorized subset; each subsequent request reevaluates authorization.
-    pub(crate) async fn prepare_known(
-        &self,
-        selection: Selection<Resolved>,
-        mut authorize: impl FnMut(EntityId, &State) -> Result<bool, RetrievalError> + Send,
-    ) -> Result<
-        (
-            DigestTreeView<
-                TreeProperty,
-                EntityMemberId,
-                EntityHead,
-                Ristretto255,
-                EngineAdapter<SE, TreeProperty, EntityHead, Ristretto255>,
-            >,
-            KnownState,
-            Vec<KnownEntity>,
-        ),
-        RetrievalError,
-    > {
-        let (owner, captured) = self.capture_for_comparison(selection, Some(&mut authorize)).await?;
-        let view = captured.view();
-        let digest = view.span_digest(..).await.map_err(open_failure)?.digest;
-        let known_matches = view
-            .range(..)
-            .map_err(open_failure)?
-            .map_ok(|leaf| KnownEntity { entity_id: leaf.id.0, head: leaf.payload.0 })
-            .try_collect()
-            .await
-            .map_err(open_failure)?;
-        Ok((owner.view(), KnownState { digest }, known_matches))
-    }
-
     /// Return the original managed owner and a private authorized capture.
     /// Both are tree handles so callers can read their views and key specs.
     /// Keep the owner while using the capture: only the original tree belongs

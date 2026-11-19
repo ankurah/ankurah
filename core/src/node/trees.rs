@@ -11,7 +11,7 @@ use crate::{
 };
 use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_digest_tree::{DigestTree, DigestTreeView, Ristretto255};
-use ankurah_proto::{ComparisonFailure, EntityId, KnownEntity, KnownState, State};
+use ankurah_proto::{ComparisonFailure, EntityId, State};
 use ankurah_signals::Wait;
 use futures::TryStreamExt;
 use std::time::Duration;
@@ -124,7 +124,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         Ok(())
     }
 
-    fn comparison_discovery(
+    pub(super) fn comparison_discovery(
         &self,
         selection: &Selection<Resolved>,
         credentials: &Vec<PA::ContextData>,
@@ -134,42 +134,6 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         } else {
             Ok(self.policy_agent.query_predicate(credentials)?)
         }
-    }
-
-    /// Prepare both wire accounts for an already policy-scoped selection from
-    /// one stable tree version, checking current discovery and state restrictions.
-    pub(crate) async fn prepare_known(
-        &self,
-        selection: Selection<Resolved>,
-        credentials: &Vec<PA::ContextData>,
-    ) -> Result<(Box<dyn Send + Sync>, KnownState, Vec<KnownEntity>), RetrievalError> {
-        let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
-        // Reconnects reuse the installed selection with current credentials. Gate
-        // disclosure without changing that tree's identity or refilling its LIMIT.
-        let allowed = if crate::schema::is_catalog_read(&selection.predicate) {
-            Predicate::True
-        } else {
-            policy.filter_predicate(Predicate::True)?
-        };
-        let (view, state, members) = self
-            .trees
-            .prepare_known(selection, |id, state| {
-                if allowed != Predicate::True {
-                    match evaluate_predicate(&TemporaryEntity::new(id, state)?, &allowed) {
-                        Ok(true) => {}
-                        Ok(false) | Err(FilterError::PropertyNotFound(_)) => return Ok(false),
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                match policy.check_read_state(&id, state) {
-                    Ok(()) => Ok(true),
-                    Err(AccessDenied::ByPolicy(_) | AccessDenied::ModelDenied(_)) => Ok(false),
-                    Err(error) => Err(error.into()),
-                }
-            })
-            .await?;
-        self.tree_maintenance.notify_one();
-        Ok((Box::new(view), state, members))
     }
 
     /// Call while holding publication, before polling the canonical storage commit.

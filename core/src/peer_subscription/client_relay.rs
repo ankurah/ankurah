@@ -534,8 +534,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 /// Trait for communicating with remote peers (abstraction over WeakNode for testing)
 #[async_trait]
 pub trait TNode<CD: ContextData>: Send + Sync {
-    /// Send a predicate registration request to a remote peer, fetch known matches,
-    /// apply received deltas, and store used events.
+    /// Install a remote query and reconcile its initial captured result.
     /// Returns Ok(()) if subscription was established and deltas applied successfully.
     async fn remote_subscribe(
         &self,
@@ -569,35 +568,7 @@ where
         let node = self.upgrade().ok_or(NodeDropped)?;
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
-        let (_digest_tree, known_state, known_matches) = node.prepare_known(selection.clone(), &context_data).await?;
-
-        // Both accounts describe one local version; the peer still uses known_matches.
-        let response = node
-            .request(
-                peer_id,
-                &context_data,
-                ankurah_proto::NodeRequestBody::SubscribeQuery {
-                    query_id,
-                    selection: selection.clone(),
-                    version,
-                    known_matches,
-                    known_state,
-                },
-            )
-            .await?;
-        let deltas = match response {
-            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, deltas } => deltas,
-            ankurah_proto::NodeResponseBody::Error(e) => return Err(RetrievalError::RequestError(RequestError::ServerError(e))),
-            other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
-        };
-
-        tracing::debug!("Node.remote_subscribe: query_id: {}, received deltas: {}", query_id, deltas.len());
-        // 3. Apply deltas to local node using NodeApplier
-        let event_getter = crate::retrieval::CachedEventGetter::new(&node, &context_data);
-        let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-        crate::node::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
-
-        Ok(())
+        node.reconcile_query(peer_id, selection, &context_data, Some((query_id, version))).await
     }
 
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {

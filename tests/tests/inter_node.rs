@@ -173,7 +173,7 @@ async fn server_edits_subscription() -> Result<()> {
 // A second subscription's snapshot can arrive after another query already holds
 // the entity at that head. Applying the unchanged snapshot must not notify the
 // established query with an empty-events Update, which could race its next real
-// update (#202). Hold query B's response until query A is watching, then release
+// update (#202). Hold query B's repair until query A is watching, then release
 // the unchanged snapshot and verify that A receives no notification.
 #[tokio::test]
 async fn subscription_empty_events_from_noop_delta() -> Result<()> {
@@ -182,19 +182,31 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
-    // Query B's id is not known until we build it, but the gate closure needs to
-    // recognize B's QuerySubscribed response. Share it via an Arc set below.
+    // Learn B's comparison identity from its reply, then hold the actual state
+    // delivery. Holding only the reply would let repair choose a newer state.
     let gate_query_id: Arc<std::sync::Mutex<Option<proto::QueryId>>> = Arc::new(std::sync::Mutex::new(None));
+    let gate_comparison: Arc<std::sync::Mutex<Option<proto::ComparisonId>>> = Arc::new(std::sync::Mutex::new(None));
+    let parked = Arc::new(tokio::sync::Notify::new());
 
-    // Hold QuerySubscribed responses whose query_id matches B, so B's initial
-    // delta is not applied on the client until we explicitly release it.
     let (_conn, gate) = {
         let gate_query_id = gate_query_id.clone();
+        let gate_comparison = gate_comparison.clone();
+        let parked = parked.clone();
         GatedConnection::new(&server, &client, move |msg: &proto::NodeMessage| match msg {
             proto::NodeMessage::Response(resp) => match &resp.body {
-                proto::NodeResponseBody::QuerySubscribed { query_id, .. } => Some(*query_id) == *gate_query_id.lock().unwrap(),
+                proto::NodeResponseBody::QuerySubscribed { query_id, target } if Some(*query_id) == *gate_query_id.lock().unwrap() => {
+                    *gate_comparison.lock().unwrap() = Some(target.id);
+                    false
+                }
                 _ => false,
             },
+            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::Comparison { comparison, deltas }, .. })
+                if Some(*comparison) == *gate_comparison.lock().unwrap()
+                    && deltas.iter().any(|delta| matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })) =>
+            {
+                parked.notify_one();
+                true
+            }
             _ => false,
         })
         .await
@@ -215,11 +227,12 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
 
     let pred = "name = 'Rex'";
 
-    // Query B: start (do NOT wait). Its known_matches are empty (Rex not local
-    // yet) so the server returns a StateSnapshot for Rex - which the gate parks.
+    // Query B starts cold. Wait until its actual StateSnapshot is parked before
+    // letting A make Rex resident, so the no-op delivery is guaranteed to occur.
     client_ctx.resolve_model_id::<Pet>().await?;
     let query_b = client_ctx.query::<PetView>(nocache(pred)?)?;
     *gate_query_id.lock().unwrap() = Some(query_b.query_id());
+    tokio::time::timeout(std::time::Duration::from_secs(5), parked.notified()).await?;
 
     // Query A: fully establish. Rex is still not local (B's delta is held), so A
     // gets and applies its own StateSnapshot, making Rex resident at head0 and

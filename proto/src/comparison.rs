@@ -30,12 +30,27 @@ pub struct ComparisonTarget {
     pub page: Option<ComparisonPage>,
 }
 
+/// An entity to reconcile with the requester's current head. A key identifies
+/// its exact address in the captured tree; no key requests an ordinary
+/// authorized read of a known identity, including one that left the selection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepairMember {
+    pub known: KnownEntity,
+    pub key: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ComparisonRequest {
-    Pages { spans: Vec<Span> },
+    Pages {
+        spans: Vec<Span>,
+    },
     /// Transfer through the peer's existing update channel. `delivery` is
     /// registered by the requester before sending, so an early push is admissible.
-    Repair { delivery: UpdateId, members: Vec<KnownEntity>, events_only: bool },
+    Repair {
+        delivery: UpdateId,
+        members: Vec<RepairMember>,
+        events_only: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

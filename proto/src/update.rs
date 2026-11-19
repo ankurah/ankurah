@@ -9,6 +9,8 @@ pub struct UpdateId(Ulid);
 pub enum NodeUpdateBody {
     /// New events for a subscription
     SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
+    /// Query repair shares the peer's update channel, with explicit admission.
+    Comparison { comparison: crate::ComparisonId, deltas: Vec<crate::EntityDelta> },
 }
 
 /// Content of an update - either events or state with events
@@ -112,6 +114,7 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NodeUpdateBody::Comparison { comparison, deltas } => write!(f, "Comparison {comparison:?} [{}]", deltas.len()),
             NodeUpdateBody::SubscriptionUpdate { items } => {
                 write!(f, "SubscriptionUpdate [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
             }

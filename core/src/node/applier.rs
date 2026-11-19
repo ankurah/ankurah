@@ -9,7 +9,7 @@ use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
 
 /// Consolidates all logic for applying remote updates to a node
-/// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
+/// Handles standing-query updates and entity repair deliveries.
 pub struct NodeApplier;
 
 impl NodeApplier {
@@ -364,7 +364,7 @@ impl NodeApplier {
         Ok(())
     }
 
-    /// Apply EntityDelta from Fetch or QuerySubscribed responses
+    /// Apply one entity repair from the peer update channel.
     /// Returns Some(EntityChange) if the delta resulted in a change, None otherwise
     async fn apply_delta<SE, PA, E, S>(
         node: &Node<SE, PA>,
