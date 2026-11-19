@@ -90,6 +90,8 @@ pub struct Scheduler {
     max_rounds: usize,
     /// Load-bearing request ids whose responses carry no collection.
     catalog_requests: std::collections::BTreeSet<proto::RequestId>,
+    /// Event retrieval must be able to finish while its requesting update is pending.
+    retrieval_requests: std::collections::BTreeSet<proto::RequestId>,
 }
 
 impl Scheduler {
@@ -102,6 +104,7 @@ impl Scheduler {
             node_ids,
             max_rounds: 100_000,
             catalog_requests: std::collections::BTreeSet::new(),
+            retrieval_requests: std::collections::BTreeSet::new(),
         }
     }
 
@@ -136,12 +139,20 @@ impl Scheduler {
             let Some(dst) = recipient_id(&out.message).and_then(|id| self.index_of(&id)) else { continue };
             let digest = message_digest(&out.message);
             let catalog_read = self.is_catalog_read(&out.message);
+            if let proto::NodeMessage::Request { request, .. } = &out.message {
+                if matches!(request.body, proto::NodeRequestBody::GetEvents { .. }) {
+                    self.retrieval_requests.insert(request.id.clone());
+                }
+            }
+            // These RPCs have no production timeout/retry. Losing either leg
+            // prevents convergence; delay, duplication and partitions still apply.
+            let retrieval = self.is_retrieval(&out.message);
             self.inflight.push(InFlight {
                 src: out.src,
                 dst,
                 message: out.message,
                 digest,
-                droppable: !catalog_read,
+                droppable: !catalog_read && !retrieval,
                 duplicable: !catalog_read,
                 accept: None,
             });
@@ -199,12 +210,85 @@ impl Scheduler {
     /// message (a dangling parent, a V6 unknown-entity item) is a legitimate
     /// outcome the invariants check for, not a harness error. Returns whether
     /// the message's acceptance target (if any) is now satisfied.
-    async fn deliver(&self, item: &InFlight, nodes: &[SimNode], trace: &mut Trace, duplicate: bool) -> bool {
+    async fn deliver(&mut self, item: &InFlight, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace, duplicate: bool) -> bool {
         trace.record(TraceEvent::Deliver { src: item.src, dst: item.dst, digest: item.digest.clone(), duplicate });
-        let _ = nodes[item.dst].node.handle_message(clone_message(&item.message)).await;
+        let handling = nodes[item.dst].node.handle_message(clone_message(&item.message));
+        tokio::pin!(handling);
+        let mut rounds = 0;
+        loop {
+            if futures_util::poll!(handling.as_mut()).is_ready() {
+                break;
+            }
+            self.absorb_captured();
+            // Event misses start fresh RPCs inside this handler. If retrieval ever
+            // coalesces requests, their replies may already be in the outer batch.
+            if let Some(retrievals) = self.retrieval_round(rng, trace) {
+                rounds += 1;
+                assert!(rounds <= self.max_rounds, "event retrieval did not finish within {} rounds", self.max_rounds);
+                for (request, duplicate) in retrievals {
+                    Box::pin(self.deliver(&request, nodes, rng, trace, false)).await;
+                    if duplicate {
+                        Box::pin(self.deliver(&request, nodes, rng, trace, true)).await;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = handling.as_mut() => break,
+                    _ = self.captured.changed() => {},
+                }
+            }
+        }
         match &item.accept {
             None => true,
             Some((entity, event)) => nodes[item.dst].stored_event_ids(*entity).await.contains(event),
+        }
+    }
+
+    fn is_retrieval(&self, message: &proto::NodeMessage) -> bool {
+        match message {
+            proto::NodeMessage::Request { request, .. } => matches!(request.body, proto::NodeRequestBody::GetEvents { .. }),
+            proto::NodeMessage::Response(response) => self.retrieval_requests.contains(&response.request_id),
+            _ => false,
+        }
+    }
+
+    /// Advance only event-retrieval traffic while an update waits for its missing
+    /// history. Other captured messages retain their queue order for the outer round.
+    fn retrieval_round(&mut self, rng: &mut SimRng, trace: &mut Trace) -> Option<Vec<(InFlight, bool)>> {
+        let mut retrievals = Vec::new();
+        for item in std::mem::take(&mut self.inflight) {
+            if self.is_retrieval(&item.message) {
+                retrievals.push(item);
+            } else {
+                self.inflight.push(item);
+            }
+        }
+        if retrievals.is_empty() {
+            return None;
+        }
+        self.maybe_toggle_partitions(rng, trace);
+        if !retrievals.iter().any(|item| self.link_up(item.src, item.dst)) {
+            self.heal_partitions(trace);
+        }
+        if self.faults.reorder {
+            rng.shuffle(&mut retrievals);
+        }
+        let mut ready = Vec::new();
+        for item in retrievals {
+            if !self.link_up(item.src, item.dst) || (self.faults.delay && rng.chance(self.faults.delay_p)) {
+                self.inflight.push(item);
+            } else {
+                let duplicate = item.duplicable && self.faults.duplicate && rng.chance(self.faults.duplicate_p);
+                ready.push((item, duplicate));
+            }
+        }
+        Some(ready)
+    }
+
+    fn heal_partitions(&mut self, trace: &mut Trace) {
+        for (a, b) in std::mem::take(&mut self.partitions) {
+            trace.record(TraceEvent::Partition { a, b, up: true });
         }
     }
 
@@ -264,10 +348,7 @@ impl Scheduler {
             if !deliverable_now && !self.partitions.is_empty() {
                 // Sorted iteration (BTreeSet via mem::take) keeps the heal order,
                 // and thus the trace, deterministic.
-                let healed = std::mem::take(&mut self.partitions);
-                for key in healed {
-                    trace.record(TraceEvent::Partition { a: key.0, b: key.1, up: true });
-                }
+                self.heal_partitions(trace);
             }
 
             // Split into deliverable vs blocked (behind a cut link).
@@ -298,9 +379,9 @@ impl Scheduler {
                     continue;
                 }
                 let dup = item.duplicable && self.faults.duplicate && rng.chance(self.faults.duplicate_p);
-                let accepted = self.deliver(&item, nodes, trace, false).await;
+                let accepted = self.deliver(&item, nodes, rng, trace, false).await;
                 if dup {
-                    let _ = self.deliver(&item, nodes, trace, true).await;
+                    let _ = self.deliver(&item, nodes, rng, trace, true).await;
                 }
                 // A load-bearing message not yet accepted (e.g. its parent has
                 // not arrived) is redelivered in a later round.

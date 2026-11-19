@@ -343,3 +343,52 @@ fn record_write(
     let event = head.ids().next().cloned().expect("a single-tip head after a linear write");
     writes.lock().unwrap().push(LocalWrite { origin, entity, field, value: value.to_owned(), event });
 }
+
+/// A merged snapshot can name a head event absent from both the receiver and
+/// the update's event fragments. Its handler must retrieve that event while the
+/// scheduler still owns the pending update; awaiting the handler serially deadlocks.
+#[test]
+fn missing_snapshot_head_is_retrieved_during_delivery() {
+    use ankurah_tests::sim::{model, run_once};
+
+    for faults in [
+        FaultConfig::none(),
+        FaultConfig {
+            delay: true,
+            duplicate: true,
+            drop: true,
+            partition: true,
+            delay_p: 0.3,
+            duplicate_p: 1.0,
+            drop_p: 1.0,
+            partition_toggle_p: 0.3,
+            ..FaultConfig::none()
+        },
+    ] {
+        let outcome = run_once(
+            "missing_snapshot_head",
+            0,
+            faults,
+            3,
+            body(|w: &mut Workload| {
+                Box::pin(async move {
+                    let entity = w.create_at(0, Field::Title, "base").await;
+                    w.settle().await;
+                    let parent = w.head_of(entity).unwrap();
+                    let left = model::attest(model::edit_event(entity, parent.clone(), Field::Title, "left", w.next_mint_seq()));
+                    let right = model::attest(model::edit_event(entity, parent, Field::Body, "right", w.next_mint_seq()));
+                    w.apply_events_at(0, entity, vec![left.clone(), right.clone()]).await;
+                    w.apply_events_at(1, entity, vec![left, right.clone()]).await;
+                    w.apply_events_at(2, entity, vec![right.clone()]).await;
+                    let mut item = w.state_and_event_item(0, entity).await;
+                    let proto::UpdateContent::StateAndEvent(_, events) = &mut item.content else { unreachable!() };
+                    *events = vec![right.into()];
+                    w.deliver_items(0, 2, vec![item]);
+                    tokio::time::timeout(std::time::Duration::from_secs(5), w.settle()).await.expect("missing-head retrieval completes");
+                })
+            }),
+        );
+        outcome.assert_converged();
+        assert_eq!(outcome.max_head_len, 2, "both concurrent heads must survive");
+    }
+}

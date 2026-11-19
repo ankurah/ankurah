@@ -28,18 +28,26 @@ pub struct Outbound {
 
 /// Shared sink for node-emitted messages, drained by the scheduler each step.
 #[derive(Clone, Default)]
-pub struct Captured(Arc<Mutex<Vec<Outbound>>>);
+pub struct Captured {
+    messages: Arc<Mutex<Vec<Outbound>>>,
+    changed: Arc<tokio::sync::Notify>,
+}
 
 impl Captured {
     pub fn new() -> Self { Self::default() }
 
-    fn push(&self, out: Outbound) { self.0.lock().unwrap().push(out); }
+    fn push(&self, out: Outbound) {
+        self.messages.lock().unwrap().push(out);
+        self.changed.notify_one();
+    }
+
+    pub(super) async fn changed(&self) { self.changed.notified().await; }
 
     /// Remove and return everything captured since the last drain, preserving
     /// insertion order. The scheduler decides what to do with them.
-    pub fn drain(&self) -> Vec<Outbound> { std::mem::take(&mut *self.0.lock().unwrap()) }
+    pub fn drain(&self) -> Vec<Outbound> { std::mem::take(&mut *self.messages.lock().unwrap()) }
 
-    pub fn is_empty(&self) -> bool { self.0.lock().unwrap().is_empty() }
+    pub fn is_empty(&self) -> bool { self.messages.lock().unwrap().is_empty() }
 }
 
 /// `PeerSender` bound to one logical source node, feeding `Captured`.

@@ -35,12 +35,10 @@
 //! - `Node::get_durable_peer_random()` uses `rand::thread_rng()` and is reached
 //!   by the event-gap-fill path in the SubscriptionUpdate applier
 //!   (`CachedEventGetter`) when an event's parents are missing locally. The
-//!   harness avoids triggering it: every event a scenario delivers arrives with
-//!   its parents already present (single-event acceptance-retry on the
-//!   CommitTransaction path; pre-placed lineages on the SubscriptionUpdate
-//!   path). A future scenario that deliberately induces a cross-peer gap would
-//!   reach this `thread_rng` and must expect a determinism-audit failure until
-//!   that production path is made seedable. This boundary is flagged in the PR.
+//!   harness has one durable peer, so retrieval has only one possible target.
+//!   The scheduler services event-retrieval RPCs while the requesting update is
+//!   pending. Scenarios with several durable peers would need to control peer
+//!   selection before claiming reproducible retrieval schedules.
 //! - Container iteration order: the scheduler holds cut links in a `BTreeSet`
 //!   (not `HashSet`) so heal order is sorted, and all schedule-affecting
 //!   collections are `Vec`/`BTreeSet`/`BTreeMap`. HashMaps in the harness are
