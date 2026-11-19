@@ -11,9 +11,7 @@ use futures::TryStreamExt;
 
 use super::*;
 use crate::property::backend::{lww::LWWBackend, PropertyBackend};
-use crate::selection::filter::{Error as FilterError, Filterable};
 use crate::storage::StorageTransaction;
-use crate::sync::EntityVersion;
 use crate::test_utils::TestStorage;
 
 mod continuation;
@@ -31,24 +29,6 @@ struct Version {
     score: i64,
     active: Option<bool>,
     head: Clock,
-}
-
-impl EntityVersion for Version {
-    fn id(&self) -> EntityId { self.id }
-    fn head(&self) -> Clock { self.head.clone() }
-}
-
-impl Filterable for Version {
-    fn is_member_of(&self, selected: &ModelId) -> Result<bool, FilterError> { Ok(*selected == model()) }
-
-    fn value(&self, property: &PropertyId) -> Option<Value> {
-        match *property {
-            PropertyId::Id => Some(Value::EntityId(self.id)),
-            property if property == score() => Some(Value::I64(self.score)),
-            property if property == active() => self.active.map(Value::Bool),
-            _ => None,
-        }
-    }
 }
 
 impl Version {

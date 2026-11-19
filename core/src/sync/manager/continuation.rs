@@ -70,7 +70,7 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
                     &mut trx,
                     id.clone(),
                     key_spec,
-                    std::iter::empty::<EntityMember<'_, TemporaryEntity>>(),
+                    std::iter::empty::<EntityMember<'_>>(),
                 )
                 .await;
                 match created {
@@ -184,9 +184,8 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
             let key_spec = tree.key_spec().clone();
             store.clear_buffered();
             let trx = store.buffered_transaction().await.map_err(|error| open_failure(error.into()))?;
-            let created = DigestTree::create_in(store.clone(), trx, key_spec, std::iter::empty::<EntityMember<'_, TemporaryEntity>>())
-                .await
-                .map_err(open_failure)?;
+            let created =
+                DigestTree::create_in(store.clone(), trx, key_spec, std::iter::empty::<EntityMember<'_>>()).await.map_err(open_failure)?;
             created.landed()
         } else {
             DigestTree::open(store).await.map_err(open_failure)?

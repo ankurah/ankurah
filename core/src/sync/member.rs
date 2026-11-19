@@ -10,6 +10,7 @@ use ankurah_core_types::{EntityId, PropertyId, Value};
 use ankurah_digest_tree::{Encode, Member, MemberId, Payload, StoreError};
 use ankurah_proto::Clock;
 
+use crate::entity::TemporaryEntity;
 use crate::selection::filter::Filterable;
 use crate::value::ValueExt;
 
@@ -26,19 +27,7 @@ pub struct EntityMemberId(pub EntityId);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityHead(pub Clock);
 
-/// One stable entity version supplied by a commit's owner. Before and after
-/// versions must remain unchanged while tree maintenance reads them.
-pub trait EntityVersion: Filterable + Send + Sync {
-    fn id(&self) -> EntityId;
-    fn head(&self) -> Clock;
-}
-
-impl EntityVersion for crate::entity::TemporaryEntity {
-    fn id(&self) -> EntityId { self.id() }
-    fn head(&self) -> Clock { self.head() }
-}
-
-pub(super) struct EntityMember<'a, E>(pub &'a E);
+pub(super) struct EntityMember<'a>(pub &'a TemporaryEntity);
 
 impl Encode for TreeProperty {
     fn encode(&self) -> Vec<u8> { bincode::serialize(&self.0).expect("property identities serialize") }
@@ -62,7 +51,7 @@ impl Payload for EntityHead {
     fn digest_bytes(&self) -> Cow<'_, [u8]> { Cow::Owned(self.0.ids().flat_map(|id| id.as_bytes().iter().copied()).collect()) }
 }
 
-impl<E: EntityVersion> Member<TreeProperty> for EntityMember<'_, E> {
+impl Member<TreeProperty> for EntityMember<'_> {
     type Id = EntityMemberId;
     type Payload = EntityHead;
     type KeyError = Infallible;

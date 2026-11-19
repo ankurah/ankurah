@@ -25,7 +25,7 @@ pub mod storage_adapter;
 
 pub use error::{Error, TreePart};
 pub use manager::{TreeManager, WriteBehind};
-pub use member::{EntityHead, EntityMemberId, EntityVersion, TreeProperty};
+pub use member::{EntityHead, EntityMemberId, TreeProperty};
 pub use storage_adapter::{
     AppliedTrees, CacheSettings, EngineAdapter, StorageCache, StorageEngineSnapshot, StorageEngineTrx, TreeChange, TreeId, TreeLanding,
 };

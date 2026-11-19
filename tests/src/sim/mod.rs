@@ -32,13 +32,11 @@
 //!   random, but they never affect scheduling (the scheduler keys on queue
 //!   position and the seeded RNG) and are excluded from the semantic trace
 //!   digest, so they do not perturb the audit.
-//! - `Node::get_durable_peer_random()` uses `rand::thread_rng()` and is reached
-//!   by the event-gap-fill path in the SubscriptionUpdate applier
-//!   (`CachedEventGetter`) when an event's parents are missing locally. The
-//!   harness has one durable peer, so retrieval has only one possible target.
-//!   The scheduler services event-retrieval RPCs while the requesting update is
-//!   pending. Scenarios with several durable peers would need to control peer
-//!   selection before claiming reproducible retrieval schedules.
+//! - Event-gap retrieval uses `Node::get_durable_peer_random()`, which chooses
+//!   among sorted peer IDs using the node's seedable RNG. The harness has one
+//!   durable peer, so retrieval has only one possible target; multi-durable
+//!   scenarios must also seed each node's RNG. The scheduler services retrieval
+//!   RPCs while the requesting update is pending.
 //! - Container iteration order: the scheduler holds cut links in a `BTreeSet`
 //!   (not `HashSet`) so heal order is sorted, and all schedule-affecting
 //!   collections are `Vec`/`BTreeSet`/`BTreeMap`. HashMaps in the harness are

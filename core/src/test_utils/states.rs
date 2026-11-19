@@ -112,13 +112,15 @@ pub(super) fn select(
     }
     matching.sort_by(|(a, left), (b, right)| {
         for order in selection.order_by.as_deref().unwrap_or_default() {
-            let comparison = match (left.value_at(&order.path), right.value_at(&order.path)) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+            // Match storage-common's value sort: missing values precede present
+            // ones in either direction. Real engine ordering is tested there.
+            let comparison = match (left.value_at(&order.path), right.value_at(&order.path), &order.direction) {
+                (None, None, _) => Ordering::Equal,
+                (None, Some(_), _) => Ordering::Less,
+                (Some(_), None, _) => Ordering::Greater,
+                (Some(left), Some(right), OrderDirection::Asc) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+                (Some(left), Some(right), OrderDirection::Desc) => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
             };
-            let comparison = if order.direction == OrderDirection::Desc { comparison.reverse() } else { comparison };
             if comparison != Ordering::Equal {
                 return comparison;
             }

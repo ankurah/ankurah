@@ -185,7 +185,7 @@ async fn nested_json_limit_tracks_query_membership_and_refills_with_unchanged_st
     assert_eq!(tree.key_spec().keyparts[0].value_type, ValueType::Json);
     let mut selected_ids = ids(&tree.view()).await?;
     selected_ids.sort();
-    assert_eq!(selected_ids, vec![entities[0].payload.entity_id, entities[1].payload.entity_id]);
+    assert_eq!(selected_ids, vec![entities[1].payload.entity_id, entities[3].payload.entity_id]);
 
     let updated = json_state(2, serde_json::json!({"rank": 40}))?;
     let mut trx = fixture.storage.transaction();
@@ -193,9 +193,10 @@ async fn nested_json_limit_tracks_query_membership_and_refills_with_unchanged_st
     fixture.manager.invalidate();
     trx.commit().await?.committed()?;
     fixture.manager.maintain().await?;
-    let leaves: Vec<_> = tree.view().range(..)?.try_collect().await?;
-    assert_eq!(leaves.iter().map(|leaf| leaf.id.0).collect::<Vec<_>>(), vec![entities[0].payload.entity_id, entities[2].payload.entity_id]);
-    assert_eq!(leaves[1].payload.0, entities[2].payload.state.head);
+    let mut leaves: Vec<_> = tree.view().range(..)?.try_collect().await?;
+    leaves.sort_by_key(|leaf| leaf.id.0);
+    assert_eq!(leaves.iter().map(|leaf| leaf.id.0).collect::<Vec<_>>(), vec![entities[0].payload.entity_id, entities[3].payload.entity_id]);
+    assert_eq!(leaves[0].payload.0, entities[0].payload.state.head);
     assert_eq!(tree.audit().await?.members, 2);
 
     selected.limit = None;
