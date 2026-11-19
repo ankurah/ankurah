@@ -51,7 +51,7 @@ impl ComparisonBudget {
         Ok(())
     }
 
-    fn charge(&self, steps: usize) -> Result<(), RetrievalError> {
+    pub(in crate::node) fn charge(&self, steps: usize) -> Result<(), RetrievalError> {
         self.check()?;
         let mut used = self.steps.lock().unwrap();
         *used =

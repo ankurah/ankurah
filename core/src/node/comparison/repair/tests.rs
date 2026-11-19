@@ -270,6 +270,53 @@ async fn known_id_repair_does_not_require_captured_membership() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn an_advanced_capture_repairs_only_the_verified_suffix_of_a_long_history() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let mut history = vec![fixture.root.clone(), fixture.current.clone()];
+    while history.len() < 64 {
+        history.push(child(history.last().unwrap()));
+    }
+    store(&fixture.node, &history[2..]).await?;
+    fixture.current = history[63].clone();
+    fixture.state(&fixture.current, true);
+    // There is room to inspect only the known frontier and its two successors,
+    // regardless of the entity's much longer retained history.
+    fixture.node.policy_agent.0.lock().unwrap().limits.max_events = 3;
+    let (id, key) = fixture.capture().await?;
+    let newer = child(&fixture.current);
+    store(&fixture.node, &[newer.clone()]).await?;
+    fixture.state(&newer, true);
+    let known = Clock::singleton(&history[62]);
+    let repair = fixture.repair(id, Some(key.clone()), known.clone(), false).await?;
+    repair.revalidate(&fixture.node, &vec![DEFAULT_CONTEXT]).await?;
+    assert!(repair.unavailable.is_empty());
+    assert_eq!(delivered(&repair), vec![fixture.current.clone(), newer]);
+
+    // An explicit history repair cannot use an adopted head as proof that its
+    // ancestors are present; the same small budget must refuse the full walk.
+    assert!(matches!(fixture.repair(id, Some(key), known, true).await,
+        Err(RetrievalError::StorageError(ref error)) if error.downcast_ref::<ComparisonFailure>() == Some(&ComparisonFailure::LimitExceeded)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_repair_keeps_both_ancestries_when_current_is_concurrent_with_capture() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let (id, key) = fixture.capture().await?;
+    let current = child(&fixture.root);
+    store(&fixture.node, &[current.clone()]).await?;
+    fixture.state(&current, true);
+    let repair = fixture.repair(id, Some(key), Clock::singleton(&fixture.root), false).await?;
+    repair.revalidate(&fixture.node, &vec![DEFAULT_CONTEXT]).await?;
+    let events = delivered(&repair);
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0], fixture.root);
+    assert!(events.contains(&fixture.current));
+    assert!(events.contains(&current));
+    Ok(())
+}
+
+#[tokio::test]
 async fn unknown_concurrent_head_gets_complete_parent_first_history() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let (id, _) = fixture.capture().await?;
@@ -305,6 +352,43 @@ async fn event_denial_never_sends_a_bridge_with_a_hole() -> anyhow::Result<()> {
     let repair = fixture.repair(id, Some(key), Clock::default(), true).await?;
     assert!(repair.deltas.is_empty());
     assert_eq!(repair.unavailable, vec![fixture.current.entity_id]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_redacted_known_floor_does_not_hide_its_readable_suffix() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let (id, _) = fixture.capture().await?;
+    fixture.node.policy_agent.0.lock().unwrap().events.insert(fixture.root.id());
+    let repair = fixture.repair(id, None, Clock::singleton(&fixture.root), false).await?;
+    repair.revalidate(&fixture.node, &vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(delivered(&repair), vec![fixture.current]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_large_current_state_can_authorize_a_small_bridge_but_not_an_oversized_delivery() -> anyhow::Result<()> {
+    use crate::property::backend::{LWWBackend, PropertyBackend};
+
+    let fixture = Fixture::new().await?;
+    let (id, _) = fixture.capture().await?;
+    let backend = LWWBackend::new();
+    backend.set(proto::PropertyId::EntityId(EntityId::random()), Some(ankurah_core_types::Value::String("x".repeat(4096))));
+    crate::test_helpers::commit_backend(&backend, 2)?;
+    let mut state = fixture.node.storage.get_state(fixture.current.entity_id).await?;
+    state.payload.state.state_buffers.0.insert("lww".into(), backend.to_state_buffer()?);
+    fixture.node.storage.set_state(state);
+    {
+        let mut restrictions = fixture.node.policy_agent.0.lock().unwrap();
+        restrictions.limits.max_bytes = 1024;
+        restrictions.limits.max_capture_bytes = 8192;
+    }
+    let repair = fixture.repair(id, None, Clock::singleton(&fixture.root), false).await?;
+    assert!(repair.bytes < 1024);
+    repair.revalidate(&fixture.node, &vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(delivered(&repair), vec![fixture.current.clone()]);
+    assert!(matches!(fixture.repair(id, None, Clock::default(), false).await,
+        Err(RetrievalError::StorageError(ref error)) if error.downcast_ref::<ComparisonFailure>() == Some(&ComparisonFailure::LimitExceeded)));
     Ok(())
 }
 
@@ -457,22 +541,25 @@ async fn repeated_coverage_proofs_share_the_callers_work_budget() -> anyhow::Res
 async fn releasing_a_comparison_cancels_blocked_repair_reads() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let (id, key) = fixture.capture().await?;
-    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (entered, mut entering) = tokio::sync::oneshot::channel();
     let (_resume, resume) = tokio::sync::oneshot::channel();
     *fixture.node.storage.hold_state_snapshot.lock().unwrap() = Some((entered, resume));
-    let node = fixture.node.clone();
-    let peer = fixture.peer;
-    let selection = fixture.selection.clone();
     let member =
         proto::RepairMember { known: proto::KnownEntity { entity_id: fixture.current.entity_id, head: Clock::default() }, key: Some(key) };
-    let worker =
-        tokio::spawn(
-            async move { node.prepare_comparison_repair(peer, id, &selection, vec![member], false, &vec![DEFAULT_CONTEXT]).await },
-        );
-    entering.await?;
-    fixture.node.captures.release(peer, id);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await??;
-    assert!(matches!(result, Err(RetrievalError::StorageError(ref error))
-        if error.downcast_ref::<ComparisonFailure>() == Some(&ComparisonFailure::Expired)));
+    let credentials = vec![DEFAULT_CONTEXT];
+    let repair = fixture.node.prepare_comparison_repair(fixture.peer, id, &fixture.selection, vec![member], false, &credentials);
+    tokio::pin!(repair);
+    // Reach this request's read before background maintenance can consume the
+    // storage hook. Spawning first would make the held reader nondeterministic.
+    assert!(futures::poll!(&mut repair).is_pending());
+    entering.try_recv()?;
+    fixture.node.captures.release(fixture.peer, id);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), repair).await?;
+    let error = result.err().expect("a released comparison must refuse repair");
+    assert!(
+        matches!(&error, RetrievalError::StorageError(cause)
+        if cause.downcast_ref::<ComparisonFailure>() == Some(&ComparisonFailure::Expired)),
+        "{error:?}"
+    );
     Ok(())
 }

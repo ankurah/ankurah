@@ -272,7 +272,16 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
 
     let agent = BridgePolicyAgent::new();
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    let connection = LocalProcessConnection::new(&client, &server).await?;
+    let hold_updates = Arc::new(AtomicBool::new(false));
+    let held = hold_updates.clone();
+    let (connection, gate) = common::GatedConnection::new(&server, &client, move |message| {
+        held.load(Ordering::SeqCst)
+            && matches!(
+                message,
+                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::SubscriptionUpdate { .. }, .. })
+            )
+    })
+    .await;
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 3);
     let model = reader.resolve_model_id::<Pet>().await?;
@@ -304,6 +313,7 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
     assert_eq!(summaries.len(), 2);
     assert!(!summaries[0].0 && summaries[1].0);
     assert_eq!(summaries[0].1, summaries[1].1, "both request paths describe the same allowed members and heads");
+    hold_updates.store(true, Ordering::SeqCst);
     for (id, changes_summary) in [(hidden, false), (visible, true)] {
         let view = writer.get::<PetView>(id).await?;
         let trx = writer.begin();
@@ -323,10 +333,14 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
     assert!(!hidden_repairs.is_empty(), "the changed hidden member exercises repair sanitation");
     assert!(hidden_repairs.iter().all(|member| member.known.head.is_empty()), "a denied local head is never disclosed in a repair request");
     drop(repairs);
+    hold_updates.store(false, Ordering::SeqCst);
+    gate.release_held(&client).await;
 
     // A relay retry keeps the installed selection, but policy may have narrowed.
     // Its digest must not disclose a formerly allowed member on reconnect.
     drop(connection);
+    client.deregister_peer(server.id);
+    server.deregister_peer(client.id);
     let missing_property = Predicate::Comparison {
         left: Box::new(ankql::ast::Expr::Path(proto::PropertyId::EntityId(proto::EntityId::random()).into())),
         operator: ankql::ast::ComparisonOperator::Equal,
@@ -442,6 +456,16 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let mut state = states[0].clone();
         let entity_id = state.payload.entity_id;
         let known_head = state.payload.state.head.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if client.storage.get_state(entity_id).await.is_ok_and(|state| state.payload.state.head == known_head) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let validated = client_agent.validate_calls.load(Ordering::SeqCst);
         // Advance the stored row with an idempotent membership event to exercise a real bridge.
         let update = proto::Event::update(
             entity_id,
@@ -495,8 +519,8 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         }
 
         // Reconnect the standing catalog queries through the complete comparison
-        // path. Their existing heads require event repair, not cold state adoption.
-        let validated = client_agent.validate_calls.load(Ordering::SeqCst);
+        // path. An earlier in-flight comparison may already have repaired this
+        // update; either way the existing head requires validated event repair.
         drop(connection.take());
         connection = Some(LocalProcessConnection::new(&client, &server).await?);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -529,7 +553,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                 },
             )
             .await?;
-        assert!(matches!(response, proto::NodeResponseBody::Error(message) if message.contains("all reads denied")));
+        assert!(matches!(&response, proto::NodeResponseBody::Error(message) if message == "access denied"), "{response:?}");
     }
     Ok(())
 }

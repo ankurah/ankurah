@@ -408,14 +408,12 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     ) -> Result<(), RetrievalError> {
         let result = async {
             self.check_comparison_disclosure(checked, credentials)?;
-            if !self.policy_agent.state_reads_follow_predicate(credentials) {
-                let members = checked.view().count(..).await.map_err(tree_failure)?;
-                checked.charge(usize::try_from(members).map_err(|_| failure(ComparisonFailure::LimitExceeded))?, 0)?;
-            }
             let retained = checked.slot.retained.get().expect("checked capture");
-            self.validate_comparison_authorization(&retained.selection, checked.view(), credentials, &retained.discovery)
-                .await
-                .map_err(restart)?;
+            self.validate_comparison_authorization(&retained.selection, checked.view(), credentials, &retained.discovery, &|work| {
+                checked.charge(work, 0)
+            })
+            .await
+            .map_err(restart)?;
             self.check_comparison_disclosure(checked, credentials)
         }
         .await;

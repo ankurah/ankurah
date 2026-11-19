@@ -98,11 +98,18 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     connection.comparisons.admit(id, credentials.clone(), limits)?;
                     Active { connection: Arc::downgrade(&connection), from: self.id, id }
                 };
-                let (owner, local, _) =
+                let (owner, local, discovery) =
                     budget.wait(self.capture_comparison(selection.clone(), credentials)).await.map_err(super::serve::restart)?;
                 let known_state = proto::KnownState {
                     digest: budget.wait(async { local.view().span_digest(..).await.map_err(super::client::view_error) }).await?.digest,
                 };
+                budget
+                    .wait(
+                        self.validate_comparison_authorization(&selection, &local.view(), credentials, &discovery, &|work| {
+                            budget.charge(work)
+                        }),
+                    )
+                    .await?;
                 let key_spec = super::wire::key_spec_to_wire(local.key_spec());
                 let current = self.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
                 if !Weak::ptr_eq(&active.connection, &Arc::downgrade(&current)) {
@@ -135,14 +142,23 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 drop(owner);
                 result
             }
-            .await;
+            .await
+            .map_err(super::serve::restart);
             match result {
                 Err(RetrievalError::StorageError(ref error))
                     if attempt < 2
                         && matches!(
                             error.downcast_ref::<ComparisonFailure>(),
                             Some(ComparisonFailure::Expired | ComparisonFailure::Restart)
-                        ) => {}
+                        ) =>
+                {
+                    budget
+                        .wait(async {
+                            futures_timer::Delay::new(std::time::Duration::from_millis(1 << attempt)).await;
+                            Ok(())
+                        })
+                        .await?;
+                }
                 result => return result,
             }
         }

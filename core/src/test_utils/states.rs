@@ -24,7 +24,9 @@ pub(super) struct Snapshot {
     changed: std::vec::IntoIter<EntityId>,
     cursor: StateCursor,
     hold_page: Arc<Mutex<Option<(usize, Pause)>>>,
+    hold_finish: Arc<Mutex<Option<Pause>>>,
     reject_finish: Arc<AtomicBool>,
+    point_reads: Arc<AtomicUsize>,
     selection: Option<Selection<Resolved>>,
     selection_reads: Arc<AtomicUsize>,
 }
@@ -34,7 +36,9 @@ impl Snapshot {
         data: &TestData,
         scan: StateScan<'_>,
         hold_page: Arc<Mutex<Option<(usize, Pause)>>>,
+        hold_finish: Arc<Mutex<Option<Pause>>>,
         reject_finish: Arc<AtomicBool>,
+        point_reads: Arc<AtomicUsize>,
         selection_reads: Arc<AtomicUsize>,
     ) -> Result<Self, RetrievalError> {
         let since = match scan {
@@ -71,7 +75,17 @@ impl Snapshot {
             _ => None,
         };
         let cursor = StateCursor::new(bincode::serialize(&(data.incarnation, data.revision)).unwrap());
-        Ok(Self { states: data.states.clone(), changed: changed.into_iter(), cursor, hold_page, reject_finish, selection, selection_reads })
+        Ok(Self {
+            states: data.states.clone(),
+            changed: changed.into_iter(),
+            cursor,
+            hold_page,
+            hold_finish,
+            reject_finish,
+            point_reads,
+            selection,
+            selection_reads,
+        })
     }
 }
 
@@ -97,6 +111,7 @@ impl StateSnapshot for Snapshot {
     }
 
     async fn get_states(&mut self, ids: &[EntityId]) -> Result<Vec<Option<Attested<EntityState>>>, RetrievalError> {
+        self.point_reads.fetch_add(ids.len(), AtomicOrdering::Relaxed);
         Ok(ids.iter().map(|id| self.states.get(id).cloned()).collect())
     }
 
@@ -128,6 +143,11 @@ impl StateSnapshot for Snapshot {
     }
 
     async fn finish(self: Box<Self>) -> Result<StateCursor, RetrievalError> {
+        let pause = self.hold_finish.lock().unwrap().take();
+        if let Some((entered, resume)) = pause {
+            entered.send(()).unwrap();
+            let _ = resume.await;
+        }
         if self.reject_finish.load(AtomicOrdering::SeqCst) {
             return Err(crate::error::MutationError::WriteConflict.into());
         }

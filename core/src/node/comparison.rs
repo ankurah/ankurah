@@ -19,9 +19,11 @@ pub(super) fn response_error(error: anyhow::Error) -> ankurah_proto::NodeRespons
     if let Some(refusal) = error.downcast_ref::<ComparisonFailure>() {
         return NodeResponseBody::Compared(Err(refusal.clone()));
     }
-    if let Some(crate::error::RetrievalError::StorageError(cause)) = error.downcast_ref::<crate::error::RetrievalError>() {
-        if let Some(refusal) = cause.downcast_ref::<ComparisonFailure>() {
-            return NodeResponseBody::Compared(Err(refusal.clone()));
+    if let Some(error) = error.downcast_ref::<crate::error::RetrievalError>() {
+        if let crate::error::RetrievalError::StorageError(cause) = serve::restart(error.clone()) {
+            if let Some(refusal) = cause.downcast_ref::<ComparisonFailure>() {
+                return NodeResponseBody::Compared(Err(refusal.clone()));
+            }
         }
     }
     NodeResponseBody::Error(error.to_string())

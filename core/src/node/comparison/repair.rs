@@ -62,7 +62,9 @@ impl<SE: StorageEngine + 'static, CD: crate::session::ContextData> PreparedRepai
             let mut state_bytes = 0usize;
             for (sent, current) in self.states.iter().zip(current) {
                 let current = current.ok_or_else(|| failure(ComparisonFailure::AuthorizationChanged))?;
-                state_bytes = state_bytes.checked_add(size(&current)?).filter(|bytes| *bytes <= self.checked.limits().max_capture_bytes)
+                state_bytes = state_bytes
+                    .checked_add(size(&current)?)
+                    .filter(|bytes| *bytes <= self.checked.limits().max_capture_bytes)
                     .ok_or_else(|| failure(ComparisonFailure::LimitExceeded))?;
                 if current.payload.entity_id != sent.payload.entity_id {
                     return Err(crate::sync::Error::AnswerMisfit.into());
@@ -312,7 +314,10 @@ impl<'a, SE, CD: crate::session::ContextData> HistoryBudget<'a, SE, CD> {
 
     fn inspect_state_bytes(&self, bytes: usize) -> Result<(), RetrievalError> {
         let mut used = self.used.lock().unwrap();
-        used.state_bytes = used.state_bytes.checked_add(bytes).filter(|bytes| *bytes <= self.limits.max_capture_bytes)
+        used.state_bytes = used
+            .state_bytes
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= self.limits.max_capture_bytes)
             .ok_or_else(|| failure(ComparisonFailure::LimitExceeded))?;
         Ok(())
     }
@@ -363,7 +368,19 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent> RepairHistory<'a, SE, PA>
             Err(RetrievalError::EventNotFound(_)) => false,
             Err(error) => return Err(error),
         };
-        if !force_history && known_verified && !known.is_empty() && target == current {
+        let mut current_covers_target = target == current;
+        if !force_history && known_verified && !known.is_empty() && !current_covers_target {
+            // A capture can lag current state. Prove its frontier is covered
+            // before using the requester's verified head as the bridge floor.
+            // Both comparisons share event reads through this history's cache.
+            self.verify_clock(target).await?;
+            current_covers_target = match compare(self, current, target, self.budget.comparison_budget()).await?.relation {
+                AbstractCausalRelation::Equal | AbstractCausalRelation::StrictDescends { .. } => true,
+                AbstractCausalRelation::BudgetExceeded { .. } => return Err(failure(ComparisonFailure::LimitExceeded)),
+                _ => false,
+            };
+        }
+        if !force_history && known_verified && !known.is_empty() && current_covers_target {
             match compare(self, current, known, self.budget.comparison_budget()).await {
                 Ok(result) => match result.relation {
                     AbstractCausalRelation::Equal | AbstractCausalRelation::StrictAscends => return Ok(Vec::new()),
@@ -411,7 +428,9 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent> RepairHistory<'a, SE, PA>
 
     fn authorize_events(&self, events: Vec<Attested<Event>>) -> Result<Vec<Attested<Event>>, RetrievalError> {
         let policy = ContextPolicy::from_credentials(&self.node.policy_agent, self.credentials);
-        for event in &events { policy.check_read_event(event, self.state)?; }
+        for event in &events {
+            policy.check_read_event(event, self.state)?;
+        }
         Ok(crate::event_dag::ordering::topo_sort_events(events)?)
     }
 }

@@ -32,8 +32,7 @@
 //!   StateSnapshot: depth
 //!   affects only the excluded setup, and the measured region is snapshot
 //!   adoption. A lane guard asserts no events were committed locally.
-//! - `bridge_catchup`: the TRUE EventBridge lane, via the stale-client shape
-//!   the client
+//! - `bridge_catchup`: the EventBridge lane with a stale client. The client
 //!   fetches once so it holds the entity at a stale head, disconnects, the
 //!   server advances by GAP edits (100 / 1000 / 5000), then the client
 //!   reconnects and re-fetches. The comparison repair carries the stale head,

@@ -246,7 +246,12 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                 // Send the updated predicate to the peer, under the
                 // credentials current at send time.
-                match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version).await {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.wait_for_cancel() => return,
+                    result = node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version) => result,
+                };
+                match result {
                     _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
                     Ok(()) => {
                         // Deltas applied successfully, now activate the livequery
@@ -438,8 +443,13 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let livequery =
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
-        // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
-        match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version).await {
+        // Dropping this future cancels comparison retries as well as its current RPC.
+        let result = tokio::select! {
+            biased;
+            _ = cancel.wait_for_cancel() => return,
+            result = node.remote_subscribe(target_peer, query_id, predicate, cdatas, version) => result,
+        };
+        match result {
             _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
             Ok(()) => {
                 // Deltas applied successfully, now activate the livequery
@@ -492,6 +502,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         // Evaluate retriability at failure time
         let is_retryable = match &error {
             RetrievalError::MutationError(error) if matches!(**error, MutationError::WriteConflict) => true,
+            RetrievalError::StorageError(error)
+                if matches!(
+                    error.downcast_ref::<proto::ComparisonFailure>(),
+                    Some(proto::ComparisonFailure::Expired | proto::ComparisonFailure::Restart)
+                ) =>
+            {
+                true
+            }
             // Retrieval errors from fetching are generally not retryable
             RetrievalError::RequestError(req_err) => match req_err {
                 RequestError::PeerNotConnected => true,
@@ -736,8 +754,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_snapshot_conflict_retries_without_retrying_permanent_mutation_errors() {
-        for (error, retry) in [(MutationError::WriteConflict, true), (MutationError::InvalidUpdate("invalid state"), false)] {
+    async fn snapshot_and_capture_conflicts_retry_without_retrying_permanent_refusals() {
+        for (error, retry) in [
+            (RetrievalError::from(MutationError::WriteConflict), true),
+            (RetrievalError::from(MutationError::InvalidUpdate("invalid state")), false),
+            (RetrievalError::storage(proto::ComparisonFailure::Restart), true),
+            (RetrievalError::storage(proto::ComparisonFailure::Expired), true),
+            (RetrievalError::storage(proto::ComparisonFailure::AuthorizationChanged), false),
+            (RetrievalError::storage(proto::ComparisonFailure::LimitExceeded), false),
+        ] {
             let (relay, sender, peer) = connected_relay();
             sender.set_fail_next(error);
             let query = proto::QueryId::new();
@@ -1064,7 +1089,7 @@ mod tests {
             assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p == peer_id));
 
             ESTABLISHED.take();
-            stale.send(stale_reply).unwrap();
+            assert!(stale.send(stale_reply).is_err(), "supersession drops the in-flight request");
             settle().await;
             assert!(matches!(relay.get_status(query_id), Some(Status::Established(_, 2))), "{:?}", relay.get_status(query_id));
             assert_eq!(ESTABLISHED.take(), Vec::<u32>::new(), "a superseded reply must not activate the livequery");
@@ -1083,7 +1108,7 @@ mod tests {
 
         relay.subscribe_query(query_id, create_test_selection(), create_test_model_id().into(), 2, MockLiveQuery);
         settle().await;
-        stale.send(Err(RequestError::ServerError("stale".into()))).unwrap();
+        assert!(stale.send(Err(RequestError::ServerError("stale".into()))).is_err());
         settle().await;
 
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p == peer));
@@ -1105,7 +1130,7 @@ mod tests {
         settle().await;
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 1)) if p == peer_id));
 
-        stale.send(Err(RequestError::ConnectionLost)).unwrap();
+        assert!(stale.send(Err(RequestError::ConnectionLost)).is_err());
         settle().await;
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(_, 1))), "{:?}", relay.get_status(query_id));
     }

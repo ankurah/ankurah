@@ -33,7 +33,10 @@ pub(crate) struct TestStorage {
     pub hold_state_snapshot: Mutex<Option<Pause>>,
     /// Pause the page that many calls from now, counting from zero.
     pub hold_state_page: Arc<Mutex<Option<(usize, Pause)>>>,
+    /// Pause after all canonical reads, before finishing their snapshot.
+    pub hold_state_finish: Arc<Mutex<Option<Pause>>>,
     pub reject_state_finish: Arc<AtomicBool>,
+    pub state_point_reads: Arc<AtomicUsize>,
     /// Complete limited-query or refill executions, distinct from changed-ID reads.
     pub state_selection_reads: Arc<AtomicUsize>,
     /// Pauses the next map write part way, after the first of its writes.
@@ -284,7 +287,9 @@ impl StorageEngine for TestStorage {
             &self.data.lock().unwrap(),
             scan,
             self.hold_state_page.clone(),
+            self.hold_state_finish.clone(),
             self.reject_state_finish.clone(),
+            self.state_point_reads.clone(),
             self.state_selection_reads.clone(),
         )?;
         let hold = self.hold_state_snapshot.lock().unwrap().take();
