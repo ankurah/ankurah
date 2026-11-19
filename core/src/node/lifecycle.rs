@@ -68,7 +68,7 @@ impl NodeLifecycle {
     ) -> BoxFuture<'a, Result<T, E>> {
         // Box before constructing the wrapper: nested operations otherwise
         // embed their entire work future at every cancellation boundary.
-        let work = Box::pin(work);
+        let work: BoxFuture<'a, Result<T, E>> = Box::pin(work);
         Box::pin(async move {
             let _operation = self.admit()?;
             tokio::select! {
