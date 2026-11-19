@@ -317,6 +317,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                     updates.as_ref().unwrap().iter().any(|message| match message {
                         proto::NodeMessage::Update(update) => match &update.body {
                             proto::NodeUpdateBody::SubscriptionUpdate { items } => items.iter().any(|item| item.entity_id == *id),
+                            proto::NodeUpdateBody::Comparison { deltas, .. } => deltas.iter().any(|delta| delta.entity_id == *id),
                         },
                         _ => false,
                     })

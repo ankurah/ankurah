@@ -378,8 +378,8 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         let result = (|| {
             self.system.check_not_halted()?;
             checked.check_active()?;
-            let current = self.peer_connections.get(&checked.key.0).ok_or_else(|| failure(ComparisonFailure::Expired))?;
-            if !Weak::ptr_eq(&checked.slot.connection, &Arc::downgrade(&current)) || checked.slot.credentials != *credentials {
+            self.peer_connections.get(&checked.key.0).ok_or_else(|| failure(ComparisonFailure::Expired))?;
+            if checked.slot.credentials != *credentials {
                 return Err(failure(ComparisonFailure::AuthorizationChanged));
             }
             let limits = restrict(checked.slot.limits, self.policy_agent.comparison_limits(credentials));

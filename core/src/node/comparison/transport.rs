@@ -106,7 +106,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         for attempt in 0..3 {
             let result = async {
                 let id = ComparisonId::new();
-                let active = {
+                let _active = {
                     let connection = self.peer_connections.get(&connection_id).ok_or(RequestError::PeerNotConnected)?;
                     connection.comparisons.admit(id, credentials.clone(), limits)?;
                     Active { connection: Arc::downgrade(&connection), from: self.keyed_id(), id }
@@ -124,11 +124,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     )
                     .await?;
                 let key_spec = super::wire::key_spec_to_wire(local.key_spec());
-                let current = self.peer_connections.get(&connection_id).ok_or(RequestError::PeerNotConnected)?;
-                if !Weak::ptr_eq(&active.connection, &Arc::downgrade(&current)) {
-                    return Err(failure(ComparisonFailure::Expired));
-                }
-                drop(current);
+                self.peer_connections.get(&connection_id).ok_or(RequestError::PeerNotConnected)?;
                 let request = match subscription {
                     Some((query_id, version)) => proto::NodeRequestBody::SubscribeQuery {
                         query_id,

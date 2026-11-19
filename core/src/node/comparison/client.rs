@@ -217,7 +217,7 @@ fn disclosable_members(
             withheld.push(id);
             continue;
         }
-        // A captured remote address was already disclosed by the connection_id. It can
+        // A captured remote address was already disclosed by the peer. It can
         // still be repaired cold without revealing a denied local head.
         member.known.head = state.filter(|_| readable).map(|state| state.payload.state.head).unwrap_or_default();
         disclosed.push(member);
