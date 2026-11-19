@@ -1,6 +1,12 @@
 //! Receiver-owned, directional replication through bounded digest comparison.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto::{ComparisonFailure, EntityId, KnownState};
@@ -40,9 +46,8 @@ pub enum ReplicationState {
 pub struct Replication(Arc<Inner>);
 
 struct Inner {
-    state: Mut<ReplicationState>,
+    progress: Arc<Progress>,
     cancel: CancelFlag,
-    wake: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for Inner {
@@ -50,13 +55,14 @@ impl Drop for Inner {
 }
 
 impl Replication {
-    pub fn state(&self) -> Read<ReplicationState> { self.0.state.read() }
+    pub fn state(&self) -> Read<ReplicationState> { self.0.progress.state.read() }
 
     /// Wait for a completed source capture, or return the current refusal.
     /// An existing CaughtUp value describes the last completed capture; call
     /// `retry` first to request a new sweep explicitly.
     pub async fn wait_caught_up(&self) -> Result<KnownState, RetrievalError> {
         self.0
+            .progress
             .state
             .wait_for(|state| match state {
                 ReplicationState::CaughtUp(source) => Some(Ok(source.clone())),
@@ -68,17 +74,40 @@ impl Replication {
 
     /// Cancel an in-flight sweep and compare again using current credentials.
     /// A dropped or halted Node cannot be retried through an existing handle.
-    pub fn retry(&self) {
-        let retry = self.0.state.update(|state| match state {
+    pub fn retry(&self) { self.0.progress.restart(); }
+}
+
+struct Progress {
+    state: Mut<ReplicationState>,
+    revision: AtomicU64,
+    wake: tokio::sync::Notify,
+}
+
+impl Progress {
+    fn restart(&self) {
+        let retry = self.state.update(|state| match state {
             ReplicationState::Failed(RetrievalError::NodeDropped(_) | RetrievalError::NodeHalted(_)) => false,
             _ => {
+                self.revision.fetch_add(1, Ordering::Relaxed);
                 *state = ReplicationState::Connecting;
                 true
             }
         });
         if retry {
-            self.0.wake.notify_one();
+            self.wake.notify_one();
         }
+    }
+
+    fn publish(&self, revision: u64, next: ReplicationState) -> bool {
+        // Retry and completion serialize through the same state lock. Checking
+        // the revision before acquiring it would allow an obsolete result through.
+        self.state.update(|state| {
+            if self.revision.load(Ordering::Relaxed) != revision {
+                return false;
+            }
+            *state = next;
+            true
+        })
     }
 }
 
@@ -107,12 +136,15 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         }
         let sessions = sessions.into();
         self.sessions.attach(&sessions);
-        let state = Mut::new(ReplicationState::Connecting);
+        let progress = Arc::new(Progress {
+            state: Mut::new(ReplicationState::Connecting),
+            revision: AtomicU64::new(0),
+            wake: tokio::sync::Notify::new(),
+        });
         let cancel = CancelFlag::default();
-        let wake = Arc::new(tokio::sync::Notify::new());
-        let handle = Replication(Arc::new(Inner { state: state.clone(), cancel: cancel.clone(), wake: wake.clone() }));
-        let changed = wake.clone();
-        let session_watch = sessions.subscribe(move |_| changed.notify_one());
+        let handle = Replication(Arc::new(Inner { progress: progress.clone(), cancel: cancel.clone() }));
+        let changed = progress.clone();
+        let session_watch = sessions.subscribe(move |_| changed.restart());
         let weak = self.weak();
         let run = self.run.clone();
         let ready = self.wait_ready();
@@ -133,13 +165,14 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 result = ready => result.map_err(RetrievalError::from),
             };
             if let Err(error) = initialized {
-                state.set(ReplicationState::Failed(error));
+                progress.state.set(ReplicationState::Failed(error));
                 return;
             }
             // A tree owner keeps continuation active between comparisons. Neither
             // it nor the waiting worker keeps the Node or public handle alive.
             let mut _tree = None;
             loop {
+                let revision = progress.revision.load(Ordering::Relaxed);
                 let attempt = async {
                     let node = weak.upgrade().ok_or(NodeDropped)?;
                     node.check_ready()?;
@@ -152,34 +185,30 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
                     let mut scoped = selection.clone();
                     scoped.predicate = policy.filter_predicate(scoped.predicate)?;
-                    state.set(ReplicationState::Comparing);
+                    progress.publish(revision, ReplicationState::Comparing);
                     node.reconcile_selection(peer, scoped, &credentials, None).await
                 };
                 let result = tokio::select! {
                     biased;
                     _ = cancel.wait_for_cancel() => return,
                     _ = run.wait_value(false) => {
-                        state.set(ReplicationState::Failed(stopped()));
+                        progress.state.set(ReplicationState::Failed(stopped()));
                         return;
                     },
-                    _ = wake.notified() => continue,
+                    _ = progress.wake.notified() => continue,
                     result = attempt => result,
                 };
-                let retry = match result {
-                    Ok((source, tree)) => {
-                        _tree = Some(tree);
-                        state.set(ReplicationState::CaughtUp(source));
-                        true
-                    }
-                    Err(error) if retryable(&error) => {
-                        state.set(ReplicationState::Connecting);
-                        true
-                    }
-                    Err(error) => {
-                        state.set(ReplicationState::Failed(error));
-                        false
-                    }
+                let (next, retry, tree) = match result {
+                    Ok((source, tree)) => (ReplicationState::CaughtUp(source), true, Some(tree)),
+                    Err(error) if retryable(&error) => (ReplicationState::Connecting, true, None),
+                    Err(error) => (ReplicationState::Failed(error), false, None),
                 };
+                if !progress.publish(revision, next) {
+                    continue;
+                }
+                if let Some(tree) = tree {
+                    _tree = Some(tree);
+                }
                 let next_sweep = async {
                     if retry {
                         futures_timer::Delay::new(Duration::from_secs(1)).await;
@@ -191,10 +220,10 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     biased;
                     _ = cancel.wait_for_cancel() => return,
                     _ = run.wait_value(false) => {
-                        state.set(ReplicationState::Failed(stopped()));
+                        progress.state.set(ReplicationState::Failed(stopped()));
                         return;
                     },
-                    _ = wake.notified() => {},
+                    _ = progress.wake.notified() => {},
                     _ = next_sweep => {},
                 }
             }

@@ -141,3 +141,35 @@ async fn unavailable_required_history_stops_after_bounded_capture_retries() -> a
     assert!(node.peer_connections.get(&peer).unwrap().pending_requests.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn retry_rejects_a_finished_sweeps_late_success_or_refusal() -> anyhow::Result<()> {
+    let progress =
+        Arc::new(Progress { state: Mut::new(ReplicationState::Comparing), revision: AtomicU64::new(0), wake: tokio::sync::Notify::new() });
+    let handle = Replication(Arc::new(Inner { progress: progress.clone(), cancel: CancelFlag::default() }));
+    let old = progress.revision.load(Ordering::Relaxed);
+    // The worker has selected a result, but retry arrives before publication.
+    handle.retry();
+    let mut waiting = Box::pin(handle.wait_caught_up());
+    assert!(futures::poll!(&mut waiting).is_pending());
+    assert!(!progress.publish(old, ReplicationState::CaughtUp(KnownState::empty())));
+    assert!(!progress.publish(old, ReplicationState::Failed(RetrievalError::storage(ComparisonFailure::LimitExceeded))));
+    assert!(matches!(handle.state().value(), ReplicationState::Connecting));
+    assert!(futures::poll!(&mut waiting).is_pending(), "an obsolete completion must not satisfy the fresh wait");
+
+    let current = progress.revision.load(Ordering::Relaxed);
+    assert!(progress.publish(current, ReplicationState::CaughtUp(KnownState::empty())));
+    assert_eq!(waiting.await?, KnownState::empty());
+
+    // Signal listeners may synchronously request another sweep.
+    let listener_handle = handle.clone();
+    let _listener = handle.state().subscribe(move |state| {
+        if matches!(state, ReplicationState::Comparing) {
+            listener_handle.retry();
+        }
+    });
+    assert!(progress.publish(current, ReplicationState::Comparing));
+    assert!(matches!(handle.state().value(), ReplicationState::Connecting));
+    assert!(!progress.publish(current, ReplicationState::CaughtUp(KnownState::empty())));
+    Ok(())
+}
