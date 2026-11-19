@@ -88,6 +88,18 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         credentials: &Vec<PA::ContextData>,
         subscription: Option<(proto::QueryId, u32)>,
     ) -> Result<(), RetrievalError> {
+        self.reconcile_selection(peer, selection, credentials, subscription).await.map(|_| ())
+    }
+
+    /// Keep the managed tree alive with the completed source coverage. Durable
+    /// interests retain this owner between sweeps without retaining entity views.
+    pub(in crate::node) async fn reconcile_selection(
+        &self,
+        peer: EntityId,
+        selection: Selection<Resolved>,
+        credentials: &Vec<PA::ContextData>,
+        subscription: Option<(proto::QueryId, u32)>,
+    ) -> Result<(proto::KnownState, super::super::trees::ComparisonTree<SE>), RetrievalError> {
         let limits = self.policy_agent.comparison_limits(credentials);
         let mut budget = ComparisonBudget::new(limits);
         for attempt in 0..3 {
@@ -138,9 +150,9 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 if target.id != id {
                     return Err(failure(ComparisonFailure::InvalidRequest("unexpected comparison identity".into())));
                 }
-                let result = self.compare_query(peer, &selection, &local, target, credentials, &mut budget).await;
-                drop(owner);
-                result
+                let coverage = target.known_state.clone();
+                self.compare_query(peer, &selection, &local, target, credentials, &mut budget).await?;
+                Ok((coverage, owner))
             }
             .await
             .map_err(super::serve::restart);

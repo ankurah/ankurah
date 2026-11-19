@@ -32,25 +32,33 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new() -> anyhow::Result<Self> {
+    async fn new() -> anyhow::Result<Self> { Self::with_durability(false).await }
+
+    async fn with_durability(durable: bool) -> anyhow::Result<Self> {
         let storage = Arc::new(TestStorage::default());
-        let node = Node::new(storage.clone(), PermissiveAgent::new());
+        let node = if durable {
+            Node::new_durable(storage.clone(), PermissiveAgent::new())
+        } else {
+            Node::new(storage.clone(), PermissiveAgent::new())
+        };
         node.system.wait_loaded().await?;
-        let events = LocalEventGetter::new(storage.clone(), false);
+        let events = LocalEventGetter::new(storage.clone(), durable);
         let genesis = Event::genesis(
             Some(EntityId::from_bytes([4; 32])),
             AuthorId::Unknown,
             OperationSet(vec![Operation::Membership(Membership::Add(model_a())), value_operation("initial")?]),
         );
         events.stage_event(genesis.clone());
-        let (entity, _) =
-            NodeApplier::apply_and_commit_events(&node, &[Attested::opt(genesis.clone(), None)], &events).await?.unwrap().into_parts();
+        let (entity, _) = NodeApplier::apply_and_commit_events(&node, &[Attested::opt(genesis.clone(), None)], &events, None)
+            .await?
+            .unwrap()
+            .into_parts();
         Ok(Self { node, storage, events, genesis, entity })
     }
 
     async fn commit_event(&self, event: Event) -> anyhow::Result<()> {
         self.events.stage_event(event.clone());
-        NodeApplier::apply_and_commit_events(&self.node, &[Attested::opt(event, None)], &self.events).await?;
+        NodeApplier::apply_and_commit_events(&self.node, &[Attested::opt(event, None)], &self.events, None).await?;
         Ok(())
     }
 
@@ -112,6 +120,86 @@ impl Fixture {
         let update = proto::SubscriptionUpdateItem { entity_id: self.entity.id(), content, predicate_relevance: vec![] };
         NodeApplier::apply_update(&self.node, &peer, update, &self.events, &states).await.map(|_| ())
     }
+}
+
+#[tokio::test]
+async fn durable_nodes_refuse_bare_snapshots_for_new_and_existing_entities() -> anyhow::Result<()> {
+    let source = Fixture::new().await?;
+    let next = Event::update(source.entity.id(), source.entity.head(), AuthorId::Unknown, OperationSet::default());
+    source.commit_event(next).await?;
+    let snapshot = source.entity.to_state()?;
+    for existing in [false, true] {
+        let storage = Arc::new(TestStorage::default());
+        let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+        node.system.wait_loaded().await?;
+        let events = LocalEventGetter::new(storage.clone(), true);
+        let states = LocalStateGetter::new(storage.clone());
+        let resident = if existing {
+            NodeApplier::apply_and_commit_events(&node, &[source.genesis.clone().into()], &events, None).await?.map(|c| c.into_parts().0)
+        } else {
+            None
+        };
+        let before = resident.as_ref().map(Entity::to_state).transpose()?;
+        let state = proto::StateFragment { state: snapshot.clone(), attestations: Default::default() };
+        let delta = proto::EntityDelta { entity_id: source.entity.id(), content: proto::DeltaContent::StateSnapshot { state } };
+        let error = NodeApplier::apply_delta(&node, &EntityId::random(), delta, &events, &states).await.unwrap_err();
+        assert!(matches!(error, MutationError::InvalidUpdate("durable nodes require event-backed state")), "{error}");
+        assert_eq!(resident.as_ref().map(Entity::to_state).transpose()?, before);
+        if let Some(before) = before {
+            assert_eq!(storage.get_state(source.entity.id()).await?.payload.state, before);
+        } else {
+            assert!(matches!(storage.get_state(source.entity.id()).await, Err(RetrievalError::EntityNotFound(_))));
+            assert!(node.entities.get(&source.entity.id()).is_none());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_state_and_events_reconstructs_history_before_publishing() -> anyhow::Result<()> {
+    let source = Fixture::new().await?;
+    let first = Event::update(source.entity.id(), source.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("first")?]));
+    let last = Event::update(source.entity.id(), Clock::singleton(&first), AuthorId::Unknown, OperationSet(vec![value_operation("last")?]));
+    source.commit_event(first.clone()).await?;
+    source.commit_event(last.clone()).await?;
+    let expected = source.entity.to_state()?;
+    // The advertised body is deliberately different. Durable state must be
+    // derived from the verified events, even when the advertised head agrees.
+    let mut advertised = expected.clone();
+    advertised.memberships.insert(model_b());
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    node.system.wait_loaded().await?;
+    let states = LocalStateGetter::new(storage.clone());
+    let peer = EntityId::random();
+    let update = |events: Vec<Event>| proto::SubscriptionUpdateItem {
+        entity_id: source.entity.id(),
+        content: proto::UpdateContent::StateAndEvent(
+            proto::StateFragment { state: advertised.clone(), attestations: Default::default() },
+            events.into_iter().map(|event| Attested::from(event).into()).collect(),
+        ),
+        predicate_relevance: vec![],
+    };
+    for incomplete in [vec![], vec![last.clone()], vec![source.genesis.clone()], vec![source.genesis.clone(), last.clone()]] {
+        assert!(NodeApplier::apply_update(&node, &peer, update(incomplete), &NoEventReads, &states).await.is_err());
+        assert!(matches!(storage.get_state(source.entity.id()).await, Err(RetrievalError::EntityNotFound(_))));
+        assert!(storage.dump_entity_events(source.entity.id()).await?.is_empty());
+        assert!(node.entities.get(&source.entity.id()).is_none());
+    }
+    let complete = vec![last.clone(), source.genesis.clone(), first.clone()];
+    storage.fail_next_commit();
+    assert!(NodeApplier::apply_update(&node, &peer, update(complete.clone()), &NoEventReads, &states).await.is_err());
+    assert!(storage.dump_entity_events(source.entity.id()).await?.is_empty());
+    assert!(node.entities.get(&source.entity.id()).is_none());
+    let change = NodeApplier::apply_update(&node, &peer, update(complete.clone()), &NoEventReads, &states).await?.unwrap();
+    assert_eq!(change.entity().to_state()?, expected);
+    assert_eq!(storage.get_state(source.entity.id()).await?.payload.state, expected);
+    assert_eq!(
+        storage.get_events(vec![source.genesis.id(), first.id(), last.id()]).await?,
+        vec![source.genesis.into(), first.into(), last.into()]
+    );
+    assert!(NodeApplier::apply_update(&node, &peer, update(complete), &NoEventReads, &states).await?.is_none());
+    Ok(())
 }
 
 #[tokio::test]
@@ -627,39 +715,42 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
 
 #[tokio::test]
 async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
-        let fixture = Fixture::new().await?;
-        let foreign = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
-        cache(&fixture.storage, &[&foreign]).await?;
-        let valid =
-            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("valid")?]));
-        let disjoint = Event::update(fixture.entity.id(), Clock::singleton(&foreign), AuthorId::Unknown, OperationSet::default());
-        for event in [&foreign, &valid, &disjoint] {
-            event.validate_structure()?;
-        }
-        let before = fixture.entity.to_state()?;
-        let (notifications, observed) = mpsc::channel();
-        let _listener = fixture.entity.broadcast().reference().listen(notifications);
+    for durable in [false, true] {
+        for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+            let fixture = Fixture::with_durability(durable).await?;
+            let foreign = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
+            cache(&fixture.storage, &[&foreign]).await?;
+            let valid =
+                Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("valid")?]));
+            let disjoint = Event::update(fixture.entity.id(), Clock::singleton(&foreign), AuthorId::Unknown, OperationSet::default());
+            for event in [&foreign, &valid, &disjoint] {
+                event.validate_structure()?;
+            }
+            let before = fixture.entity.to_state()?;
+            let (notifications, observed) = mpsc::channel();
+            let _listener = fixture.entity.broadcast().reference().listen(notifications);
 
-        // The valid sibling must not vouch for an input whose history belongs to another entity.
-        let error = fixture.deliver(ingress, vec![valid.clone(), disjoint.clone()]).await.unwrap_err();
-        assert!(matches!(error, MutationError::LineageError(LineageError::Disjoint)), "{ingress:?}: {error}");
-        assert_eq!(fixture.entity.to_state()?, before, "{ingress:?}");
-        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before, "{ingress:?}");
-        assert!(fixture.storage.get_events(vec![valid.id(), disjoint.id()]).await?.is_empty(), "{ingress:?}");
-        assert!(!fixture.storage.list_materializations().await?.contains(&model_b()), "{ingress:?}");
-        assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{ingress:?}");
+            // The valid sibling must not vouch for an input whose history belongs to another entity.
+            let error = fixture.deliver(ingress, vec![valid.clone(), disjoint.clone()]).await.unwrap_err();
+            assert!(matches!(error, MutationError::LineageError(LineageError::Disjoint)), "{ingress:?}: {error}");
+            assert_eq!(fixture.entity.to_state()?, before, "{ingress:?}");
+            assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before, "{ingress:?}");
+            assert!(fixture.storage.get_events(vec![valid.id(), disjoint.id()]).await?.is_empty(), "{ingress:?}");
+            assert!(!fixture.storage.list_materializations().await?.contains(&model_b()), "{ingress:?}");
+            assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{ingress:?}");
 
-        for mut events in [vec![valid.clone().into(), disjoint.clone().into()], vec![disjoint.into(), valid.into()]] {
-            let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-            let error = candidate
-                .apply_events(&fixture.events, &mut events, |_| panic!("disjoint batch must be rejected before policy checks"))
-                .await
-                .unwrap_err();
-            assert!(matches!(error, MutationError::LineageError(LineageError::Disjoint)));
-            assert_eq!(candidate.to_state()?, before);
+            for mut events in [vec![valid.clone().into(), disjoint.clone().into()], vec![disjoint.into(), valid.into()]] {
+                let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
+                let error = candidate
+                    .apply_events(&fixture.events, &mut events, |_| panic!("disjoint batch must be rejected before policy checks"))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, MutationError::LineageError(LineageError::Disjoint)));
+                assert_eq!(candidate.to_state()?, before);
+            }
         }
     }
+
     Ok(())
 }
 
@@ -721,29 +812,32 @@ async fn event_only_discards_the_batch_without_partial_failed_operations() -> an
 
 #[tokio::test]
 async fn state_and_event_bridges_discard_the_batch_on_operation_failure() -> anyhow::Result<()> {
-    for ingress in [EventIngress::StateAndEvent, EventIngress::EventBridge] {
-        let fixture = Fixture::new().await?;
-        let before = fixture.entity.to_state()?;
-        let first =
-            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("first")?]));
-        let failed = Event::update(
-            fixture.entity.id(),
-            Clock::singleton(&first),
-            AuthorId::Unknown,
-            OperationSet(vec![Operation::Backend {
-                backend: "yrs".into(),
-                operations: vec![proto::BackendOperation { diff: vec![0xff] }],
-            }]),
-        );
-        let (notifications, observed) = mpsc::channel();
-        let _listener = fixture.entity.broadcast().reference().listen(notifications);
-        let error = fixture.deliver(ingress, vec![first.clone(), failed.clone()]).await.unwrap_err();
-        assert!(matches!(error, MutationError::StateError(_)), "{ingress:?}: {error}");
-        assert_eq!(fixture.entity.to_state()?, before, "{ingress:?}");
-        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before, "{ingress:?}");
-        assert!(fixture.storage.get_events(vec![first.id(), failed.id()]).await?.is_empty(), "{ingress:?}");
-        assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{ingress:?}");
+    for durable in [false, true] {
+        for ingress in [EventIngress::StateAndEvent, EventIngress::EventBridge] {
+            let fixture = Fixture::with_durability(durable).await?;
+            let before = fixture.entity.to_state()?;
+            let first =
+                Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("first")?]));
+            let failed = Event::update(
+                fixture.entity.id(),
+                Clock::singleton(&first),
+                AuthorId::Unknown,
+                OperationSet(vec![Operation::Backend {
+                    backend: "yrs".into(),
+                    operations: vec![proto::BackendOperation { diff: vec![0xff] }],
+                }]),
+            );
+            let (notifications, observed) = mpsc::channel();
+            let _listener = fixture.entity.broadcast().reference().listen(notifications);
+            let error = fixture.deliver(ingress, vec![first.clone(), failed.clone()]).await.unwrap_err();
+            assert!(matches!(error, MutationError::StateError(_)), "{ingress:?}: {error}");
+            assert_eq!(fixture.entity.to_state()?, before, "{ingress:?}");
+            assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before, "{ingress:?}");
+            assert!(fixture.storage.get_events(vec![first.id(), failed.id()]).await?.is_empty(), "{ingress:?}");
+            assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{ingress:?}");
+        }
     }
+
     Ok(())
 }
 
@@ -781,27 +875,30 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
 /// No event in the batch is applied when history preparation fails.
 #[tokio::test]
 async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_is_judged() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
-        let fixture = Fixture::new().await?;
-        let genesis = fixture.entity.head();
-        let honest = Event::update(fixture.entity.id(), genesis.clone(), AuthorId::Unknown, OperationSet::default());
-        let unreadable = EventId::from_bytes([9; 32]);
-        // The known parent is generation 2, but the update claims 1: a false annotation within the bound.
-        let over_both = Event::update(
-            fixture.entity.id(),
-            Clock::new(vec![(1, honest.id()), (1, unreadable.clone())])?,
-            AuthorId::Unknown,
-            OperationSet::default(),
-        );
+    for durable in [false, true] {
+        for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+            let fixture = Fixture::with_durability(durable).await?;
+            let genesis = fixture.entity.head();
+            let honest = Event::update(fixture.entity.id(), genesis.clone(), AuthorId::Unknown, OperationSet::default());
+            let unreadable = EventId::from_bytes([9; 32]);
+            // The known parent is generation 2, but the update claims 1: a false annotation within the bound.
+            let over_both = Event::update(
+                fixture.entity.id(),
+                Clock::new(vec![(1, honest.id()), (1, unreadable.clone())])?,
+                AuthorId::Unknown,
+                OperationSet::default(),
+            );
 
-        let error = fixture.deliver(ingress, vec![honest.clone(), over_both.clone()]).await.unwrap_err();
-        assert!(
-            matches!(&error, MutationError::RetrievalError(RetrievalError::EventNotFound(id)) if *id == unreadable),
-            "{ingress:?}: {error}"
-        );
-        assert!(fixture.storage.get_events(vec![honest.id(), over_both.id()]).await?.is_empty(), "{ingress:?}");
-        assert_eq!(fixture.entity.head(), genesis, "{ingress:?}");
+            let error = fixture.deliver(ingress, vec![honest.clone(), over_both.clone()]).await.unwrap_err();
+            assert!(
+                matches!(&error, MutationError::RetrievalError(RetrievalError::EventNotFound(id)) if *id == unreadable),
+                "{ingress:?}: {error}"
+            );
+            assert!(fixture.storage.get_events(vec![honest.id(), over_both.id()]).await?.is_empty(), "{ingress:?}");
+            assert_eq!(fixture.entity.head(), genesis, "{ingress:?}");
+        }
     }
+
     Ok(())
 }
 
@@ -1001,7 +1098,7 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     // The parent arrives before a fresh application attempt.
     cache(&storage, &[&parent]).await?;
     let before = entity.to_state()?;
-    let error = NodeApplier::apply_and_commit_events(&node, &[admitted], &events).await.unwrap_err();
+    let error = NodeApplier::apply_and_commit_events(&node, &[admitted], &events, None).await.unwrap_err();
     assert!(
         matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: 1, known: 2, .. })),
         "{error}"

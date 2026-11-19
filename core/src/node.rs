@@ -42,6 +42,7 @@ pub(crate) mod handler;
 pub mod handles;
 mod match_args;
 mod peer_state;
+mod replication;
 mod schema_registration;
 mod state;
 #[cfg(test)]
@@ -52,6 +53,7 @@ pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
+pub use replication::{Replication, ReplicationState};
 use schema_registration::WireRegistrant;
 pub use state::NodeState;
 

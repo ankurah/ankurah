@@ -112,6 +112,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         credentials: &Vec<PA::ContextData>,
     ) -> Result<PreparedRepair<SE, PA::ContextData>, RetrievalError> {
         let checked = self.checked_comparison(peer, id, selection, credentials, members.len()).await?;
+        let durable = checked.connection()?.durable;
         let remaining = checked.remaining();
         let prepare = async {
             let limits = checked.limits();
@@ -178,7 +179,9 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     disclosed.push(state);
                     continue;
                 }
-                let content = if !events_only && member.known.head.is_empty() {
+                // Durable replicas must be able to reconstruct every admitted state.
+                // A cold replica therefore receives ancestry back to creation.
+                let content = if !durable && !events_only && member.known.head.is_empty() {
                     proto::DeltaContent::StateSnapshot {
                         state: proto::StateFragment { state: state.payload.state.clone(), attestations: state.attestations.clone() },
                     }

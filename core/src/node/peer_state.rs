@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 
 pub struct PeerState<CD: ContextData> {
     pub(super) sender: Box<dyn PeerSender>,
-    _durable: bool,
+    pub(super) durable: bool,
     pub(super) subscription_handler: SubscriptionHandler<CD>,
     pub(super) comparisons: super::comparison::IncomingComparisons<CD>,
     pub(super) pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
@@ -21,7 +21,7 @@ impl<CD: ContextData> PeerState<CD> {
     pub(super) fn new(sender: Box<dyn PeerSender>, durable: bool, subscription_handler: SubscriptionHandler<CD>) -> Self {
         Self {
             sender,
-            _durable: durable,
+            durable,
             subscription_handler,
             comparisons: Default::default(),
             pending_requests: SafeMap::new(),

@@ -223,7 +223,9 @@ impl Transaction {
                 forks.push((entity, entity_after));
             }
 
-            if !relayed {
+            // Durable commits complete locally; directional replication propagates
+            // their events independently of peer availability or acceptance.
+            if !node.durable && !relayed {
                 if let ContextAuth::Sessions(sessions) = auth {
                     node.relay_to_required_peers(&sessions.write_credential()?, self.id.clone(), &attested_events).await?;
                 }

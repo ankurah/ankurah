@@ -2,7 +2,7 @@ use crate::entity::RemoteTrxEntity;
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
 use crate::reactor::ChangeNotification;
-use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
@@ -116,7 +116,7 @@ impl NodeApplier {
                 let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, event_fragments, event_getter)?;
                 // Batch preparation requires parents before their children; wire order is untrusted.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
-                Self::apply_and_commit_events(node, &attested_events, event_getter).await
+                Self::apply_and_commit_events(node, &attested_events, event_getter, None).await
             }
 
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
@@ -126,6 +126,12 @@ impl NodeApplier {
 
                 let state: Attested<proto::EntityState> = (entity_id, state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
+
+                if node.durable {
+                    // The snapshot is a claim to verify, never a substitute for
+                    // the history needed to reconstruct durable state.
+                    return Self::apply_and_commit_events(node, &attested_events, event_getter, Some(&state.payload.state.head)).await;
+                }
 
                 if let Some(entity) = Self::save_new_entity(node, &state.payload, &attested_events, event_getter, state_getter).await? {
                     return Ok(Some(EntityChange::new(entity, attested_events)));
@@ -206,6 +212,9 @@ impl NodeApplier {
         E: SuspenseEvents + Send + Sync,
         S: crate::retrieval::GetState + Send + Sync,
     {
+        if node.durable {
+            return Err(MutationError::InvalidUpdate("durable nodes require event-backed state"));
+        }
         if node.entities.get_or_retrieve(state_getter, event_getter, &state.entity_id).await?.is_some() {
             return Ok(None);
         }
@@ -241,6 +250,9 @@ impl NodeApplier {
         PA: PolicyAgent + Send + Sync + 'static,
         E: SuspenseEvents + Send + Sync,
     {
+        if node.durable {
+            return Err(MutationError::InvalidUpdate("durable nodes require event-backed state"));
+        }
         crate::util::retry::retry_on!(MutationError::WriteConflict, {
             let candidate = RemoteTrxEntity::edit(entity)?;
             let expected_head = candidate.head();
@@ -282,13 +294,32 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         events: &[Attested<proto::Event>],
         event_getter: &E,
+        required_head: Option<&proto::Clock>,
     ) -> Result<Option<EntityChange>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
         E: SuspenseEvents + Send + Sync,
     {
-        let Some(first) = events.first() else { return Ok(None) };
+        let Some(first) = events.first() else {
+            return if required_head.is_some() {
+                Err(MutationError::InvalidUpdate("durable nodes require event-backed state"))
+            } else {
+                Ok(None)
+            };
+        };
+        // Missing durable history must fail this attempt, not be fetched and
+        // persisted independently by an ephemeral node's caching getter.
+        let local_events = node.durable.then(|| LocalEventGetter::new(node.storage.clone(), true));
+        let event_getter: &(dyn SuspenseEvents + Send + Sync) = if let Some(local_events) = &local_events {
+            for event in events {
+                local_events.stage_event(event.payload.clone());
+            }
+            local_events
+        } else {
+            event_getter
+        };
+        let event_getter = &event_getter;
         let entity_id = first.payload.entity_id;
         let state_getter = LocalStateGetter::new(node.storage.clone());
         crate::util::retry::retry_on!(MutationError::WriteConflict, {
@@ -296,6 +327,22 @@ impl NodeApplier {
             let expected_head = candidate.head();
             let mut events = events.to_vec();
             candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
+            if let Some(required_head) = required_head {
+                let relation = crate::event_dag::compare(
+                    event_getter,
+                    &candidate.head(),
+                    required_head,
+                    crate::event_dag::DEFAULT_BUDGET.saturating_add(events.len()),
+                )
+                .await?
+                .relation;
+                if !matches!(
+                    relation,
+                    crate::event_dag::AbstractCausalRelation::Equal | crate::event_dag::AbstractCausalRelation::StrictDescends { .. }
+                ) {
+                    return Err(MutationError::InvalidUpdate("event batch does not cover the supplied snapshot head"));
+                }
+            }
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
             let mut storage_trx = node.storage.transaction();
@@ -402,7 +449,7 @@ impl NodeApplier {
 
                 // Batch preparation requires parents before their children; wire order is untrusted.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
-                let change = Self::apply_and_commit_events(node, &attested_events, event_getter).await?;
+                let change = Self::apply_and_commit_events(node, &attested_events, event_getter, None).await?;
 
                 // An already-applied bridge changes nothing. Avoid emitting an empty
                 // Update to subscriptions that already hold this entity.

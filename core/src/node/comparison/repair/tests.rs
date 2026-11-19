@@ -132,14 +132,21 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new() -> anyhow::Result<Self> {
+    async fn new() -> anyhow::Result<Self> { Self::with_peer_durability(false).await }
+
+    async fn with_peer_durability(durable: bool) -> anyhow::Result<Self> {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new_durable(storage, ReadPolicy::default());
         node.system.create().await?;
         node.wait_ready().await?;
         let peer = EntityId::random();
         node.register_peer(
-            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+            proto::Presence {
+                node_id: peer,
+                durable,
+                system_root: if durable { node.system.root() } else { None },
+                protocol_version: proto::PROTOCOL_VERSION,
+            },
             Box::new(Sender(peer)),
         )
         .await?;
@@ -229,6 +236,33 @@ fn delivered(repair: &PreparedRepair<TestStorage, &'static DefaultContext>) -> V
 }
 
 #[tokio::test]
+async fn durable_cold_repair_sends_complete_history_and_refuses_holes() -> anyhow::Result<()> {
+    let fixture = Fixture::with_peer_durability(true).await?;
+    let (id, key) = fixture.capture().await?;
+    let repair = fixture.repair(id, Some(key.clone()), Clock::default(), false).await?;
+    repair.revalidate(&fixture.node, &vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(delivered(&repair), vec![fixture.root.clone(), fixture.current.clone()]);
+    assert!(repair.unavailable.is_empty());
+
+    // A redacted ancestor cannot be replaced with a bare snapshot, nor may a
+    // suffix be sent as if it reconstructed the current state.
+    fixture.node.policy_agent.0.lock().unwrap().events.insert(fixture.root.id());
+    let repair = fixture.repair(id, Some(key.clone()), Clock::default(), false).await?;
+    assert!(repair.deltas.is_empty());
+    assert_eq!(repair.unavailable, vec![fixture.current.entity_id]);
+    fixture.node.policy_agent.0.lock().unwrap().events.clear();
+
+    let missing = child(&fixture.current);
+    let current = child(&missing);
+    store(&fixture.node, &[current.clone()]).await?;
+    fixture.state(&current, true);
+    let repair = fixture.repair(id, Some(key), Clock::default(), false).await?;
+    assert!(repair.deltas.is_empty());
+    assert_eq!(repair.unavailable, vec![fixture.current.entity_id]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cold_repair_uses_current_state_and_exact_captured_key() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let (id, key) = fixture.capture().await?;
@@ -271,7 +305,7 @@ async fn known_id_repair_does_not_require_captured_membership() -> anyhow::Resul
 
 #[tokio::test]
 async fn an_advanced_capture_repairs_only_the_verified_suffix_of_a_long_history() -> anyhow::Result<()> {
-    let mut fixture = Fixture::new().await?;
+    let mut fixture = Fixture::with_peer_durability(true).await?;
     let mut history = vec![fixture.root.clone(), fixture.current.clone()];
     while history.len() < 64 {
         history.push(child(history.last().unwrap()));
@@ -318,7 +352,7 @@ async fn ordinary_repair_keeps_both_ancestries_when_current_is_concurrent_with_c
 
 #[tokio::test]
 async fn unknown_concurrent_head_gets_complete_parent_first_history() -> anyhow::Result<()> {
-    let fixture = Fixture::new().await?;
+    let fixture = Fixture::with_peer_durability(true).await?;
     let (id, _) = fixture.capture().await?;
     let remote = child(&fixture.root); // This branch is not stored on the serving node.
     let repair = fixture.repair(id, None, Clock::singleton(&remote), false).await?;
