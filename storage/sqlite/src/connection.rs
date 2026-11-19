@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::error::SqliteError;
 
@@ -17,16 +17,16 @@ pub enum SqliteConfig {
     Memory,
 }
 
-/// A wrapper around a SQLite connection that can be used with bb8
-///
-/// Since rusqlite::Connection is not Send, we wrap it in a Mutex
-/// and use spawn_blocking for all operations.
+/// Opens file connections for bb8 and owns one private-memory database.
 pub struct SqliteConnectionManager {
     config: SqliteConfig,
+    /// Pool expiry replaces handles without discarding the private database.
+    /// Every handle shares the connection's mutex, including retained snapshots.
+    memory: OnceCell<PooledConnection>,
 }
 
 impl SqliteConnectionManager {
-    pub fn new(config: SqliteConfig) -> Self { Self { config } }
+    pub fn new(config: SqliteConfig) -> Self { Self { config, memory: OnceCell::new() } }
 
     pub fn file(path: impl Into<PathBuf>) -> Self { Self::new(SqliteConfig::File(path.into())) }
 
@@ -109,12 +109,17 @@ impl bb8::ManageConnection for SqliteConnectionManager {
     type Error = SqliteError;
 
     fn connect(&self) -> impl std::future::Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        let config = self.config.clone();
         async move {
-            let manager = SqliteConnectionManager::new(config);
-            tokio::task::spawn_blocking(move || manager.create_connection().map(PooledConnection::new))
-                .await
-                .map_err(|e| SqliteError::TaskJoin(e.to_string()))?
+            let open = || async {
+                let config = self.config.clone();
+                tokio::task::spawn_blocking(move || Self::new(config).create_connection().map(PooledConnection::new))
+                    .await
+                    .map_err(|e| SqliteError::TaskJoin(e.to_string()))?
+            };
+            match &self.config {
+                SqliteConfig::Memory => self.memory.get_or_try_init(open).await.cloned(),
+                SqliteConfig::File(_) => open().await,
+            }
         }
     }
 

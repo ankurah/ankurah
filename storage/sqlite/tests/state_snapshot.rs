@@ -44,6 +44,82 @@ async fn memory_pages_validate_the_counter_and_release_the_single_connection() -
 }
 
 #[tokio::test]
+async fn memory_operations_share_the_database_after_pool_connection_expiry() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use ankurah_core::storage::{MapId, MapRead, MapRows, MapSnapshot, MapWrite};
+    use ankurah_proto::{EntityId, ModelId};
+
+    let pool = bb8::Pool::builder()
+        .max_size(1)
+        .idle_timeout(None)
+        .max_lifetime(Duration::from_millis(100))
+        .reaper_rate(Duration::from_millis(20))
+        .build(SqliteConnectionManager::memory())
+        .await?;
+    let engine = SqliteStorageEngine::new(pool).await?;
+    let (mut first, event) = entity!(1);
+    let model = ModelId::EntityId(EntityId::from_bytes([101; 32]));
+    first.payload.state.memberships.insert(model);
+    let map = MapId::new("memory");
+    let read = MapRead::Get { map: map.clone(), keys: vec![b"key".to_vec()] };
+    let mut transaction = engine.transaction();
+    transaction.set_state(&Clock::default(), &first).await?;
+    transaction.add_events(std::slice::from_ref(&event)).await?;
+    transaction.map_write(vec![MapWrite::Put { map: map.clone(), key: b"key".to_vec(), value: vec![1] }]).await?;
+    transaction.commit().await?.committed()?;
+    let cursor = engine.state_snapshot(StateScan::Changes(None)).await?.finish().await?;
+
+    // Observe the pool retiring its handle; elapsed time alone does not prove
+    // that the next checkout must obtain a replacement from the manager.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while engine.pool().state().statistics.connections_closed_max_lifetime == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+
+    assert_eq!(engine.get_state(first.payload.entity_id).await?.payload, first.payload);
+    assert_eq!(engine.get_events(vec![event.payload.id()]).await?, [event.clone()]);
+    let membership = Selection { predicate: Predicate::MemberOf(model), order_by: None, limit: Some(10) };
+    assert_eq!(engine.fetch_states(&membership).await?, [first.clone()]);
+    assert_eq!(engine.map_snapshot(&[]).await?.map_read(vec![read.clone()]).await?, [MapRows::Got(vec![Some(vec![1])])]);
+
+    // A new model also exercises schema preparation after the pool replacement.
+    let (mut second, _) = entity!(2);
+    second.payload.state.memberships.insert(ModelId::EntityId(EntityId::from_bytes([102; 32])));
+    let mut transaction = engine.transaction();
+    transaction.set_state(&Clock::default(), &second).await?;
+    transaction.map_write(vec![MapWrite::Put { map, key: b"key".to_vec(), value: vec![2] }]).await?;
+    transaction.commit().await?.committed()?;
+    assert_eq!(engine.get_state(second.payload.entity_id).await?.payload, second.payload);
+
+    let mut changes = engine.state_snapshot(StateScan::Changes(Some(&cursor))).await?;
+    assert_eq!(changes.next_page(NonZeroUsize::new(10).unwrap()).await?, [second.clone()]);
+    changes.finish().await?;
+    let all = Selection { predicate: Predicate::True, order_by: None, limit: Some(10) };
+    let mut selected = engine.state_snapshot(StateScan::Selection(&all)).await?;
+    let rows = selected.next_page(NonZeroUsize::new(10).unwrap()).await?;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&first) && rows.contains(&second));
+    assert_eq!(selected.get_states(&[first.payload.entity_id, second.payload.entity_id]).await?, [Some(first.clone()), Some(second)]);
+    selected.finish().await?;
+    assert_eq!(engine.map_snapshot(&[]).await?.map_read(vec![read.clone()]).await?, [MapRows::Got(vec![Some(vec![2])])]);
+
+    assert!(engine.delete_all().await?);
+    assert!(matches!(engine.get_state(first.payload.entity_id).await, Err(RetrievalError::EntityNotFound(_))));
+    assert!(engine.get_events(vec![event.payload.id()]).await?.is_empty());
+    assert!(engine.fetch_states(&all).await?.is_empty());
+    let mut empty = engine.state_snapshot(StateScan::Changes(None)).await?;
+    assert!(empty.next_page(NonZeroUsize::new(10).unwrap()).await?.is_empty());
+    empty.finish().await?;
+    assert_eq!(engine.map_snapshot(&[]).await?.map_read(vec![read]).await?, [MapRows::Got(vec![None])]);
+    put(&engine, &Clock::default(), &first).await?;
+    assert_eq!(engine.fetch_states(&membership).await?, [first]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn wal_pages_point_reads_and_refill_share_a_snapshot_while_writes_continue() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let pool = bb8::Pool::builder().max_size(1).build(SqliteConnectionManager::file(directory.path().join("snapshot.sqlite"))).await?;
