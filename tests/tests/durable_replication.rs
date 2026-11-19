@@ -3,7 +3,14 @@
 mod common;
 
 use ankql::ast::{Predicate, Resolved, Selection};
-use ankurah::core::{error::RetrievalError, storage::StorageTransaction};
+use ankurah::core::{
+    entity::Entity,
+    error::{RetrievalError, ValidationError},
+    node::{NodeInner, ReplicationState},
+    policy::{AccessDenied, DefaultContext, PolicyAgent},
+    storage::{StateScan, StorageTransaction},
+    util::Iterable,
+};
 use common::*;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -68,6 +75,16 @@ async fn create(node: &Durable, title: &str, artist: &str) -> anyhow::Result<(En
     let id = transaction.create(&Record { title: title.into(), artist: artist.into() }).await?.id();
     let event = transaction.commit_and_return_events().await?.into_iter().find(|event| event.entity_id == id).unwrap();
     Ok((id, event))
+}
+
+async fn create_many(node: &Durable, count: usize) -> anyhow::Result<Vec<EntityId>> {
+    let transaction = node.context_async(DEFAULT_CONTEXT).await?.begin();
+    let mut ids = Vec::new();
+    for index in 0..count {
+        ids.push(transaction.create(&Record { title: format!("record {index}"), artist: format!("{index:03}") }).await?.id());
+    }
+    transaction.commit().await?;
+    Ok(ids)
 }
 
 async fn edit(node: &Durable, id: EntityId, title: Option<&str>, artist: Option<&str>) -> anyhow::Result<proto::Event> {
@@ -320,5 +337,330 @@ async fn a_slow_replica_does_not_delay_local_durable_commits() -> anyhow::Result
     wait_for_head(&target, id, &proto::Clock::singleton(&updated)).await?;
     within(replication.wait_caught_up()).await?;
     assert_history(&target, id, &[genesis.id(), updated.id()].into_iter().collect()).await?;
+    Ok(())
+}
+
+async fn next_delivery(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> anyhow::Result<Vec<u8>> {
+    within(async { receiver.recv().await.ok_or_else(|| anyhow::anyhow!("repair recorder closed")) }).await
+}
+
+fn repair_delivery(message: &[u8]) -> anyhow::Result<(proto::ComparisonId, Vec<EntityId>)> {
+    let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::Comparison { comparison, deltas }, .. }) =
+        bincode::deserialize(message)?
+    else {
+        anyhow::bail!("expected comparison repair delivery")
+    };
+    Ok((comparison, deltas.into_iter().map(|delta| delta.entity_id).collect()))
+}
+
+#[tokio::test]
+async fn cancelled_bootstrap_rejects_late_deliveries_and_resumes_committed_progress_after_restart() -> anyhow::Result<()> {
+    let source = seed().await?;
+    let ids: HashSet<_> = create_many(&source, 100).await?.into_iter().collect();
+    let directory = tempfile::tempdir()?;
+    let storage = Arc::new(SledStorageEngine::with_path(directory.path().to_path_buf())?);
+    let target = replica_in(&source, storage.clone()).await?;
+    let selected = selection(&target, "true").await?;
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let data_ids = ids.clone();
+    let (connection, gate) = GatedConnection::new(&source, &target, move |message| {
+        if matches!(message, proto::NodeMessage::Update(proto::NodeUpdate {
+            body: proto::NodeUpdateBody::Comparison { deltas, .. }, ..
+        }) if deltas.iter().any(|delta| data_ids.contains(&delta.entity_id)))
+        {
+            sent.send(bincode::serialize(message).unwrap()).unwrap();
+            return true;
+        }
+        false
+    })
+    .await;
+    let replication = target.replicate_from(source.id, selected.clone(), DEFAULT_CONTEXT)?;
+    let first = next_delivery(&mut received).await?;
+    let completed: HashSet<_> = repair_delivery(&first)?.1.into_iter().collect();
+    assert!(!completed.is_empty() && completed.len() < ids.len());
+    assert!(matches!(replication.state().peek(), ReplicationState::Comparing));
+    gate.release_first(&target, 1).await;
+    let late = next_delivery(&mut received).await?;
+    let (comparison, outstanding) = repair_delivery(&late)?;
+    assert!(matches!(replication.state().peek(), ReplicationState::Comparing), "partial progress does not establish coverage");
+    for id in &completed {
+        assert_history(&target, *id, &event_ids(&source, *id).await?).await?;
+    }
+    for id in &outstanding {
+        assert_absent(&target, *id).await?;
+    }
+    drop(replication);
+    // The release is sent after dropping the receiver's admission. Observing
+    // Expired at the source establishes cancellation without a scheduler sleep.
+    within(async {
+        loop {
+            let reply = target
+                .request(
+                    source.id,
+                    &DEFAULT_CONTEXT,
+                    proto::NodeRequestBody::Compare {
+                        comparison,
+                        selection: selected.clone(),
+                        request: proto::ComparisonRequest::Pages { spans: vec![ankurah_digest_tree::Span::all()] },
+                    },
+                )
+                .await?;
+            if matches!(reply, proto::NodeResponseBody::Compared(Err(proto::ComparisonFailure::Expired))) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let before_replay = storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?;
+    target.handle_message(bincode::deserialize(&first)?).await?;
+    gate.release_held(&target).await;
+    assert_eq!(storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?, before_replay);
+    for id in &outstanding {
+        assert_absent(&target, *id).await?;
+    }
+    drop(connection);
+    drop(target);
+    within(async {
+        while Arc::strong_count(&storage) != 1 {
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?;
+    drop(storage);
+
+    let changed = *completed.iter().min().unwrap();
+    edit(&source, changed, Some("changed during restart"), None).await?;
+    let target = Node::new_durable(Arc::new(SledStorageEngine::with_path(directory.path().to_path_buf())?), PermissiveAgent::new());
+    within(target.wait_ready()).await?;
+    assert_eq!(target.storage.fetch_states(&selected).await?.len(), completed.len());
+    let repaired = Arc::new(Mutex::new(Vec::new()));
+    let recorded = repaired.clone();
+    let data_ids = ids.clone();
+    let (_connection, _gate) = GatedConnection::new(&source, &target, move |message| {
+        if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::Comparison { deltas, .. }, .. }) = message {
+            recorded.lock().unwrap().extend(deltas.iter().map(|delta| delta.entity_id).filter(|id| data_ids.contains(id)));
+        }
+        false
+    })
+    .await;
+    let replication = target.replicate_from(source.id, selected, DEFAULT_CONTEXT)?;
+    assert_eq!(within(replication.wait_caught_up()).await?.digest.count() as usize, ids.len());
+    let expected: HashSet<_> = ids.difference(&completed).copied().chain([changed]).collect();
+    let received = repaired.lock().unwrap().clone();
+    assert_eq!(received.len(), expected.len());
+    assert_eq!(received.into_iter().collect::<HashSet<_>>(), expected, "completed unchanged members are not transferred again");
+    for id in ids {
+        assert_eq!(target.storage.get_state(id).await?.payload.state.head, source.storage.get_state(id).await?.payload.state.head);
+        assert_history(&target, id, &event_ids(&source, id).await?).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn limited_replication_refills_order_gaps_without_discarding_departed_history() -> anyhow::Result<()> {
+    let source = seed().await?;
+    let target = replica(&source).await?;
+    let (first, _) = create(&source, "included", "00").await?;
+    let (second, _) = create(&source, "included", "10").await?;
+    let (third, _) = create(&source, "included", "20").await?;
+    let selected = selection(&target, "title = 'included' ORDER BY artist ASC LIMIT 2").await?;
+    let _connection = LocalProcessConnection::new(&source, &target).await?;
+    let replication = target.replicate_from(source.id, selected.clone(), DEFAULT_CONTEXT)?;
+    assert_eq!(within(replication.wait_caught_up()).await?.digest.count(), 2);
+    assert_absent(&target, third).await?;
+
+    edit(&source, first, None, Some("30")).await?;
+    replication.retry();
+    assert_eq!(within(replication.wait_caught_up()).await?.digest.count(), 2);
+    assert_eq!(
+        target.storage.fetch_states(&selected).await?.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(),
+        vec![second, third]
+    );
+    edit(&source, second, Some("excluded"), None).await?;
+    replication.retry();
+    assert_eq!(within(replication.wait_caught_up()).await?.digest.count(), 2);
+    assert_eq!(
+        target.storage.fetch_states(&selected).await?.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(),
+        vec![third, first]
+    );
+    let (entered, _) = create(&source, "included", "05").await?;
+    replication.retry();
+    assert_eq!(within(replication.wait_caught_up()).await?.digest.count(), 2);
+    assert_eq!(
+        target.storage.fetch_states(&selected).await?.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(),
+        vec![entered, third]
+    );
+    for id in [first, second, third, entered] {
+        assert_history(&target, id, &event_ids(&source, id).await?).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_causally_newer_local_prefix_does_not_starve_a_missing_source_suffix() -> anyhow::Result<()> {
+    let source = seed().await?;
+    let ids = create_many(&source, 100).await?;
+    let target = replica(&source).await?;
+    let connection = LocalProcessConnection::new(&source, &target).await?;
+    let initial = target.replicate_from(source.id, selection(&target, "true ORDER BY artist ASC LIMIT 80").await?, DEFAULT_CONTEXT)?;
+    assert_eq!(within(initial.wait_caught_up()).await?.digest.count(), 80);
+    drop(initial);
+    drop(connection);
+    let mut expected_histories = BTreeMap::new();
+    for id in &ids[..80] {
+        let local = edit(&target, *id, Some("locally advanced"), None).await?;
+        let mut expected = event_ids(&source, *id).await?;
+        expected.insert(local.id());
+        expected_histories.insert(*id, expected);
+    }
+    for id in &ids[80..] {
+        assert_absent(&target, *id).await?;
+    }
+
+    let repaired = Arc::new(Mutex::new(Vec::new()));
+    let recorded = repaired.clone();
+    let data_ids: HashSet<_> = ids.iter().copied().collect();
+    let (_connection, _gate) = GatedConnection::new(&source, &target, move |message| {
+        if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::Comparison { deltas, .. }, .. }) = message {
+            recorded.lock().unwrap().extend(deltas.iter().map(|delta| delta.entity_id).filter(|id| data_ids.contains(id)));
+        }
+        false
+    })
+    .await;
+    let replication = target.replicate_from(source.id, selection(&target, "true ORDER BY artist ASC").await?, DEFAULT_CONTEXT)?;
+    assert_eq!(within(replication.wait_caught_up()).await?.digest.count(), 100);
+    let repaired = repaired.lock().unwrap().clone();
+    assert_eq!(repaired.len(), 20, "covered local descendants need no history repair");
+    assert_eq!(repaired.into_iter().collect::<HashSet<_>>(), ids[80..].iter().copied().collect());
+    for (index, id) in ids.iter().enumerate() {
+        let record = target.context_async(DEFAULT_CONTEXT).await?.get::<RecordView>(*id).await?;
+        assert_eq!(record.title()?, if index < 80 { "locally advanced".to_owned() } else { format!("record {index}") });
+        let expected = match expected_histories.get(id) {
+            Some(events) => events.clone(),
+            None => event_ids(&source, *id).await?,
+        };
+        assert_history(&target, *id, &expected).await?;
+    }
+    Ok(())
+}
+
+/// States are readable, but one required ancestor may not leave the source.
+#[derive(Clone)]
+struct HiddenAncestor {
+    denied: proto::EventId,
+    repairs: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PolicyAgent for HiddenAncestor {
+    type ContextData = &'static DefaultContext;
+
+    fn sign_request<SE: StorageEngine, C: Iterable<Self::ContextData>>(
+        &self,
+        _: &NodeInner<SE, Self>,
+        credentials: &C,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, AccessDenied> {
+        Ok(credentials.iterable().map(|_| proto::AuthData(vec![])).collect())
+    }
+
+    async fn check_request<SE: StorageEngine, A: Iterable<proto::AuthData> + Send + Sync>(
+        &self,
+        _: &Node<SE, Self>,
+        auth: &A,
+        request: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, ValidationError> {
+        if matches!(request.body, proto::NodeRequestBody::Compare { request: proto::ComparisonRequest::Repair { .. }, .. }) {
+            self.repairs.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
+    }
+
+    fn check_write_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &Self::ContextData,
+        _: &Entity,
+        _: &Entity,
+        _: &proto::Event,
+    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+        Ok(None)
+    }
+
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &proto::Attested<proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<proto::Attestation> { None }
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &proto::Attested<proto::EntityState>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn query_predicate<C: Iterable<Self::ContextData>>(&self, _: &C) -> Result<Predicate<Resolved>, AccessDenied> { Ok(Predicate::True) }
+
+    fn state_reads_follow_predicate<C: Iterable<Self::ContextData>>(&self, _: &C) -> bool { true }
+
+    fn check_read_event<C: Iterable<Self::ContextData>>(&self, _: &C, event: &proto::Attested<proto::Event>) -> Result<(), AccessDenied> {
+        if event.payload.id() == self.denied {
+            Err(AccessDenied::ByPolicy("ancestor is not readable"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_denied_required_ancestor_stops_replication_without_persisting_partial_history() -> anyhow::Result<()> {
+    let original = seed().await?;
+    let target = replica(&original).await?;
+    let (id, genesis) = create(&original, "readable state", "source").await?;
+    edit(&original, id, Some("later readable state"), None).await?;
+    let storage = original.storage.clone();
+    drop(original);
+    within(async {
+        while Arc::strong_count(&storage) != 1 {
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?;
+    let repairs = Arc::new(AtomicUsize::new(0));
+    let source = Node::new_durable(storage, HiddenAncestor { denied: genesis.id(), repairs: repairs.clone() });
+    within(source.wait_ready()).await?;
+    let _connection = LocalProcessConnection::new(&source, &target).await?;
+    let replication = target.replicate_from(source.id, selection(&target, "true").await?, DEFAULT_CONTEXT)?;
+    let refusal = tokio::time::timeout(Duration::from_secs(5), replication.wait_caught_up()).await?.unwrap_err();
+    assert!(matches!(refusal, RetrievalError::StorageError(error)
+        if error.downcast_ref::<proto::ComparisonFailure>() == Some(&proto::ComparisonFailure::MemberUnavailable)));
+    assert!(matches!(replication.state().peek(), ReplicationState::Failed(_)));
+    assert_eq!(repairs.load(Ordering::SeqCst), 3, "one bounded reconciliation attempt owns all retries");
+    assert_absent(&target, id).await?;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(repairs.load(Ordering::SeqCst), 3, "a permanent refusal must not start a fresh polling budget");
+    assert_absent(&target, id).await?;
     Ok(())
 }

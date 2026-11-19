@@ -121,5 +121,23 @@ async fn a_retained_interest_does_not_keep_an_unprovisioned_node_alive() -> anyh
     drop(node);
     assert!(matches!(tokio::time::timeout(Duration::from_secs(1), handle.wait_caught_up()).await?, Err(RetrievalError::NodeDropped(_))));
     assert!(weak.upgrade().is_none());
+    handle.retry();
+    assert!(matches!(tokio::time::timeout(Duration::from_secs(1), handle.wait_caught_up()).await?, Err(RetrievalError::NodeDropped(_))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_required_history_stops_after_bounded_capture_retries() -> anyhow::Result<()> {
+    let (node, peer, mut messages) = fixture().await?;
+    let handle = node.replicate_from(peer, ankql::ast::Predicate::True.into(), DEFAULT_CONTEXT)?;
+    for _ in 0..3 {
+        let next = request(receive(&mut messages).await?);
+        answer(&node, peer, next, proto::NodeResponseBody::Compared(Err(ComparisonFailure::MemberUnavailable))).await?;
+        assert!(matches!(receive(&mut messages).await?, proto::NodeMessage::ReleaseComparison { .. }));
+    }
+    assert!(matches!(handle.wait_caught_up().await, Err(RetrievalError::StorageError(error))
+        if error.downcast_ref::<ComparisonFailure>() == Some(&ComparisonFailure::MemberUnavailable)));
+    assert!(tokio::time::timeout(Duration::from_millis(1100), messages.recv()).await.is_err());
+    assert!(node.peer_connections.get(&peer).unwrap().pending_requests.is_empty());
     Ok(())
 }

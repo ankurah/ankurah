@@ -65,9 +65,18 @@ impl Replication {
     }
 
     /// Cancel an in-flight sweep and compare again using current credentials.
+    /// A dropped or halted Node cannot be retried through an existing handle.
     pub fn retry(&self) {
-        self.0.state.set(ReplicationState::Connecting);
-        self.0.wake.notify_one();
+        let retry = self.0.state.update(|state| match state {
+            ReplicationState::Failed(RetrievalError::NodeDropped(_) | RetrievalError::NodeHalted(_)) => false,
+            _ => {
+                *state = ReplicationState::Connecting;
+                true
+            }
+        });
+        if retry {
+            self.0.wake.notify_one();
+        }
     }
 }
 

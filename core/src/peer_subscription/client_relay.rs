@@ -762,6 +762,7 @@ mod tests {
             (RetrievalError::storage(proto::ComparisonFailure::Expired), true),
             (RetrievalError::storage(proto::ComparisonFailure::AuthorizationChanged), false),
             (RetrievalError::storage(proto::ComparisonFailure::LimitExceeded), false),
+            (RetrievalError::storage(proto::ComparisonFailure::MemberUnavailable), false),
         ] {
             let (relay, sender, peer) = connected_relay();
             sender.set_fail_next(error);

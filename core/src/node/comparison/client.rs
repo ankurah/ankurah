@@ -401,7 +401,7 @@ async fn repair<E: Exchange>(
             return Err(invalid("repair returned an unrequested or repeated unavailable identity"));
         }
         if claims[&id].expected.is_some() {
-            return Err(failure(ComparisonFailure::Restart));
+            return Err(failure(ComparisonFailure::MemberUnavailable));
         }
         // A missing known identity does not authorize deleting local history.
     }

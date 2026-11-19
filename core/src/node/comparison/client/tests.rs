@@ -197,12 +197,15 @@ async fn coverage_requires_events_when_state_delivery_does_not_suffice() {
 }
 
 #[tokio::test]
-async fn unavailable_target_restarts_and_malformed_pages_never_repair() {
+async fn unavailable_required_member_is_distinct_from_expiry_and_malformed_pages_never_repair() {
     let ours = tree(&[]).await;
     let added = item(1, 1, 1);
     let mut remote = Mock::new(&[], &[added.clone()]).await;
     remote.unavailable.insert(added.id);
-    assert_failure(compare(&ours, target(&remote.tree, false).await, &remote, &budget()).await.unwrap_err(), ComparisonFailure::Restart);
+    assert_failure(
+        compare(&ours, target(&remote.tree, false).await, &remote, &budget()).await.unwrap_err(),
+        ComparisonFailure::MemberUnavailable,
+    );
     remote.calls.lock().unwrap().repairs.clear();
     remote.malformed = true;
     let error = compare(&ours, target(&remote.tree, false).await, &remote, &budget()).await.unwrap_err();

@@ -161,7 +161,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     if attempt < 2
                         && matches!(
                             error.downcast_ref::<ComparisonFailure>(),
-                            Some(ComparisonFailure::Expired | ComparisonFailure::Restart)
+                            Some(ComparisonFailure::Expired | ComparisonFailure::Restart | ComparisonFailure::MemberUnavailable)
                         ) =>
                 {
                     budget

@@ -74,4 +74,6 @@ pub enum ComparisonFailure {
     KeySpecMismatch,
     #[error("invalid comparison request: {0}")]
     InvalidRequest(String),
+    #[error("a captured member or its required history is unavailable")]
+    MemberUnavailable,
 }
