@@ -174,6 +174,11 @@ where
 
     match rebuilding {
         Ok(created) => {
+            if previous.is_some() {
+                // Rebuilding replaces a recovery boundary, even if its rows fit
+                // the ordinary history budget. Existing captures must restart.
+                trx.map_write(vec![MapWrite::Clear { map: incarnation.history() }]).await?;
+            }
             if only_invalid {
                 let found = trx.map_read(vec![entry::read([&id])]).await?;
                 let entry = entry::found_one(&id, found)?.ok_or_else(|| Error::NoSuchTree(id.clone()))?;
@@ -274,6 +279,7 @@ pub async fn drop(trx: &mut dyn StorageTransaction, id: &TreeId) -> Result<(), M
         Ok(Some(entry)) => {
             writes.push(MapWrite::Clear { map: entry.incarnation.rows() });
             writes.push(MapWrite::Clear { map: entry.incarnation.log() });
+            writes.push(MapWrite::Clear { map: entry.incarnation.history() });
             writes.push(MapWrite::Clear { map: entry.incarnation.members() });
         }
 

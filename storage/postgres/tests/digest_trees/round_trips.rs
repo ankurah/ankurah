@@ -30,18 +30,18 @@ macro_rules! several_levels {
 /// The statements of a storage transaction's first request when it applies
 /// changes to `$trees` trees whose trie nodes' rows are cached: the
 /// transaction's beginning, each tree's lock, the trees' entries, and each
-/// tree's leaves and change log.
+/// tree's leaves, change log and history metadata.
 macro_rules! locks_and_reads {
     ($trees:expr) => {
-        1 + $trees + 1 + 2 * $trees
+        1 + $trees + 1 + 3 * $trees
     };
 }
 
 /// The statements of the request that commits changes to `$trees` trees:
-/// each tree's rows and change log, the trees' entries, and the `COMMIT`.
+/// each tree's rows, change log and history, the trees' entries, and the `COMMIT`.
 macro_rules! writes_and_commit {
     ($trees:expr) => {
-        2 * $trees + 1 + 1
+        3 * $trees + 1 + 1
     };
 }
 

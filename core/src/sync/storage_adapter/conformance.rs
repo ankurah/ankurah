@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::storage::StorageEngine;
 
 pub(crate) mod cache_model;
+mod captures;
 mod changes;
 pub mod fixtures;
 mod lifecycle;
@@ -25,6 +26,7 @@ mod refusals;
 mod store_contract;
 
 pub use cache_model::*;
+pub use captures::*;
 pub use changes::*;
 pub use lifecycle::*;
 pub use reads::*;
@@ -78,6 +80,7 @@ macro_rules! __digest_trees_conformance_suite {
             a_damaged_row_fails_reads_and_marks_the_tree_invalid_at_its_next_commit,
             a_tree_whose_entry_is_damaged_refuses_its_changes_until_it_is_dropped,
             reads_commits_landings_and_evictions_in_any_order_never_serve_a_row_of_another_generation,
+            a_capture_survives_flushes_and_other_managers_commits,
         );
 
         $crate::sync::conformance::__every_store_conformance_case!(

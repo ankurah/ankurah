@@ -24,7 +24,9 @@ mod write;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use audit::Audit;
-pub use read::{ComparisonError, Difference, DigestTreeView, IntoScanRange, Leaf, MemberStream, Page, PageGetter, PageMisfit, ScanRange};
+pub use read::{
+    Comparison, ComparisonError, Difference, DigestTreeView, IntoScanRange, Leaf, MemberStream, Page, PageGetter, PageMisfit, ScanRange,
+};
 pub use write::{Applied, Created, Prepared, Transaction};
 
 use rows::TreeRows;

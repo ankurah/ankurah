@@ -57,16 +57,26 @@ fn log_reads<G: DigestGroup>(reads: &[MapRead], tree: &Tree<G>) -> usize {
 }
 
 /// A commit to a tree whose node rows the cache keeps, as a creation's
-/// landing leaves them, reads no node row through storage, and neither does
-/// a read of the tree's digests after it lands.
+/// landing leaves them, reads no existing node row through storage. A split
+/// probes its new keys to journal their absence. Digest reads need no probes.
 async fn a_tree_whose_node_rows_are_cached_reads_none_through_storage<G: DigestGroup>() -> anyhow::Result<()> {
     let engine = Arc::new(TestStorage::default());
     let trees = stores(&engine);
     let tree: Tree<G> = created(&trees, &engine, "tree", several_levels!()).await?;
+    let before = rows_now(&engine, &tree).await?;
 
     engine.record_map_reads();
     commit(&trees, &engine, &tree, |changes| changes.insert(item!(1000, 150))).await?;
-    assert_eq!(node_row_reads(&engine.recorded_map_reads(), &tree), 0, "the commit");
+    let mut existing = engine.recorded_map_reads();
+    assert!(node_row_reads(&existing, &tree) <= 1, "new node keys are probed together");
+    for read in &mut existing {
+        if let MapRead::Get { map, keys } = read {
+            if map == &tree.store().inner().rows {
+                keys.retain(|key| before.contains_key(key));
+            }
+        }
+    }
+    assert_eq!(node_row_reads(&existing, &tree), 0, "existing nodes come from the cache");
 
     engine.record_map_reads();
     tree.view().span_digest(Span::all()).await?;

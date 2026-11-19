@@ -55,6 +55,8 @@ pub(super) struct Inner<SE> {
     log: MapId,
     buffered: std::sync::Mutex<Option<Arc<Buffered>>>,
     publication: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
+    /// Read an immutable buffered version through retained before-images.
+    captured: bool,
 }
 
 /// A tree write's generation and cached row changes, published after the
@@ -85,6 +87,7 @@ impl<SE: StorageEngine> Inner<SE> {
             incarnation,
             buffered: std::sync::Mutex::new(None),
             publication: std::sync::Mutex::new(None),
+            captured: false,
         }
     }
 
@@ -199,7 +202,7 @@ where
 
     /// A transaction on the same incarnation of the same tree, in the same
     /// engine, whichever handle it came from.
-    fn owns(&self, trx: &StorageEngineTrx<'_, SE, K, L, G>) -> bool { self.same_tree(trx.store()) }
+    fn owns(&self, trx: &StorageEngineTrx<'_, SE, K, L, G>) -> bool { !self.inner.captured && self.same_tree(trx.store()) }
 
     fn landed(&self, landing: TreeLanding) {
         if !landing.buffered.is_empty() {

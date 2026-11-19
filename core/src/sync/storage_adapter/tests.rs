@@ -14,6 +14,7 @@ use crate::test_utils::TestStorage;
 mod buffered;
 mod cache;
 mod cancellation;
+mod captures;
 mod damage;
 mod failures;
 mod key_migration;

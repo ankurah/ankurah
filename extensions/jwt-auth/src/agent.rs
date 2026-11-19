@@ -331,6 +331,12 @@ impl PolicyAgent for JwtAgent {
         self.read_predicate(data, ReadOperation::Retrieve)
     }
 
+    fn state_reads_follow_predicate<C>(&self, _data: &C) -> bool
+    where C: Iterable<Self::ContextData> {
+        // JWT read restrictions are expressed entirely by the read predicates.
+        true
+    }
+
     fn check_write(&self, cdata: &Self::ContextData, entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
         if cdata.is_privileged() {
             return Ok(());

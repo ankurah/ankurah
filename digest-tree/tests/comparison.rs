@@ -6,6 +6,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::num::NonZeroUsize;
 use std::ops::{Bound, RangeInclusive};
 
 use ankurah_core_types::key_spec::KeySpec;
@@ -361,6 +362,23 @@ fn misfit<T: Debug, E: Debug>(compared: Result<T, ComparisonError<E>>) -> PageMi
     }
 }
 
+/// Both public comparison modes reject the same malformed pages. The
+/// incremental one also remains ended after its error.
+async fn incremental_misfit<P: PageGetter<Id, Title, Ristretto255>>(view: View, getter: P) -> PageMisfit
+where P::Error: Debug {
+    let mut comparison = view.compare(getter, NonZeroUsize::new(8).unwrap());
+    loop {
+        match comparison.next_batch().await {
+            Ok(Some(_)) => {}
+            result => {
+                let misfit = misfit(result);
+                assert!(comparison.next_batch().await.unwrap().is_none());
+                return misfit;
+            }
+        }
+    }
+}
+
 /// An answer that names another number of pages than spans asked is
 /// refused: the comparison could pair no page with its span.
 #[tokio::test]
@@ -381,6 +399,7 @@ async fn an_answer_of_another_number_of_pages_is_refused() {
     let (ours, theirs) = trees_differing_in_one_album().await;
 
     assert_eq!(misfit(ours.view().differences(OneShort(theirs.view())).await), PageMisfit::WrongNumberOfPages);
+    assert_eq!(incremental_misfit(ours.view(), OneShort(theirs.view())).await, PageMisfit::WrongNumberOfPages);
 }
 
 /// A getter that answers its root's page whatever span it is asked: once
@@ -402,10 +421,12 @@ async fn a_page_outside_the_span_asked_is_refused() {
 
     let (ours, theirs) = trees_differing_in_one_album().await;
     assert_eq!(misfit(ours.view().differences(RootsPage(theirs.view())).await), PageMisfit::SubspanOutside, "digests");
+    assert_eq!(incremental_misfit(ours.view(), RootsPage(theirs.view())).await, PageMisfit::SubspanOutside);
 
     let small: Tree = tree_of!(keyspec(), albums(1..=10));
     let window = ours.select(..=1705).unwrap();
     assert_eq!(misfit(window.differences(RootsPage(small.view())).await), PageMisfit::MemberOutside, "members");
+    assert_eq!(incremental_misfit(window, RootsPage(small.view())).await, PageMisfit::MemberOutside);
 }
 
 /// A subdivision with a subspan as wide as the span asked, or with an empty
@@ -444,11 +465,13 @@ async fn a_subdivision_that_doesnt_narrow_the_span_asked_is_refused() {
     let (ours, theirs) = trees_differing_in_one_album().await;
 
     assert_eq!(misfit(ours.view().differences(Itself).await), PageMisfit::SubspanNotNarrower, "the span itself");
+    assert_eq!(incremental_misfit(ours.view(), Itself).await, PageMisfit::SubspanNotNarrower);
     assert_eq!(
         misfit(ours.view().differences(WithAnEmptySubspan(theirs.view())).await),
         PageMisfit::SubspanNotNarrower,
         "an empty subspan"
     );
+    assert_eq!(incremental_misfit(ours.view(), WithAnEmptySubspan(theirs.view())).await, PageMisfit::SubspanNotNarrower);
 }
 
 /// A subdivision that leaves part of its span uncovered would hide the
@@ -475,6 +498,7 @@ async fn a_subdivision_that_doesnt_cover_its_span_is_refused() {
     let (ours, theirs) = trees_differing_in_one_album().await;
 
     assert_eq!(misfit(ours.view().differences(Dropping(theirs.view())).await), PageMisfit::SubspansLeaveGap);
+    assert_eq!(incremental_misfit(ours.view(), Dropping(theirs.view())).await, PageMisfit::SubspansLeaveGap);
 }
 
 /// A page whose digests or members come out of address order is refused, and
@@ -524,7 +548,10 @@ async fn a_page_out_of_address_order_is_refused() {
     let (ours, theirs) = trees_differing_in_one_album().await;
     assert_eq!(misfit(ours.view().differences(Backwards(theirs.view())).await), PageMisfit::SubspansOutOfOrder, "digests");
     assert_eq!(misfit(ours.view().differences(Overlapping(theirs.view())).await), PageMisfit::SubspansOutOfOrder, "overlapping");
+    assert_eq!(incremental_misfit(ours.view(), Backwards(theirs.view())).await, PageMisfit::SubspansOutOfOrder);
+    assert_eq!(incremental_misfit(ours.view(), Overlapping(theirs.view())).await, PageMisfit::SubspansOutOfOrder);
 
     let small: Tree = tree_of!(keyspec(), albums(1..=10));
     assert_eq!(misfit(ours.view().differences(Backwards(small.view())).await), PageMisfit::MembersOutOfOrder, "members");
+    assert_eq!(incremental_misfit(ours.view(), Backwards(small.view())).await, PageMisfit::MembersOutOfOrder);
 }

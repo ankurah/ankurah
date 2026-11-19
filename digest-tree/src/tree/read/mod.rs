@@ -6,7 +6,7 @@ mod comparison;
 mod member_stream;
 mod view;
 
-pub use comparison::{ComparisonError, Difference, Page, PageGetter, PageMisfit};
+pub use comparison::{Comparison, ComparisonError, Difference, Page, PageGetter, PageMisfit};
 pub use member_stream::{IntoScanRange, MemberStream, ScanRange};
 pub use view::{DigestTreeView, Leaf};
 

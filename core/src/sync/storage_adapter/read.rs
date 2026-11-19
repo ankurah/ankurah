@@ -24,11 +24,13 @@ pub struct StorageEngineSnapshot<SE: StorageEngine, K, L, G> {
     generation: u64,
     pub(super) buffered: Option<Arc<super::Buffered>>,
     pub(super) writes: crate::storage::pending_writes::PendingWrites,
+    /// Before-images restoring a captured durable base beneath its own writes.
+    pub(super) history: crate::storage::pending_writes::PendingWrites,
 }
 
 impl<SE: StorageEngine, K, L, G> StorageEngineSnapshot<SE, K, L, G> {
     pub(super) fn new(store: EngineAdapter<SE, K, L, G>, snapshot: SE::Snapshot, generation: u64) -> Self {
-        Self { store, snapshot, generation, buffered: None, writes: Default::default() }
+        Self { store, snapshot, generation, buffered: None, writes: Default::default(), history: Default::default() }
     }
 
     pub(super) async fn map_read(&mut self, reads: Vec<MapRead>) -> Result<Vec<crate::storage::MapRows>, StoreError> {
@@ -36,9 +38,10 @@ impl<SE: StorageEngine, K, L, G> StorageEngineSnapshot<SE, K, L, G> {
         let stored = match &self.buffered {
             Some(buffered) => {
                 let (reads, overlay) = buffered.writes.read(reads);
+                let (reads, history) = self.history.read(reads);
                 let stored =
                     if reads.is_empty() { Vec::new() } else { self.snapshot.map_read(reads).await.map_err(snapshot_store_failure)? };
-                overlay.answer(stored)
+                overlay.answer(history.answer(stored))
             }
             None => self.snapshot.map_read(reads).await.map_err(snapshot_store_failure)?,
         };
@@ -72,6 +75,7 @@ where
         if let Some(buffered) = &self.buffered {
             read.fill_from_pending(&tree.id, &buffered.writes)?;
         }
+        read.fill_from_pending(&tree.id, &self.history)?;
         read.fill_from_cache(tree, self.generation);
 
         if let Some(unread) = read.unread() {

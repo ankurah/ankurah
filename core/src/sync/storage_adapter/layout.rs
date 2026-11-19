@@ -3,5 +3,6 @@
 //! lock, the tree's entry in the trees map, and its change log.
 
 pub(in crate::sync::storage_adapter) mod entry;
+pub(in crate::sync::storage_adapter) mod history;
 pub(in crate::sync::storage_adapter) mod log;
 pub(in crate::sync::storage_adapter) mod names;

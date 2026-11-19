@@ -19,6 +19,7 @@ mod lifetime;
 mod limited;
 mod maintenance;
 mod opening;
+mod preparation;
 
 fn model() -> ModelId { ModelId::EntityId(EntityId::from_bytes([80; 32])) }
 fn score() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([90; 32])) }

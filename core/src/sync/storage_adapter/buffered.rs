@@ -10,7 +10,7 @@ use ankurah_digest_tree::{DigestGroup, Encode, Row, RowKey, Store, StoreError, W
 
 use super::layout::{
     entry::{self, TreeEntry},
-    log,
+    history, log,
     names::trees_map,
 };
 use super::{EngineAdapter, Inner, StorageEngineSnapshot, StorageEngineTrx, TreeLanding};
@@ -79,8 +79,20 @@ where
     /// A private working copy. It reads the same durable base but publishes no
     /// partial scan to callers, and is not subject to the owner's dirty flag.
     pub(in crate::sync) fn working(&self) -> Self {
-        let inner = Inner::new(self.inner.storage.clone(), self.inner.cache.clone(), self.inner.id.clone(), self.inner.incarnation);
+        let mut inner = Inner::new(self.inner.storage.clone(), self.inner.cache.clone(), self.inner.id.clone(), self.inner.incarnation);
         *inner.buffered.lock().unwrap() = Some(self.buffered());
+        inner.captured = self.inner.captured;
+        Self::new(inner)
+    }
+
+    /// Freeze the current managed version without retaining a storage snapshot.
+    /// Later reads reconstruct its durable base from bounded before-images, or
+    /// fail with a retryable conflict when that history no longer covers it.
+    /// The returned adapter is read-only; it cannot flush its private overlay.
+    pub(in crate::sync) fn capture(&self) -> Self {
+        let mut inner = Inner::new(self.inner.storage.clone(), self.inner.cache.clone(), self.inner.id.clone(), self.inner.incarnation);
+        *inner.buffered.lock().unwrap() = Some(self.buffered());
+        inner.captured = true;
         Self::new(inner)
     }
 
@@ -113,18 +125,31 @@ where
         let mut snapshot = self.inner.storage.map_snapshot(&[self.inner.lock.clone()]).await.map_err(snapshot_store_failure)?;
         let mut reads = vec![entry::read([&self.inner.id])];
         reads.extend(cached.map(|from| log::read_after(buffered.base.incarnation.log(), from)));
+        if self.inner.captured {
+            reads.push(history::read_after(buffered.base.incarnation.history(), buffered.base.generation));
+        }
         let mut answers = snapshot.map_read(reads).await.map_err(snapshot_store_failure)?.into_iter();
         let found = entry::found(&[&self.inner.id], answers.next())
             .map_err(StoreError::permanent)?
             .pop()
             .expect("one entry was requested")
             .map_err(StoreError::permanent)?;
-        if found != Some(buffered.base) {
+        let found = found.ok_or_else(|| snapshot_store_failure(MutationError::WriteConflict.into()))?;
+        if found != buffered.base
+            && (!self.inner.captured || found.incarnation != buffered.base.incarnation || found.status != buffered.base.status)
+        {
             return Err(snapshot_store_failure(MutationError::WriteConflict.into()));
         }
-        if let Some(from) = cached.filter(|from| *from != buffered.base.generation) {
-            let to = buffered.base.generation;
-            let changed = match answers.next() {
+        let cached_changes = cached.and_then(|_| answers.next());
+        let reverse = if self.inner.captured {
+            let Some(MapRows::Ranged(entries)) = answers.next() else { return Err(StoreError::permanent(Error::AnswerMisfit)) };
+            history::rewind(rows.clone(), buffered.base.generation, found.generation, entries).map_err(snapshot_store_failure)?
+        } else {
+            PendingWrites::default()
+        };
+        if let Some(from) = cached.filter(|from| *from != found.generation) {
+            let to = found.generation;
+            let changed = match cached_changes {
                 Some(MapRows::Ranged(entries)) if from < to => log::changes(&self.inner.id, from, to, entries),
                 Some(MapRows::Ranged(_)) => None,
                 _ => return Err(StoreError::permanent(Error::AnswerMisfit)),
@@ -134,18 +159,25 @@ where
                 None => self.inner.cache.forget(&rows, from),
             }
         }
-        let mut read = StorageEngineSnapshot::new(self.clone(), snapshot, buffered.base.generation);
+        let mut read = StorageEngineSnapshot::new(self.clone(), snapshot, found.generation);
         read.buffered = Some(buffered);
+        read.history = reverse;
         Ok(read)
     }
 
     pub(in crate::sync) async fn buffered_transaction(&self) -> Result<StorageEngineTrx<'_, SE, K, L, G>, StoreError> {
+        if self.inner.captured {
+            return Err(StoreError::permanent("a captured tree is read-only"));
+        }
         let read = self.begin_read().await?;
         Ok(StorageEngineTrx::buffered(self.clone(), read))
     }
 
     /// The owner's member lookup shares the tree's buffered and durable version.
     pub(in crate::sync) async fn member_rows(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, RetrievalError> {
+        if self.inner.captured {
+            return Err(RetrievalError::InvalidState("a capture has no maintenance member lookup".into()));
+        }
         let mut snapshot = self.begin_read().await.map_err(|error| open_failure(error.into()))?;
         let read = MapRead::Get { map: snapshot.buffered.as_ref().expect("managed read").members(), keys: keys.to_vec() };
         let answers = snapshot.map_read(vec![read]).await.map_err(|error| open_failure(error.into()))?;
@@ -175,9 +207,18 @@ where
     /// Persist precisely this buffered version. The named lock protects the
     /// comparison and write together; a newer durable base requires reconciliation.
     pub(in crate::sync) async fn flush(&self) -> Result<(), RetrievalError> {
+        if self.inner.captured {
+            return Err(RetrievalError::InvalidState("a captured tree cannot be flushed".into()));
+        }
         let version = self.buffered();
         let mut trx = self.inner.storage.transaction();
-        let found = trx.map_lock_and_read(&[self.inner.lock.clone()], vec![entry::read([&self.inner.id])]).await?;
+        let mut found = trx
+            .map_lock_and_read(
+                &[self.inner.lock.clone()],
+                vec![entry::read([&self.inner.id]), history::metadata_read(version.base.incarnation)],
+            )
+            .await?;
+        let metadata = history::metadata_found(found.pop())?;
         if entry::found_one(&self.inner.id, found)? != Some(version.base) {
             return Err(MutationError::WriteConflict.into());
         }
@@ -196,12 +237,16 @@ where
         let mut changed = Vec::new();
         let rows = version.base.incarnation.rows();
         let mut cleared = false;
+        let mut history_keys = Vec::new();
         for (map, changes) in pending.take() {
             if changes.cleared {
                 writes.push(MapWrite::Clear { map: map.clone() });
                 cleared |= map == rows;
             }
             for (key, value) in changes.keys {
+                if map == rows {
+                    history_keys.push(key.clone());
+                }
                 if map == rows && super::cache::admits(&RowKey::decode(&key).map_err(|error| open_failure(error.into()))?) {
                     changed.push((key.clone(), value.clone()));
                 }
@@ -223,6 +268,8 @@ where
         if let Some(unreached) = generation.checked_sub(log::LENGTH) {
             writes.push(MapWrite::Delete { map: version.base.incarnation.log(), key: log::key(unreached) });
         }
+        let known = history::cached::<K, L, G>(&self.inner.cache, version.base.incarnation, Some(version.base.generation), &history_keys);
+        writes.extend(history::record(&mut trx, version.base.incarnation, generation, history_keys, known, Some(metadata), cleared).await?);
         trx.map_write(writes).await?;
         trx.commit().await?.committed()?;
         if cleared {

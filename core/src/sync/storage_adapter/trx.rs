@@ -12,6 +12,7 @@ use crate::storage::{MapRead, MapWrite, ScanDirection, StorageEngine, StorageTra
 use crate::sync::error::transaction_store_failure;
 use crate::sync::storage_adapter::cache::admits;
 use crate::sync::storage_adapter::layout::entry::{Status, TreeEntry};
+use crate::sync::storage_adapter::layout::history;
 use crate::sync::storage_adapter::layout::log::{self, Changed};
 use crate::sync::storage_adapter::layout::names::trees_map;
 use crate::sync::{Error, TreePart};
@@ -37,6 +38,8 @@ pub struct StorageEngineTrx<'a, SE: StorageEngine, K, L, G> {
     /// answered again without another request while the transaction hasn't
     /// written the tree's rows.
     leaves: BTreeMap<RowKey, Option<Vec<u8>>>,
+    /// `None` has not been read; `Some(None)` is an absent metadata row.
+    history_metadata: Option<Option<Vec<u8>>>,
 }
 
 impl<'a, SE: StorageEngine, K, L, G> StorageEngineTrx<'a, SE, K, L, G> {
@@ -50,11 +53,16 @@ impl<'a, SE: StorageEngine, K, L, G> StorageEngineTrx<'a, SE, K, L, G> {
         locked: Option<u64>,
         leaves: BTreeMap<RowKey, Option<Vec<u8>>>,
     ) -> Self {
-        Self { store, trx: Some(trx), buffered: None, locked, generation: locked, leaves }
+        Self { store, trx: Some(trx), buffered: None, locked, generation: locked, leaves, history_metadata: None }
     }
 
     pub(super) fn buffered(store: EngineAdapter<SE, K, L, G>, read: super::StorageEngineSnapshot<SE, K, L, G>) -> Self {
-        Self { store, trx: None, buffered: Some(read), locked: None, generation: None, leaves: BTreeMap::new() }
+        Self { store, trx: None, buffered: Some(read), locked: None, generation: None, leaves: BTreeMap::new(), history_metadata: None }
+    }
+
+    pub(super) fn with_history_metadata(mut self, metadata: Option<Vec<u8>>) -> Self {
+        self.history_metadata = Some(metadata);
+        self
     }
 
     /// The store the transaction is lent as.
@@ -160,6 +168,7 @@ where
         };
 
         let mut changed: Changed = Vec::new();
+        let mut history_keys = Vec::new();
         let mut writes: Vec<MapWrite> = Vec::with_capacity(batch.len() + 3);
         for item in batch {
             let (key, row) = match item {
@@ -168,6 +177,7 @@ where
             };
 
             let (cached, key) = (admits(&key), key.encode());
+            history_keys.push(key.clone());
             if cached {
                 changed.push((key.clone(), row.clone()));
             }
@@ -182,6 +192,23 @@ where
         writes.push(MapWrite::Put { map: trees_map(), key: tree.id.entry_key(), value: entry.encode() });
 
         if self.generation.is_some() {
+            let mut known = history::cached::<K, L, G>(&tree.cache, tree.incarnation, self.landed_generation(), &history_keys);
+            if self.landed_generation().is_some() {
+                known.extend(self.leaves.iter().map(|(key, row)| (key.encode(), row.clone())));
+            }
+            writes.extend(
+                history::record(
+                    &mut **self.trx.as_mut().expect("storage transaction"),
+                    tree.incarnation,
+                    generation,
+                    history_keys,
+                    known,
+                    self.history_metadata.take(),
+                    false,
+                )
+                .await
+                .map_err(transaction_store_failure)?,
+            );
             writes.push(MapWrite::Put { map: tree.log.clone(), key: log::key(generation), value: log::entry(&changed) });
 
             if let Some(unreached) = generation.checked_sub(log::LENGTH) {

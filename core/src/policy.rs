@@ -57,6 +57,46 @@ impl AccessDenied {}
 // because it is part of this trait's surface.
 pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpdate, RegistrationPlan};
 
+/// Resource bounds for one peer's query comparisons. These bound protocol work
+/// and authorization scans; a predicate-authorized tree need not enumerate its
+/// members merely to capture a version.
+#[derive(Clone, Copy, Debug)]
+pub struct ComparisonLimits {
+    /// Spans requested in one page exchange.
+    pub max_spans: usize,
+    /// Members requested in one repair exchange.
+    pub max_members: usize,
+    /// Serialized bytes in one page answer or repair delivery.
+    pub max_bytes: usize,
+    /// Local and remote work units in one comparison.
+    pub max_steps: usize,
+    /// Simultaneously retained comparisons for one peer.
+    pub max_captures: usize,
+    pub lifetime: std::time::Duration,
+    /// Members inspected when per-state authorization is required.
+    pub max_capture_members: usize,
+    /// Canonical-state bytes inspected by one authorization scan.
+    pub max_capture_bytes: usize,
+    /// Events considered by one repair.
+    pub max_events: usize,
+}
+
+impl Default for ComparisonLimits {
+    fn default() -> Self {
+        Self {
+            max_spans: 64,
+            max_members: 256,
+            max_bytes: 4 * 1024 * 1024,
+            max_steps: 65_536,
+            max_captures: 16,
+            lifetime: std::time::Duration::from_secs(60),
+            max_capture_members: 65_536,
+            max_capture_bytes: 32 * 1024 * 1024,
+            max_events: 100_000,
+        }
+    }
+}
+
 /// PolicyAgents control access to resources, by:
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
 /// - checking access for requests. If approved, yield a ContextData
@@ -189,6 +229,20 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         std::collections::HashMap::new()
     }
 
+    /// Prove that `check_reads` adds no restrictions for these credentials.
+    /// Core still enforces the discovery predicate, including changes to it.
+    /// Keep the default when state checks can deny any selected member.
+    fn state_reads_follow_predicate<C>(&self, _data: &C) -> bool
+    where C: Iterable<Self::ContextData> {
+        false
+    }
+
+    /// Bound comparison resources for the authenticated credentials.
+    fn comparison_limits<C>(&self, _data: &C) -> ComparisonLimits
+    where C: Iterable<Self::ContextData> {
+        ComparisonLimits::default()
+    }
+
     /// Additional event restrictions after the entity passes the retrieval predicate.
     fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
@@ -315,6 +369,11 @@ impl PolicyAgent for PermissiveAgent {
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows regardless of which credentials are supplied, including none
         Ok(Predicate::True)
+    }
+
+    fn state_reads_follow_predicate<C>(&self, _data: &C) -> bool
+    where C: Iterable<Self::ContextData> {
+        true
     }
 
     // fn can_read_entity(&self, _context: &Self::ContextData, _entity: &Entity) -> AccessResult { AccessResult::Allow }

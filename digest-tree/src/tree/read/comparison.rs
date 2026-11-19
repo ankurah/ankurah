@@ -2,12 +2,14 @@
 //! it: asked about spans, it answers its page at each, what the tree holds
 //! there one level down. The view does the comparing: it compares each
 //! page's digests with its own digests of the same spans, asks for the pages
-//! beneath those that differ, a whole level per request, and, where a page
-//! holds members, pairs them with its own. How much to ask of the other tree
-//! is the getter's to judge.
+//! beneath those that differ, and, where a page holds members, compares them
+//! with its own. The caller can collect globally paired differences or read
+//! address-local differences in bounded batches. How much to admit from the
+//! other tree is the getter's to judge.
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,17 +17,20 @@ use super::{DigestTreeView, Leaf};
 use crate::span::leaf_address;
 use crate::{DigestGroup, Error, MemberId, Payload, Row, RowKey, Span, SpanDigest, Store};
 
+mod cursor;
+pub use cursor::Comparison;
+
 /// What gets the other tree's pages for one comparison: across the wire, a
 /// connection to the node that holds the tree, or one that asks several
 /// nodes; in one process, that tree's own view, as tests do. Nothing about a
 /// getter is a tree: it answers one read, a page for each span asked, in
 /// order, and compares nothing.
 ///
-/// The comparison asks its getter for one whole level of the descent per
-/// call, and sets no bounds of its own. Any judgment of the other side is
-/// the getter's, over the getter's own lifetime: its account of the pages it
-/// fetched, its patience, what it admits and its budget. A getter ends the
-/// comparison by returning its error, which the comparison returns as
+/// [`DigestTreeView::differences`] asks for one whole level of the descent per
+/// call; [`DigestTreeView::compare`] asks for bounded batches of spans. Any
+/// judgment of the other side is the getter's, over its own lifetime: its
+/// account of the pages it fetched, its patience, what it admits and its
+/// budget. A getter ends the comparison by returning its error, returned as
 /// [`ComparisonError::Getter`]. A getter for trusted trees in one process
 /// need judge nothing, and may serve one comparison after another.
 ///
@@ -37,8 +42,7 @@ pub trait PageGetter<I: MemberId, L: Payload, G: DigestGroup> {
     /// How getting pages fails.
     type Error;
 
-    /// The other tree's page at each of `spans`, in the order given: one
-    /// level of the comparison's descent.
+    /// The other tree's page at each of `spans`, in the order given.
     fn get_pages(&mut self, spans: Vec<Span>) -> impl Future<Output = Result<Vec<Page<I, L, G>>, Self::Error>> + Send;
 }
 
@@ -58,8 +62,8 @@ impl<I: MemberId, L: Payload, G: DigestGroup, P: PageGetter<I, L, G>> PageGetter
 /// the wire.
 ///
 /// A page is the unit by which a comparison narrows: each request to the
-/// other tree answers one level of the descent, a page for each span still in
-/// question, and the comparison asks next only beneath the spans whose digests
+/// other tree answers one level beneath each requested span, and the
+/// comparison asks next only beneath the spans whose digests
 /// differ. So a page is an answer, not a record. The tree builds it from its
 /// rows when asked, from the nodes beneath the span and, where the span
 /// reaches a bucket, the members within it, and neither stores nor keeps it:
@@ -82,12 +86,14 @@ pub enum Page<I, L, G: DigestGroup> {
 
 /// A member whose two sides differ: the view's leaf and the other tree's,
 /// either absent where that side doesn't hold the member. A member that
-/// moved to another key is one difference, our leaf at the old key and
-/// theirs at the new. A difference with only the other tree's leaf can name
-/// a member this tree holds at another address, within a span the two trees
-/// digest alike, which the comparison never reads: the tree keeps no index by
-/// id, so a caller that inserts the other tree's leaf checks its own records
-/// for the member first.
+/// moved to another key is paired into one difference by
+/// [`DigestTreeView::differences`], our leaf at the old key and theirs at the
+/// new. The incremental [`Comparison`] instead reports differences by
+/// address, so that move can produce two differences. A difference with only
+/// the other tree's leaf can name a member this tree holds at another
+/// address, within a span the two trees digest alike, which the comparison
+/// never reads: the tree keeps no index by id, so a caller that inserts the
+/// other tree's leaf checks its own records for the member first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Difference<I, L> {
     /// The view's leaf for the member, if it holds one.
@@ -195,44 +201,16 @@ where
     /// one read of this view's tree are [`Error::Inconsistent`].
     pub async fn differences<P: PageGetter<I, L, G>>(&self, mut getter: P) -> Result<Vec<Difference<I, L>>, ComparisonError<P::Error>> {
         let mut by_id: BTreeMap<Vec<u8>, Difference<I, L>> = BTreeMap::new();
-        let mut frontier: Vec<Span> = self.spans().to_vec();
+        let mut descent = Descent::new(self.spans().to_vec(), None);
 
         // The ids of every member each side has shown among the spans
         // compared, which are disjoint, so an id seen twice was seen at two
         // addresses.
         let (mut theirs_seen, mut ours_seen) = (HashSet::new(), HashSet::new());
 
-        while !frontier.is_empty() {
-            let pages = pages_at(&mut getter, &frontier).await?;
-
-            let mut subspans: Vec<SpanDigest<G>> = Vec::new();
-            let mut listed: Vec<(Span, Vec<Leaf<I, L>>)> = Vec::new();
-            for (span, page) in frontier.into_iter().zip(pages) {
-                match page {
-                    Page::Digests(theirs) => {
-                        fits_as_subdivision(&span, &theirs).map_err(ComparisonError::MalformedPage)?;
-                        subspans.extend(theirs);
-                    }
-
-                    Page::Members(theirs) => {
-                        fits_as_members(&span, &theirs).map_err(ComparisonError::MalformedPage)?;
-                        see_once(&mut theirs_seen, &theirs)?;
-                        listed.push((span, theirs));
-                    }
-                }
-            }
-
-            let ours = self.span_digests(subspans.iter().map(|theirs| theirs.bounds.clone()).collect()).await?;
-            frontier = Vec::new();
-            for (theirs, ours) in subspans.into_iter().zip(ours) {
-                if theirs.digest == ours.digest {
-                    continue;
-                }
-
-                match theirs.digest.count() == 0 {
-                    true => listed.push((theirs.bounds, Vec::new())),
-                    false => frontier.push(theirs.bounds),
-                }
+        while let Some(listed) = descent.advance(self, &mut getter).await? {
+            for (_, theirs) in &listed {
+                see_once(&mut theirs_seen, theirs)?;
             }
 
             let spans: Vec<Span> = listed.iter().map(|(span, _)| span.clone()).collect();
@@ -256,12 +234,111 @@ where
 
         Ok(by_id.into_values().collect())
     }
+
+    /// Compare incrementally, reporting differences by address in batches of
+    /// at most `batch_size`. The same limit bounds spans per getter call;
+    /// the getter still decides which answers it admits. Local members are
+    /// read through a bounded range stream, including when the other tree
+    /// reports an empty span covering all of ours.
+    ///
+    /// This reads nothing until [`Comparison::next_batch`] is awaited. It
+    /// keeps neither all differences nor all member ids. A moved member can
+    /// therefore appear twice, once at each address, and duplicate ids across
+    /// addresses are not detected. Each difference's two present leaves share
+    /// one address. Use [`Self::differences`] when global pairing and duplicate
+    /// detection are needed, at the cost of retaining the compared members.
+    ///
+    /// Like the collecting comparison, this is not a snapshot. Reported
+    /// differences are observations, not permission to overwrite or delete a
+    /// member. A caller applying them checks its current member by id and
+    /// verifies its completion condition after reconciliation.
+    pub fn compare<P: PageGetter<I, L, G>>(&self, getter: P, batch_size: NonZeroUsize) -> Comparison<K, I, L, G, S, P> {
+        Comparison::new(self.clone(), getter, batch_size)
+    }
 }
 
-/// The other tree's page at each of `spans`, a whole level of the descent,
-/// in one request: how the request travels, whole or in parts, is the
-/// getter's to choose. An answer with another number of pages than spans
-/// asked is [`PageMisfit::WrongNumberOfPages`].
+/// One descent shared by the collecting and incremental comparisons. The
+/// former walks whole levels; the latter keeps a depth-first stack and asks
+/// for a bounded group of its next spans. The frontier advances only after
+/// every read completes: canceling an exchange leaves its spans queued for
+/// the next attempt.
+struct Descent {
+    frontier: Vec<Span>,
+    batch_size: Option<NonZeroUsize>,
+}
+
+impl Descent {
+    fn new(mut frontier: Vec<Span>, batch_size: Option<NonZeroUsize>) -> Self {
+        if batch_size.is_some() {
+            frontier.reverse();
+        }
+        Self { frontier, batch_size }
+    }
+
+    async fn advance<K, I, L, G, S, P>(
+        &mut self,
+        view: &DigestTreeView<K, I, L, G, S>,
+        getter: &mut P,
+    ) -> Result<Option<Vec<(Span, Vec<Leaf<I, L>>)>>, ComparisonError<P::Error>>
+    where
+        K: Clone + Send + Sync + 'static,
+        I: MemberId,
+        L: Payload,
+        G: DigestGroup,
+        S: Store<RowKey, Row<K, L, G>>,
+        P: PageGetter<I, L, G>,
+    {
+        if self.frontier.is_empty() {
+            return Ok(None);
+        }
+        let spans: Vec<Span> = match self.batch_size {
+            Some(size) => self.frontier.iter().rev().take(size.get()).cloned().collect(),
+            None => self.frontier.clone(),
+        };
+        let pages = pages_at(getter, &spans).await?;
+        let mut subspans = Vec::new();
+        let mut listed = Vec::new();
+        for (span, page) in spans.iter().zip(pages) {
+            match page {
+                Page::Digests(theirs) => {
+                    fits_as_subdivision(span, &theirs).map_err(ComparisonError::MalformedPage)?;
+                    subspans.extend(theirs);
+                }
+                Page::Members(theirs) => {
+                    fits_as_members(span, &theirs).map_err(ComparisonError::MalformedPage)?;
+                    listed.push((span.clone(), theirs));
+                }
+            }
+        }
+
+        let ours = view.span_digests(subspans.iter().map(|theirs| theirs.bounds.clone()).collect()).await?;
+        let mut differing = Vec::new();
+        for (theirs, ours) in subspans.into_iter().zip(ours) {
+            if theirs.digest == ours.digest {
+                continue;
+            }
+            if theirs.digest.count() == 0 {
+                listed.push((theirs.bounds, Vec::new()));
+            } else {
+                differing.push(theirs.bounds);
+            }
+        }
+
+        match self.batch_size {
+            Some(_) => {
+                self.frontier.truncate(self.frontier.len() - spans.len());
+                self.frontier.extend(differing.into_iter().rev());
+            }
+            None => self.frontier = differing,
+        }
+        Ok(Some(listed))
+    }
+}
+
+/// The other tree's page at each of `spans`, in one request: how the request
+/// travels, whole or in parts, is the getter's to choose. An answer with
+/// another number of pages than spans asked is
+/// [`PageMisfit::WrongNumberOfPages`].
 async fn pages_at<I: MemberId, L: Payload, G: DigestGroup, P: PageGetter<I, L, G>>(
     getter: &mut P,
     spans: &[Span],

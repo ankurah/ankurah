@@ -10,8 +10,8 @@ use ankurah_digest_tree::{
 
 use super::guard::PoisonGuard;
 use super::layout::entry::{self, Status, TreeEntry};
-use super::layout::log;
 use super::layout::names::trees_map;
+use super::layout::{history, log};
 use super::{EngineAdapter, Error, StorageEngineTrx, TreeId};
 use crate::error::MutationError;
 use crate::storage::{LockName, MapRead, MapRows, MapWrite, StorageCommitResult, StorageEngine, StorageTransaction};
@@ -113,10 +113,12 @@ enum Planned<SE: StorageEngine, K, I, L, G: DigestGroup> {
 
 /// What the apply's first request found of one tree, besides its entry: for
 /// a tree with changes, the leaves its commit checks, by key, and the change
-/// log after the generation its rows were cached at, with that generation.
+/// log after the generation its rows were cached at, with that generation,
+/// and the bounded history's metadata.
 struct Found {
     leaves: BTreeMap<RowKey, Option<Vec<u8>>>,
     log: Option<(u64, MapRows)>,
+    history: Option<Vec<u8>>,
 }
 
 /// What became of one tree's changes that didn't fail the call.
@@ -261,20 +263,25 @@ where
 
     /// The reads of the tree the apply's first request makes besides its
     /// entry: for a tree with changes, the leaves its commit checks, and the
-    /// change log after the generation its rows are cached at.
+    /// change log after the generation its rows are cached at, and its history
+    /// metadata for the eventual write.
     fn reads(&self) -> Vec<MapRead> {
         let Self::Changes { prepared, cached } = self else { return Vec::new() };
         let tree = prepared.tree().store().inner();
 
         let leaves = MapRead::Get { map: tree.rows.clone(), keys: prepared.leaves_checked().iter().map(Encode::encode).collect() };
-        [leaves].into_iter().chain(cached.map(|from| log::read_after(tree.log.clone(), from))).collect()
+        [leaves]
+            .into_iter()
+            .chain(cached.map(|from| log::read_after(tree.log.clone(), from)))
+            .chain([history::metadata_read(tree.incarnation)])
+            .collect()
     }
 
     /// What the next of `answers` hold of the tree, in the order of
     /// [`reads`](Self::reads), which every tree with changes made, retired
     /// or not.
     fn found(&self, answers: &mut impl Iterator<Item = MapRows>) -> Result<Found, Error> {
-        let Self::Changes { prepared, cached } = self else { return Ok(Found { leaves: BTreeMap::new(), log: None }) };
+        let Self::Changes { prepared, cached } = self else { return Ok(Found { leaves: BTreeMap::new(), log: None, history: None }) };
         let keys = prepared.leaves_checked();
 
         let leaves = match answers.next() {
@@ -287,7 +294,8 @@ where
             None => None,
         };
 
-        Ok(Found { leaves, log })
+        let history = history::metadata_found(answers.next())?;
+        Ok(Found { leaves, log, history })
     }
 }
 
@@ -313,7 +321,7 @@ where
         store.inner().catch_up(from, locked, Some(log))?;
     }
 
-    match prepared.apply(StorageEngineTrx::new(store, trx, Some(locked), found.leaves)).await {
+    match prepared.apply(StorageEngineTrx::new(store, trx, Some(locked), found.leaves).with_history_metadata(found.history)).await {
         Ok(applied) => Ok(Outcome::Applied(applied)),
         Err(error) => refusal(error).map(Outcome::Refused),
     }

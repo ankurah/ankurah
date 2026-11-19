@@ -13,6 +13,24 @@ use tokio::time::timeout;
 use crate::database::Database;
 use crate::Tree;
 
+impl ankurah::core::sync::conformance::TestDatabase for Database {
+    type Engine = ankurah_storage_postgres::Postgres;
+
+    async fn engine(&self) -> anyhow::Result<Arc<Self::Engine>> { self.node().await }
+
+    fn keeps_a_reads_state_across_commits(&self) -> bool { true }
+}
+
+/// A capture held by one pool survives another pool's commits without holding
+/// a PostgreSQL transaction open between its reads.
+#[tokio::test]
+async fn a_capture_survives_commits_through_independent_pools() -> anyhow::Result<()> {
+    ankurah::core::sync::conformance::a_capture_survives_flushes_and_other_managers_commits::<ankurah_digest_tree::Ristretto255, _>(
+        &Database::start().await?,
+    )
+    .await
+}
+
 /// A node whose apply asks for a tree's lock while another node's storage
 /// transaction holds it waits at the database until that transaction ends,
 /// and then applies its changes to the tree as the other's commit left it:

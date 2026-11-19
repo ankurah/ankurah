@@ -5,8 +5,9 @@
 //!
 //! - the engine's trees map is `t` alone, and keys each tree's entry by the
 //!   tree's id, as its UTF-8 bytes;
-//! - a tree's rows map is `r`, its change log `l`, and its member lookup `m`, each followed by the
-//!   tree's incarnation, eight bytes big-endian;
+//! - a tree's rows map is `r`, its cache log `l`, its before-image history `h`,
+//!   and its member lookup `m`, each followed by the tree's incarnation, eight
+//!   bytes big-endian;
 //! - a tree's lock is `k`, followed by the tree's id as its UTF-8 bytes.
 //!
 //! A tree's maps are named by its incarnation alone, so the name an engine
@@ -23,6 +24,7 @@ const TREES: u8 = b't';
 const ROWS: u8 = b'r';
 const LOG: u8 = b'l';
 const MEMBERS: u8 = b'm';
+const HISTORY: u8 = b'h';
 const LOCK: u8 = b'k';
 
 /// A tree's name among one engine's digest trees, which its owner chooses.
@@ -71,6 +73,9 @@ impl Incarnation {
 
     /// The manager's member keys, heads and continuation cursor.
     pub(in crate::sync::storage_adapter) fn members(self) -> MapId { MapId::new(tagged(MEMBERS, &self.to_bytes())) }
+
+    /// Before-images retained for captured comparison versions.
+    pub(in crate::sync::storage_adapter) fn history(self) -> MapId { MapId::new(tagged(HISTORY, &self.to_bytes())) }
 
     /// Its eight bytes, big-endian.
     pub(in crate::sync::storage_adapter) fn to_bytes(self) -> [u8; 8] { self.0.to_be_bytes() }

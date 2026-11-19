@@ -181,6 +181,11 @@ async fn later_range_batches_see_intervening_commits() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn a_capture_survives_flushes_and_other_managers_commits() -> anyhow::Result<()> {
+    conformance::a_capture_survives_flushes_and_other_managers_commits::<Ristretto255, _>(&Database::start()?).await
+}
+
+#[tokio::test]
 async fn rolling_back_a_refusal_preserves_the_tree() -> anyhow::Result<()> {
     conformance::a_refusal_whose_transaction_is_dropped_leaves_the_tree_valid::<Ristretto255, _>(&Database::start()?).await
 }
