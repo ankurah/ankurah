@@ -2,6 +2,7 @@
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
 use crate::value::Value;
+use crate::value::ValueExt;
 use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyId, PropertyPath, Resolved, Stage};
 use thiserror::Error;
 
@@ -55,6 +56,8 @@ pub trait Filterable {
 /// Supplies values at a selection stage's paths, for predicate evaluation and sorting.
 pub trait ValueLookup<S: Stage> {
     fn value_at(&self, path: &S::Path) -> Option<Value>;
+    /// The ordered value, retaining JSON's type distinctions at subpaths.
+    fn order_value_at(&self, path: &S::Path) -> Option<Value> { self.value_at(path) }
     fn is_member_of(&self, _model: &S::ModelId) -> Result<bool, Error> {
         Err(Error::UnsupportedExpression("model membership is unavailable"))
     }
@@ -69,6 +72,15 @@ impl<T: Filterable> ValueLookup<Resolved> for T {
             Some(value)
         } else {
             value.extract_at_path(&path.subpath)
+        }
+    }
+
+    fn order_value_at(&self, path: &PropertyPath) -> Option<Value> {
+        let value = self.value(&path.property_id())?;
+        if path.subpath.is_empty() {
+            Some(value)
+        } else {
+            value.json_order_at_path(&path.subpath).map(Value::Json)
         }
     }
 }

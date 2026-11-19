@@ -171,6 +171,11 @@ impl IndexedDBBucket {
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let _lock = self.mutex.lock().await;
+        let canonical_selection = selection.clone();
+        let ordered = selection.order_by.as_ref().is_some_and(|order| !order.is_empty());
+        if selection.limit == Some(0) {
+            return Ok(Vec::new());
+        }
 
         // Resolve, through this engine's own durable map, the field for every
         // property the selection references (assigned on write, sticky under
@@ -230,6 +235,11 @@ impl IndexedDBBucket {
         let states = match plan {
             Plan::EmptyScan => Vec::new(),
             Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, order_by_spill } => {
+                if ordered && !complete_ordered_candidates(index_spec, bounds, &amended_selection.predicate, &field_types) {
+                    let mut complete = canonical_selection.clone();
+                    complete.predicate = Predicate::And(Box::new(Predicate::MemberOf(self.model_id)), Box::new(complete.predicate));
+                    return crate::engine::query::fetch(&self.db, &complete).await;
+                }
                 // Step 4: Ensure index exists using plan's IndexSpec
                 self.db
                     .assure_index_exists(index_spec)
@@ -275,6 +285,7 @@ impl IndexedDBBucket {
                             eq_prefix_values,
                             &order_by_spill,
                             &field_types,
+                            ordered.then_some(&canonical_selection),
                         )
                         .await?;
 
@@ -556,6 +567,7 @@ impl IndexedDBBucket {
         eq_prefix_values: Vec<ankurah_core::value::Value>,
         order_by_spill: &OrderByComponents,
         field_types: &BTreeMap<String, ValueType>,
+        canonical_selection: Option<&ankql::ast::Selection<Resolved>>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         if limit == Some(0) {
             return Ok(Vec::new());
@@ -579,6 +591,16 @@ impl IndexedDBBucket {
             crate::scanner::IdbIndexScanner::new(index.clone(), key_range, cursor_direction, effective_prefix_len, eq_prefix_values);
 
         let mut stream = std::pin::pin!(scanner.scan());
+        if let Some(selection) = canonical_selection {
+            // JS projections lose i64 precision, and IndexedDB's UTF-16 string
+            // order differs from canonical UTF-8 ordering. Hydrate before LIMIT.
+            let mut selected = ankurah_storage_common::selection::StateSelection::new(selection);
+            while let Some(result) = stream.next().await {
+                let id = result?.get(&ID_KEY)?;
+                selected.push(crate::engine::load_state_in_store(entities, id).await?)?;
+            }
+            return Ok(selected.finish());
+        }
         let mut rows: Vec<IdbRecord> = Vec::new();
 
         while let Some(result) = stream.next().await {
@@ -622,6 +644,66 @@ impl IndexedDBBucket {
     }
 }
 
+/// Only use a sparse JS index when every matching entity has all of its keys
+/// and its bounds cannot discard canonical matches. Its iteration order is
+/// never used as the canonical ORDER BY; the states are sorted after hydration.
+fn complete_ordered_candidates(
+    spec: &ankurah_core::indexing::KeySpec<String>,
+    bounds: &ankurah_storage_common::KeyBounds,
+    predicate: &Predicate<EngineColumns>,
+    types: &BTreeMap<String, ValueType>,
+) -> bool {
+    use ankurah_storage_common::{Endpoint, KeyDatum};
+    spec.keyparts.iter().all(|part| {
+        if part.key == MATERIALIZATION_KEY.to_string() {
+            return true;
+        }
+        if part.sub_path.is_some() {
+            return false;
+        }
+        let bound = bounds.keyparts.iter().find(|bound| bound.column == part.key);
+        if part.key == "id" {
+            return bound
+                .is_none_or(|bound| !matches!((&bound.low, &bound.high), (Endpoint::Value { .. }, _) | (_, Endpoint::Value { .. })));
+        }
+        if !ankurah_storage_common::predicate::requires_value(predicate, &ColumnPath::simple(&part.key)) {
+            return false;
+        }
+        let Some(value_type) = types.get(&part.key) else {
+            return false;
+        };
+        if !matches!(value_type, ValueType::I16 | ValueType::I32 | ValueType::Bool | ValueType::String) {
+            return false;
+        }
+        let Some(bound) = bound else {
+            return true;
+        };
+        fn finite(endpoint: &Endpoint) -> Option<&Value> {
+            match endpoint {
+                Endpoint::Value { datum: KeyDatum::Val(value), .. } => Some(value),
+                _ => None,
+            }
+        }
+        if [finite(&bound.low), finite(&bound.high)].into_iter().flatten().any(|value| value.value_type() != *value_type) {
+            return false;
+        }
+        if *value_type == ValueType::String && (finite(&bound.low).is_some() || finite(&bound.high).is_some()) {
+            let equality = matches!((&bound.low, &bound.high), (
+                Endpoint::Value { datum: KeyDatum::Val(low), inclusive: true },
+                Endpoint::Value { datum: KeyDatum::Val(high), inclusive: true }
+            ) if low == high);
+            // UTF-8 and UTF-16 disagree between some non-ASCII strings, but
+            // every string compares the same way against an ASCII boundary.
+            return equality
+                || [finite(&bound.low), finite(&bound.high)]
+                    .into_iter()
+                    .flatten()
+                    .all(|value| matches!(value, Value::String(value) if value.is_ascii()));
+        }
+        true
+    })
+}
+
 enum PropertyFieldClaim {
     Stored(PropertyColumn),
     Collision,
@@ -643,6 +725,14 @@ impl IdbRecord<'_> {
 }
 
 impl ankurah_core::selection::filter::ValueLookup<EngineColumns> for IdbRecord<'_> {
+    fn order_value_at(&self, path: &ColumnPath) -> Option<Value> {
+        if path.subpath.is_empty() {
+            return self.value_at(path);
+        }
+        use ankurah_core::value::ValueExt;
+        self.field_value(&path.column)?.json_order_at_path(&path.subpath).map(Value::Json)
+    }
+
     fn is_member_of(&self, model: &ModelId) -> Result<bool, ankurah_core::selection::filter::Error> { Ok(self.memberships.contains(model)) }
 
     fn value_at(&self, path: &ColumnPath) -> Option<ankurah_core::value::Value> {

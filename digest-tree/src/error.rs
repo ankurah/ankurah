@@ -63,9 +63,8 @@ pub enum Error {
         given: usize,
     },
 
-    /// A key spec's part names a collation. The tree implements none, and
-    /// ignoring the name would order members otherwise than the spec says.
-    #[error("key part {part} names a collation, which the tree doesn't implement")]
+    /// A key spec's part names a collation other than C/POSIX byte ordering.
+    #[error("key part {part} names an unsupported collation")]
     Collation {
         /// Which part, counting from zero.
         part: usize,
@@ -128,6 +127,15 @@ pub enum Error {
     /// Opening or rebuilding found a tree summed in another digest group.
     #[error("the store's tree is summed in another digest group")]
     WrongGroup,
+
+    /// Opening or rebuilding found an incompatible ordering codec. Known
+    /// legacy keys can be rebuilt from canonical members; unknown versions
+    /// require a compatible reader.
+    #[error("the store's tree uses incompatible key encoding version {found}")]
+    WrongKeyEncoding {
+        /// The version stored in the tree's metadata.
+        found: u8,
+    },
 
     /// A rebuild was given a key spec different from the stored tree's.
     /// Existing handles retain their spec, so rebuilding cannot change it.

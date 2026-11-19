@@ -108,6 +108,17 @@ impl SledModelStoreInner {
         let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
         let plan = plans.into_iter().next().ok_or_else(|| RetrievalError::Other("No plan generated".into()))?;
 
+        if let Plan::Index { index_spec, .. } = &plan {
+            if selection.order_by.as_ref().is_some_and(|order| !order.is_empty())
+                && !self.canonical_index(index_spec, &selection.predicate)?
+            {
+                // ORDER-only keys are sparse: an index can omit precisely the
+                // missing values that a canonical ORDER BY must include.
+                let ids = SledMaterializationKeyScanner::new(&self.tree, &KeyBounds::empty(), ScanDirection::Forward)?;
+                return self.filter_candidate_states(ids, &resolved_selection, false);
+            }
+        }
+
         // Execute the chosen plan using streaming pipeline architecture
         match plan {
             Plan::EmptyScan => Ok(Vec::new()),
@@ -129,7 +140,7 @@ impl SledModelStoreInner {
         mut bounds: KeyBounds,
         scan_direction: ScanDirection,
         remaining_predicate: Predicate<EngineColumns>,
-        mut order_by_spill: OrderByComponents,
+        order_by_spill: OrderByComponents,
         selection: &ankql::ast::Selection<Resolved>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         use ankurah_core::{
@@ -142,21 +153,6 @@ impl SledModelStoreInner {
             if keypart.key == "id" {
                 keypart.value_type = ValueType::EntityId;
             }
-        }
-        // String is also the planner's unknown-type placeholder. Trust that
-        // ordering only when the property's canonical definition declares String;
-        // otherwise numeric values such as 10 and 5 need actual-value sorting.
-        let mut unproven_order = false;
-        for order in &order_by_spill.presort {
-            if index_spec.keyparts.iter().any(|part| part.full_path() == order.path.to_string() && part.value_type == ValueType::String)
-                && (!order.path.is_simple() || !self.declares_string(&order.path.column)?)
-            {
-                unproven_order = true;
-                break;
-            }
-        }
-        if unproven_order {
-            order_by_spill.spill = std::mem::take(&mut order_by_spill.presort).into_iter().chain(order_by_spill.spill).collect();
         }
         let column = crate::materialization::MATERIALIZATION_COLUMN.to_owned();
         let membership = Endpoint::incl(Value::String(self.model_id.to_string()));
@@ -193,9 +189,29 @@ impl SledModelStoreInner {
         self.finish_projected_scan(projected, remaining_predicate, order_by_spill, limit)
     }
 
-    /// Predicate literals can be cast, so only the durable definition proves a
-    /// String index preserves this property's value ordering.
-    fn declares_string(&self, column: &str) -> Result<bool, RetrievalError> {
+    /// An index must include every matching row and preserve its scalar values.
+    /// Missing values, JSON and unproven casts use complete model candidates.
+    fn canonical_index(&self, spec: &KeySpec<String>, predicate: &Predicate<EngineColumns>) -> Result<bool, RetrievalError> {
+        use ankurah_core::value::ValueType;
+        for part in &spec.keyparts {
+            if part.key == "id" {
+                continue;
+            }
+            if part.sub_path.is_some()
+                || !matches!(
+                    part.value_type,
+                    ValueType::String | ValueType::I16 | ValueType::I32 | ValueType::I64 | ValueType::Bool | ValueType::EntityId
+                )
+                || !ankurah_storage_common::predicate::requires_value(predicate, &ColumnPath::simple(&part.key))
+                || self.declared_type(&part.key)? != Some(part.value_type)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn declared_type(&self, column: &str) -> Result<Option<ankurah_core::value::ValueType>, RetrievalError> {
         use ankurah_core::{
             entity::TemporaryEntity,
             selection::filter::Filterable,
@@ -203,18 +219,19 @@ impl SledModelStoreInner {
         };
         use ankurah_proto::{StateFragment, SystemModel, SystemProperty};
 
-        let Some(slot) = crate::property::slot_from_planner_column(column) else { return Ok(false) };
-        let Some(PropertyId::EntityId(id)) = self.database.property_manager.property_for_slot(slot)? else { return Ok(false) };
-        let Some(bytes) = self.database.entities_tree.get(id.to_bytes()).map_err(crate::error::sled_error)? else { return Ok(false) };
+        let Some(slot) = crate::property::slot_from_planner_column(column) else { return Ok(None) };
+        let property = self.database.property_manager.property_for_slot(slot)?;
+        let Some(PropertyId::EntityId(id)) = property else { return Ok(None) };
+        let Some(bytes) = self.database.entities_tree.get(id.to_bytes()).map_err(crate::error::sled_error)? else { return Ok(None) };
         let definition: StateFragment = bincode::deserialize(&bytes)?;
         if !definition.state.memberships.contains(&ModelId::System(SystemModel::Property)) {
-            return Ok(false);
+            return Ok(None);
         }
         let entity = TemporaryEntity::new(id, &definition.state)?;
         let Some(Value::String(value_type)) = entity.value(&PropertyId::System(SystemProperty::ValueType)) else {
             return Err(RetrievalError::storage(format!("property definition {id} has no string value_type")));
         };
-        Ok(ValueType::from_property_str(&value_type) == Some(ValueType::String))
+        Ok(ValueType::from_property_str(&value_type))
     }
 
     /// Reject nonmembers before loading state, preserving index order and LIMIT after filtering.
@@ -242,7 +259,11 @@ impl SledModelStoreInner {
             });
             let mut states = ids.entities(&self.database.entities_tree);
             if !ordered {
-                return ankurah_storage_common::selection::select_states(states.collect_states().await?, selection);
+                let mut selected = ankurah_storage_common::selection::StateSelection::new(selection);
+                while let Some(state) = states.next().await {
+                    selected.push(state?)?;
+                }
+                return Ok(selected.finish());
             }
             let mut matches = Vec::new();
             while let Some(state) = states.next().await {

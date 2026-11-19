@@ -13,25 +13,10 @@ fn sort_items_by_order<T: ValueLookup<EngineColumns>>(items: &mut [T], order_by:
     items.sort_by(|a, b| compare_items(a, b, order_by));
 }
 
-pub(crate) fn compare_items<S: ankql::ast::Stage, T: ValueLookup<S>>(a: &T, b: &T, order_by: &[ankql::ast::OrderByItem<S>]) -> Ordering {
-    for order_item in order_by {
-        let a_val = a.value_at(&order_item.path);
-        let b_val = b.value_at(&order_item.path);
+pub(crate) use ankurah_core::selection::ordering::{compare_items, compare_nullable};
 
-        // Handle None values: None sorts before Some
-        let cmp = match (a_val, b_val, &order_item.direction) {
-            (None, None, _) => Ordering::Equal,
-            (None, Some(_), _) => Ordering::Less,
-            (Some(_), None, _) => Ordering::Greater,
-            (Some(a), Some(b), ankql::ast::OrderDirection::Asc) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-            (Some(a), Some(b), ankql::ast::OrderDirection::Desc) => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
-        };
-
-        if cmp != Ordering::Equal {
-            return cmp;
-        }
-    }
-    Ordering::Equal
+fn same_partition(a: &[Option<Value>], b: &[Option<Value>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| compare_nullable(a.as_ref(), b.as_ref(), &ankql::ast::OrderDirection::Asc).is_eq())
 }
 
 /// Extract partition key (presort column values) from an item
@@ -39,7 +24,7 @@ fn extract_partition_key<T: ValueLookup<EngineColumns>>(
     item: &T,
     presort: &[ankql::ast::OrderByItem<EngineColumns>],
 ) -> Vec<Option<Value>> {
-    presort.iter().map(|p| item.value_at(&p.path)).collect()
+    presort.iter().map(|p| item.order_value_at(&p.path)).collect()
 }
 
 /// Sorted stream with partition-aware support.
@@ -152,7 +137,7 @@ where
                             this.current_partition_key = Some(item_key);
                             this.current_partition.push(item);
                         }
-                        Some(current_key) if *current_key == item_key => {
+                        Some(current_key) if same_partition(current_key, &item_key) => {
                             // Same partition - accumulate
                             this.current_partition.push(item);
                         }
@@ -240,75 +225,54 @@ impl<T: ValueLookup<EngineColumns>> PartialOrd for HeapItem<T> {
 }
 
 impl<T: ValueLookup<EngineColumns>> Ord for HeapItem<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // TopK algorithm: keep K items that would appear first in the final sorted output.
-        // We use a bounded heap and replace the "worst" candidate when a "better" one arrives.
-        //
-        // For ASC order (smallest K): use max-heap (largest candidate at top).
-        //   - When new item < top, kick out top (it's worse than new).
-        //   - Normal comparison: larger values are "greater".
-        //
-        // For DESC order (largest K): use min-heap (smallest candidate at top).
-        //   - When new item > top, kick out top (it's worse than new).
-        //   - Reversed comparison: smaller values are "greater" so BinaryHeap puts them at top.
-        for order_item in &self.order_by {
-            let self_val = self.item.value_at(&order_item.path);
-            let other_val = other.item.value_at(&order_item.path);
-
-            // Handle None values: None is "worst" for the heap (will be kicked out first)
-            // For ASC: None is smallest, so it should be "least" (kept longer in max-heap)
-            // For DESC: None is smallest, so it should be "greatest" (at top of min-heap, kicked first)
-            let cmp = match (self_val, other_val, &order_item.direction) {
-                (None, None, _) => Ordering::Equal,
-                (None, Some(_), ankql::ast::OrderDirection::Asc) => Ordering::Less, // None < Some for ASC max-heap
-                (Some(_), None, ankql::ast::OrderDirection::Asc) => Ordering::Greater, // Some > None for ASC max-heap
-                (None, Some(_), ankql::ast::OrderDirection::Desc) => Ordering::Greater, // None at top for DESC min-heap
-                (Some(_), None, ankql::ast::OrderDirection::Desc) => Ordering::Less, // Some below None for DESC min-heap
-                (Some(s), Some(o), ankql::ast::OrderDirection::Asc) => s.partial_cmp(&o).unwrap_or(Ordering::Equal), // Normal for max-heap
-                (Some(s), Some(o), ankql::ast::OrderDirection::Desc) => o.partial_cmp(&s).unwrap_or(Ordering::Equal), // Reversed for min-heap
-            };
-
-            if cmp != Ordering::Equal {
-                return cmp;
-            }
-        }
-        Ordering::Equal
-    }
+    fn cmp(&self, other: &Self) -> Ordering { compare_items(&self.item, &other.item, &self.order_by) }
 }
 
-/// TopK stream with partition-aware support.
-/// - When presort is empty: global TopK by spill columns
-/// - When presort is non-empty: partition-aware TopK (can stop early once K items emitted)
-pub struct TopKStream<S>
-where S: Stream
-{
+/// Keep at most the remaining LIMIT's worth of candidates. An ordered prefix
+/// permits early termination between partitions; a global sort uses one heap.
+/// The heap belongs to the stream so an asynchronous pause loses no candidates.
+pub struct TopKStream<S: Stream> {
     inner: Option<S>,
     order_by: OrderByComponents,
     k: usize,
     emitted_count: usize,
-    // State for iteration
-    current_partition: Vec<S::Item>,
+    heap: BinaryHeap<HeapItem<S::Item>>,
     current_partition_key: Option<Vec<Option<Value>>>,
     sorted_partition: Option<std::vec::IntoIter<S::Item>>,
-    exhausted: bool,
 }
 
-impl<S: Unpin> Unpin for TopKStream<S> where S: Stream {}
+impl<S: Stream + Unpin> Unpin for TopKStream<S> {}
 
-impl<S> TopKStream<S>
-where S: Stream
-{
+impl<S: Stream> TopKStream<S> {
     pub fn new(inner: S, order_by: OrderByComponents, k: usize) -> Self {
         Self {
             inner: Some(inner),
             order_by,
             k,
             emitted_count: 0,
-            current_partition: Vec::new(),
+            heap: BinaryHeap::new(),
             current_partition_key: None,
             sorted_partition: None,
-            exhausted: false,
         }
+    }
+}
+
+impl<S: Stream> TopKStream<S>
+where S::Item: ValueLookup<EngineColumns>
+{
+    fn keep(&mut self, item: S::Item) {
+        let candidate = HeapItem { item, order_by: self.order_by.spill.clone() };
+        if self.heap.len() < self.k - self.emitted_count {
+            self.heap.push(candidate);
+        } else if self.heap.peek().is_some_and(|worst| candidate < *worst) {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    fn finish_partition(&mut self) {
+        self.sorted_partition =
+            Some(std::mem::take(&mut self.heap).into_sorted_vec().into_iter().map(|entry| entry.item).collect::<Vec<_>>().into_iter());
     }
 }
 
@@ -321,127 +285,32 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-
-        if this.emitted_count >= this.k {
-            return Poll::Ready(None);
-        }
-
-        // If presort is empty, do global TopK (collect all, top-k, emit)
-        if this.order_by.presort.is_empty() {
-            // First try to emit from sorted partition
-            if let Some(ref mut sorted) = this.sorted_partition {
+        loop {
+            if this.emitted_count == this.k {
+                this.inner = None;
+                this.heap.clear();
+                return Poll::Ready(None);
+            }
+            if let Some(sorted) = &mut this.sorted_partition {
                 if let Some(item) = sorted.next() {
                     this.emitted_count += 1;
                     return Poll::Ready(Some(item));
                 }
                 this.sorted_partition = None;
-                return Poll::Ready(None);
             }
-
-            // Collect items from inner using top-k heap
-            let mut heap: BinaryHeap<HeapItem<S::Item>> = BinaryHeap::new();
-            loop {
-                let poll_result = {
-                    let Some(inner) = this.inner.as_mut() else { break };
-                    Pin::new(inner).poll_next(cx)
-                };
-                match poll_result {
-                    Poll::Ready(Some(item)) => {
-                        let heap_item = HeapItem { item, order_by: this.order_by.spill.clone() };
-                        if heap.len() < this.k {
-                            heap.push(heap_item);
-                        } else if let Some(worst) = heap.peek() {
-                            if heap_item < *worst {
-                                heap.pop();
-                                heap.push(heap_item);
-                            }
-                        }
-                    }
-                    Poll::Ready(None) => {
-                        // Inner exhausted - sort and prepare for emission
-                        this.inner = None;
-                        let mut top_k: Vec<_> = heap.into_iter().map(|h| h.item).collect();
-                        sort_items_by_order(&mut top_k, &this.order_by.spill);
-                        this.sorted_partition = Some(top_k.into_iter());
-                        // Emit first item
-                        return this.sorted_partition.as_mut().map_or(Poll::Ready(None), |iter| {
-                            if let Some(item) = iter.next() {
-                                this.emitted_count += 1;
-                                Poll::Ready(Some(item))
-                            } else {
-                                Poll::Ready(None)
-                            }
-                        });
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-            return Poll::Ready(None);
-        }
-
-        // Partition-aware TopK
-        loop {
-            if this.emitted_count >= this.k {
-                return Poll::Ready(None);
-            }
-
-            // First, try to emit from current sorted partition
-            if let Some(ref mut sorted_iter) = this.sorted_partition {
-                if let Some(item) = sorted_iter.next() {
-                    this.emitted_count += 1;
-                    return Poll::Ready(Some(item));
-                }
-                this.sorted_partition = None;
-            }
-
-            if this.exhausted {
-                return Poll::Ready(None);
-            }
-
-            // Get next item from inner stream (scope borrow)
-            let poll_result = {
-                let Some(inner) = this.inner.as_mut() else {
-                    return Poll::Ready(None);
-                };
-                Pin::new(inner).poll_next(cx)
-            };
-
-            match poll_result {
+            let Some(inner) = &mut this.inner else { return Poll::Ready(None) };
+            match Pin::new(inner).poll_next(cx) {
                 Poll::Ready(Some(item)) => {
-                    let item_key = extract_partition_key(&item, &this.order_by.presort);
-
-                    match &this.current_partition_key {
-                        None => {
-                            // First item - start new partition
-                            this.current_partition_key = Some(item_key);
-                            this.current_partition.push(item);
-                        }
-                        Some(current_key) if *current_key == item_key => {
-                            // Same partition - accumulate
-                            this.current_partition.push(item);
-                        }
-                        Some(_) => {
-                            // Partition changed - sort and emit previous partition
-                            let mut partition = std::mem::take(&mut this.current_partition);
-                            sort_items_by_order(&mut partition, &this.order_by.spill);
-                            this.sorted_partition = Some(partition.into_iter());
-
-                            // Start new partition with current item
-                            this.current_partition_key = Some(item_key);
-                            this.current_partition.push(item);
-                        }
+                    let key = extract_partition_key(&item, &this.order_by.presort);
+                    if this.current_partition_key.as_ref().is_some_and(|previous| !same_partition(previous, &key)) {
+                        this.finish_partition();
                     }
+                    this.current_partition_key = Some(key);
+                    this.keep(item);
                 }
                 Poll::Ready(None) => {
-                    // Inner exhausted - sort and emit final partition
-                    this.exhausted = true;
                     this.inner = None;
-
-                    if !this.current_partition.is_empty() {
-                        let mut partition = std::mem::take(&mut this.current_partition);
-                        sort_items_by_order(&mut partition, &this.order_by.spill);
-                        this.sorted_partition = Some(partition.into_iter());
-                    }
+                    this.finish_partition();
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -778,6 +647,45 @@ mod tests {
         assert!(topk.is_empty());
     }
 
+    #[test]
+    fn topk_retains_candidates_across_asynchronous_pauses() {
+        let items = [5, 2, 3, 1, 4].into_iter().map(|x| TestItem::int(&[("x", x)]));
+        let paused = futures::stream::iter(items)
+            .then(|item| {
+                let mut item = Some(item);
+                let mut paused = false;
+                futures::future::poll_fn(move |cx| {
+                    if !paused {
+                        paused = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(item.take().unwrap())
+                    }
+                })
+            })
+            .boxed();
+        let top = collect_stream(TopKStream::new(paused, OrderByComponents::new(vec![], vec![oby_asc("x")]), 3));
+        assert_eq!(top.iter().map(|item| item.value("x").unwrap()).collect::<Vec<_>>(), [Value::I32(1), Value::I32(2), Value::I32(3)]);
+    }
+
+    #[test]
+    fn a_large_partition_retains_only_the_needed_candidates() {
+        let items = (0..10_000).rev().map(|value| TestItem::cat_val("A", value));
+        let input = futures::stream::iter(items).chain(futures::stream::pending());
+        let mut top = TopKStream::new(input, OrderByComponents::new(vec![oby_asc("cat")], vec![oby_asc("val")]), 3);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(Pin::new(&mut top).poll_next(&mut cx).is_pending());
+        assert_eq!(top.heap.len(), 3, "memory is bounded even before a large partition ends");
+    }
+
+    #[test]
+    fn nan_presort_values_form_one_partition() {
+        let items = [3, 1, 2].into_iter().map(|value| TestItem::new(&[("x", Value::F64(f64::NAN)), ("y", Value::I32(value))])).collect();
+        let top = collect_stream(TopKStream::new(stream_from(items), OrderByComponents::new(vec![oby_asc("x")], vec![oby_asc("y")]), 2));
+        assert_eq!(top.iter().map(|item| item.value("y").unwrap()).collect::<Vec<_>>(), [Value::I32(1), Value::I32(2)]);
+    }
+
     // ============================================================================
     // TopKStream Tests - Partition-Aware TopK (non-empty presort)
     // ============================================================================
@@ -848,7 +756,7 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_sorted_stream_null_sorts_first_asc() {
+    fn test_sorted_stream_null_sorts_last_asc() {
         let items = vec![
             TestItem::int(&[("x", 2)]),
             TestItem::new(&[]), // x is NULL
@@ -858,14 +766,13 @@ mod tests {
         let order_by = OrderByComponents::new(vec![], vec![oby_asc("x")]);
         let sorted: Vec<_> = collect_stream(SortedStream::new(stream_from(items), order_by));
 
-        // NULL sorts first, then 1, 2
+        // Ascending order puts missing values last.
         let values: Vec<Option<i32>> = sorted.iter().map(|i| i.value("x").map(|v| extract_i32(&v))).collect();
-        assert_eq!(values, vec![None, Some(1), Some(2)]);
+        assert_eq!(values, vec![Some(1), Some(2), None]);
     }
 
     #[test]
     fn test_sorted_stream_null_sorts_first_desc() {
-        // Note: Current implementation has NULLs sort first regardless of direction
         let items = vec![
             TestItem::int(&[("x", 2)]),
             TestItem::new(&[]), // x is NULL
@@ -875,7 +782,7 @@ mod tests {
         let order_by = OrderByComponents::new(vec![], vec![oby_desc("x")]);
         let sorted: Vec<_> = collect_stream(SortedStream::new(stream_from(items), order_by));
 
-        // NULL sorts first even with DESC, then 2, 1
+        // Descending order puts missing values first.
         let values: Vec<Option<i32>> = sorted.iter().map(|i| i.value("x").map(|v| extract_i32(&v))).collect();
         assert_eq!(values, vec![None, Some(2), Some(1)]);
     }

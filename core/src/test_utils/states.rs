@@ -4,13 +4,12 @@ use super::{Pause, TestData};
 use crate::{
     entity::TemporaryEntity,
     error::RetrievalError,
-    selection::filter::{evaluate_predicate, membership_match, Error, ValueLookup},
+    selection::filter::{evaluate_predicate, membership_match, Error},
     storage::{StateCursor, StateScan, StateSnapshot},
 };
-use ankql::ast::{OrderDirection, Resolved, Selection};
+use ankql::ast::{Resolved, Selection};
 use ankurah_proto::{Attested, EntityId, EntityState};
 use std::{
-    cmp::Ordering,
     collections::BTreeMap,
     num::NonZeroUsize,
     sync::{
@@ -110,22 +109,9 @@ pub(super) fn select(
             Err(error) => return Err(error.into()),
         }
     }
-    matching.sort_by(|(a, left), (b, right)| {
-        for order in selection.order_by.as_deref().unwrap_or_default() {
-            // Match storage-common's value sort: missing values precede present
-            // ones in either direction. Real engine ordering is tested there.
-            let comparison = match (left.value_at(&order.path), right.value_at(&order.path), &order.direction) {
-                (None, None, _) => Ordering::Equal,
-                (None, Some(_), _) => Ordering::Less,
-                (Some(_), None, _) => Ordering::Greater,
-                (Some(left), Some(right), OrderDirection::Asc) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
-                (Some(left), Some(right), OrderDirection::Desc) => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
-            };
-            if comparison != Ordering::Equal {
-                return comparison;
-            }
-        }
-        a.payload.entity_id.cmp(&b.payload.entity_id)
+    let selection = ankql::selection::deterministic_order(selection);
+    matching.sort_by(|(_, left), (_, right)| {
+        crate::selection::ordering::compare_items(left, right, selection.order_by.as_deref().unwrap_or_default())
     });
     Ok(matching.into_iter().take(usize::try_from(limit).unwrap_or(usize::MAX)).map(|(state, _)| state.clone()).collect())
 }

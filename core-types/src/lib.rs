@@ -11,6 +11,7 @@ mod entity_id;
 mod error;
 pub mod key_spec;
 mod model_id;
+pub mod ordering;
 mod path;
 mod property_id;
 mod property_path;

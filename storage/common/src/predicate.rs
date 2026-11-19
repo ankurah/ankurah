@@ -1,3 +1,18 @@
+/// Whether every matching row must have a value at this path. A sparse index
+/// is incomplete when it also requires a key this predicate permits to be absent.
+pub fn requires_value(predicate: &ankql::ast::Predicate<crate::EngineColumns>, path: &crate::ColumnPath) -> bool {
+    use ankql::ast::{Expr, Predicate};
+    match predicate {
+        Predicate::Comparison { left, right, .. } => {
+            matches!(&**left, Expr::Path(found) if found == path) || matches!(&**right, Expr::Path(found) if found == path)
+        }
+        Predicate::And(left, right) => requires_value(left, path) || requires_value(right, path),
+        Predicate::Or(left, right) => requires_value(left, path) && requires_value(right, path),
+        Predicate::Not(inner) => matches!(&**inner, Predicate::IsNull(expr) if matches!(&**expr, Expr::Path(found) if found == path)),
+        _ => false,
+    }
+}
+
 /// Extracts conjuncts that can be flattened from a predicate tree.
 ///
 /// Conjuncts are predicates connected by AND operations that can be
@@ -45,6 +60,18 @@ impl ConjunctFinder {
 mod tests {
     use super::*;
     use ankurah_derive::selection;
+
+    #[test]
+    fn sparse_index_presence_proof_handles_boolean_branches() {
+        use ankql::ast::{Expr, Predicate};
+        let path = crate::ColumnPath::simple("score");
+        let required = Predicate::Not(Box::new(Predicate::IsNull(Box::new(Expr::Path(path.clone())))));
+        assert!(requires_value(&required, &path));
+        assert!(requires_value(&Predicate::And(Box::new(required.clone()), Box::new(Predicate::True)), &path));
+        assert!(!requires_value(&Predicate::Or(Box::new(required.clone()), Box::new(Predicate::True)), &path));
+        assert!(requires_value(&Predicate::Or(Box::new(required.clone()), Box::new(required)), &path));
+        assert!(!requires_value(&Predicate::IsNull(Box::new(Expr::Path(path.clone()))), &path));
+    }
 
     #[test]
     fn test_single_comparison() {

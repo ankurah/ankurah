@@ -76,7 +76,14 @@ where
     let nodes = lay_out::<G>(&NodePrefix::root(), &placed)?;
 
     let mut rows = Vec::with_capacity(1 + nodes.len() + filed.len());
-    rows.push(WriteItem::Put(RowKey::Meta, Row::Meta(Meta { key_spec: key_spec.clone(), group: G::ROW_VERSION })));
+    rows.push(WriteItem::Put(
+        RowKey::Meta,
+        Row::Meta(Meta {
+            key_spec: key_spec.clone(),
+            group: G::ROW_VERSION,
+            key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION,
+        }),
+    ));
     rows.extend(nodes.into_iter().map(|node| WriteItem::Put(RowKey::Node(node.prefix), Row::Node(node.row))));
 
     for Filed { address, payload, element } in filed {

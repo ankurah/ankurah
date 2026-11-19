@@ -20,7 +20,8 @@ where
 {
     /// Rebuild the store's existing tree to hold exactly `members`, through
     /// its owner's transaction. The stored key spec and digest group must
-    /// match, so existing handles remain usable after the owner commits.
+    /// match, so existing handles remain usable after the owner commits. This
+    /// also replaces legacy version 1 keys with the current ordering codec.
     /// [`Created::landed`] then returns a handle to the rebuilt tree.
     ///
     /// Every old row is read, and the new rows and deletions of obsolete rows
@@ -30,6 +31,7 @@ where
     ///
     /// A store without metadata is [`Error::NoTree`], another digest group is
     /// [`Error::WrongGroup`], and another key spec is [`Error::KeySpecMismatch`].
+    /// An unknown key encoding is [`Error::WrongKeyEncoding`].
     /// Invalid members are refused as in [`create_in`](Self::create_in), and
     /// an unreadable old row fails the rebuild. These failures write nothing.
     pub async fn rebuild_in<M: Member<K, Id = I, Payload = L>>(
@@ -51,6 +53,9 @@ where
         let meta = rows.meta().await?.ok_or(Error::NoTree)?;
         if meta.group != G::ROW_VERSION {
             return Err(Error::WrongGroup);
+        }
+        if meta.key_encoding != 1 && meta.key_encoding != ankurah_core_types::ordering::KEY_ENCODING_VERSION {
+            return Err(Error::WrongKeyEncoding { found: meta.key_encoding });
         }
         if meta.key_spec != key_spec {
             return Err(Error::KeySpecMismatch);

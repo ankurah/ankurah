@@ -93,7 +93,9 @@ pub fn entity_id_bound<'a>(comparison: Comparison<'a, EngineColumns>) -> Option<
     }
 }
 
-fn property_column(property: &PropertyId) -> String { if *property == PropertyId::Id { "id".to_owned() } else { format!("p_{property}") } }
+pub fn property_column(property: &PropertyId) -> String {
+    if *property == PropertyId::Id { "id".to_owned() } else { format!("p_{property}") }
+}
 
 fn quote(identifier: &str) -> String { format!("\"{}\"", identifier.replace('"', "\"\"")) }
 

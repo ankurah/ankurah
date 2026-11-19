@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use ankql::ast::{Resolved, Selection};
 use ankurah_core::error::RetrievalError;
 use ankurah_proto::{Attested, EntityId, EntityState, StateFragment};
-use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::select_states};
+use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::StateSelection};
 
 use crate::{database::Database, error::sled_error};
 
@@ -21,14 +21,14 @@ pub(super) async fn fetch(database: Arc<Database>, selection: Selection<Resolved
             materializations.insert(*model, ids);
         }
         let all = if plan.needs_all_entities() { entity_ids(&database.entities_tree)? } else { BTreeSet::new() };
-        let mut states = Vec::new();
+        let mut selected = StateSelection::new(&selection);
         for id in plan.candidate_ids(&materializations, all) {
             if let Some(bytes) = database.entities_tree.get(id.to_bytes()).map_err(sled_error)? {
                 let fragment: StateFragment = bincode::deserialize(bytes.as_ref())?;
-                states.push(Attested::<EntityState>::from_parts(id, fragment));
+                selected.push(Attested::<EntityState>::from_parts(id, fragment))?;
             }
         }
-        select_states(states, &selection)
+        Ok(selected.finish())
     })
     .await?
 }

@@ -60,8 +60,8 @@ fn rows_round_trip<G: DigestGroup>() {
     let mut digest = Digest::empty();
     digest.add_element(&element).unwrap();
 
-    // Every field of a part a stored spec keeps, though a tree refuses a
-    // spec that names a collation.
+    // Every field of a part a stored spec keeps, including an unsupported
+    // collation that a tree refuses when opening the spec.
     let key_spec = KeySpec::new(vec![
         asc!(Property::A, ValueType::I64),
         desc!(Property::B, ValueType::String),
@@ -81,8 +81,16 @@ fn rows_round_trip<G: DigestGroup>() {
         [None, Some(NodePrefix::of(&[0xB3, 0x40], 10)), Some(NodePrefix::root())].map(|branches_at| NodeRow { digest, branches_at });
 
     let rows: [Row<Property, Tag, G>; 6] = [
-        Row::Meta(Meta { key_spec: key_spec.clone(), group: G::ROW_VERSION }),
-        Row::Meta(Meta { key_spec: KeySpec::<Property>::new(vec![]), group: G::ROW_VERSION }),
+        Row::Meta(Meta {
+            key_spec: key_spec.clone(),
+            group: G::ROW_VERSION,
+            key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION,
+        }),
+        Row::Meta(Meta {
+            key_spec: KeySpec::<Property>::new(vec![]),
+            group: G::ROW_VERSION,
+            key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION,
+        }),
         Row::Node(nodes[0].clone()),
         Row::Node(nodes[1].clone()),
         Row::Node(nodes[2].clone()),
@@ -118,6 +126,29 @@ fn ristretto255_rows_round_trip() { rows_round_trip::<Ristretto255>() }
 fn lthash16_rows_round_trip() { rows_round_trip::<LtHash16>() }
 
 #[test]
+fn metadata_distinguishes_legacy_keys_from_the_current_encoding() {
+    let group = 1; // Ristretto255's persisted group identifier.
+    let key_spec = KeySpec::new(vec![asc!(Property::A, ValueType::Json)]);
+    let current = Row::<Property, Tag, Ristretto255>::Meta(Meta {
+        key_spec: key_spec.clone(),
+        group,
+        key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION,
+    });
+    let encoded = current.encode();
+    assert_eq!(&encoded[..3], &[VERSIONED_META, group, 2]);
+
+    // Original metadata had no key encoding field. It must remain readable so
+    // opening can refuse it explicitly and a rebuild can replace its keys.
+    let legacy = [&[META, group][..], &encoded[3..]].concat();
+    for (bytes, version) in [(legacy, 1), (encoded, 2)] {
+        let Row::Meta(meta) = Row::<Property, Tag, Ristretto255>::decode(&bytes).unwrap() else { panic!("metadata") };
+        assert_eq!(meta.key_spec, key_spec);
+        assert_eq!(meta.group, group);
+        assert_eq!(meta.key_encoding, version);
+    }
+}
+
+#[test]
 fn bytes_that_are_no_row_are_refused_permanently() {
     let leaf = Row::<Property, Tag, LtHash16>::Leaf(LeafRow { payload: Tag(vec![]), element: element::<LtHash16>() }).encode();
 
@@ -130,6 +161,8 @@ fn bytes_that_are_no_row_are_refused_permanently() {
         (vec![], "bytes that are no row"),
         (vec![4], "bytes that are no row"),
         (vec![META], "a truncated metadata row"),
+        (vec![VERSIONED_META], "a truncated metadata row"),
+        (vec![VERSIONED_META, 1], "a truncated metadata row"),
         (vec![META, 1, 0, 0, 0, 1, 9], "bytes that are no property"),
         (vec![META, 1, 0, 0, 0, 1, 1, 7], "a key part's direction is 0 or 1"),
         (vec![META, 1, 0, 0, 0, 1, 1, 0, 42], "a key part's value type is unknown"),

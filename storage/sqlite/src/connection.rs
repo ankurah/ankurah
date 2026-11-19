@@ -48,6 +48,7 @@ impl SqliteConnectionManager {
              PRAGMA temp_store=MEMORY;",
         )?;
         crate::id_bytes::register(&conn)?;
+        crate::order_keys::register(&conn)?;
 
         Ok(conn)
     }

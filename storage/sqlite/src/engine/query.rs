@@ -2,9 +2,9 @@ use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_core::{error::RetrievalError, storage::StorageEngine};
 use ankurah_proto::{Attested, EntityId, EntityState, PropertyId};
 use ankurah_storage_common::{
-    materialization_join::{MaterializationJoin, MaterializationTable},
+    materialization_join::{property_column, MaterializationJoin, MaterializationTable},
     materialization_plan::MaterializationPlan,
-    selection::{deterministic_limit_order, select_states},
+    selection::StateSelection,
 };
 
 use super::{load_states, SqliteStorageEngine, ENTITY_TABLE};
@@ -22,7 +22,7 @@ pub(super) struct Query {
 
 impl Query {
     pub async fn prepare(engine: &SqliteStorageEngine, selection: &Selection<Resolved>) -> Result<Self, RetrievalError> {
-        let selection = deterministic_limit_order(selection);
+        let selection = ankql::selection::deterministic_order(selection);
         let plan = MaterializationPlan::new(&selection);
         let properties: Vec<_> = selection.referenced_properties().into_iter().collect();
         let existing = engine.list_materializations().await?;
@@ -45,13 +45,33 @@ impl Query {
             split.sql_predicate = Predicate::True;
             split.remaining_predicate = selection.predicate.clone();
         }
+        let mut order_types = std::collections::BTreeMap::new();
+        let mut native_order = true;
+        for part in selection.order_by.as_deref().unwrap_or_default() {
+            let value_type = if part.path.subpath.is_empty() {
+                ankurah_core::selection::ordering::property_value_type(engine, part.path.property_id()).await?
+            } else {
+                Some(ankurah_core_types::ValueType::Json)
+            };
+            if let Some(value_type) = value_type {
+                order_types.insert(part.path.property_id(), value_type);
+            } else {
+                native_order = false;
+            }
+            // SQLite materializes NaN as SQL NULL. Its REAL column cannot
+            // distinguish it from an absent value, while canonical state can.
+            native_order &= value_type != Some(ankurah_core_types::ValueType::F64);
+        }
         let pushed = Selection {
             predicate: split.sql_predicate.clone(),
-            order_by: selection.order_by.clone(),
-            limit: if split.needs_post_filter() { None } else { selection.limit },
+            order_by: native_order.then(|| selection.order_by.clone()).flatten(),
+            limit: if split.needs_post_filter() || !native_order { None } else { selection.limit },
         };
+        let lowered = join.lower(&pushed);
+        let types = order_types.into_iter().map(|(property, ty)| (property_column(&property), ty)).collect();
         let mut builder = SqlBuilder::new();
-        builder.selection(&join.lower(&pushed)).map_err(SqliteError::from)?;
+        builder.order_types(types);
+        builder.selection(&lowered).map_err(SqliteError::from)?;
         let (predicate_sql, params) = builder.build_where_clause();
         Ok(Self {
             sql: format!(
@@ -59,7 +79,11 @@ impl Query {
                 join.sql(ENTITY_TABLE, &properties, &plan.models)
             ),
             params,
-            remaining: Selection { predicate: split.remaining_predicate, order_by: None, limit: selection.limit },
+            remaining: Selection {
+                predicate: split.remaining_predicate,
+                order_by: if native_order { None } else { selection.order_by.clone() },
+                limit: selection.limit,
+            },
         })
     }
 
@@ -72,7 +96,13 @@ impl Query {
     /// Execute the same query and post-filter inside the caller's read boundary.
     pub(super) fn states_in(&self, connection: &rusqlite::Connection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let ids = self.read_ids(connection)?;
-        select_states(load_states(connection, &ids)?, &self.remaining)
+        let mut selected = StateSelection::new(&self.remaining);
+        for ids in ids.chunks(256) {
+            for state in load_states(connection, ids)? {
+                selected.push(state)?;
+            }
+        }
+        Ok(selected.finish())
     }
 
     pub async fn states(self, engine: &SqliteStorageEngine) -> Result<Vec<Attested<EntityState>>, RetrievalError> {

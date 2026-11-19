@@ -116,7 +116,7 @@ impl<M: OrderedMap> Owner<M::Key, M::Value> for Locked<M> {
 /// A metadata row holding `n`, so that rows tell apart.
 macro_rules! row {
     ($n:expr) => {
-        Row::Meta(Meta { key_spec: KeySpec::new(Vec::new()), group: $n })
+        Row::Meta(Meta { key_spec: KeySpec::new(Vec::new()), group: $n, key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION })
     };
 }
 

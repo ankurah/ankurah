@@ -3,8 +3,8 @@
 //! A row key is a tag byte for its kind, then its body: nothing for the
 //! metadata, a node prefix's order-preserving encoding, or an address's raw
 //! bytes. The tags rise in the order the kinds are declared, so encoded
-//! keys sort as the keys do. A row begins with the same tag as its key, so a
-//! row decodes without its key.
+//! keys sort as the keys do. Each row's own tag also identifies its layout;
+//! current metadata has a distinct tag so legacy keys remain recognizable.
 
 mod key_spec;
 
@@ -14,10 +14,12 @@ use super::{Encode, LeafRow, Meta, NodeRow, Row, RowKey};
 use crate::digest::{decode_stored_element, encode_stored_element, stored_element_len};
 use crate::{Digest, DigestGroup, NodePrefix, StoreError};
 
-/// The tag of each kind of row, which begins its key's encoding and its own.
+/// Row-key tags. The original metadata value also used META; new metadata
+/// values use VERSIONED_META to distinguish their additional version field.
 const META: u8 = 0;
 const NODE: u8 = 1;
 const LEAF: u8 = 2;
+const VERSIONED_META: u8 = 3;
 
 /// The byte after a node row's digest that says whether the node is a bucket
 /// or branches, and so whether a prefix follows. The root's children may
@@ -56,7 +58,7 @@ fn tagged(tag: u8, body: &[u8]) -> Vec<u8> {
 
 /// A row's layout after its tag:
 ///
-/// - metadata: the group's identifier, then the key spec's encoding;
+/// - metadata: the group's identifier, key-encoding version, then key spec;
 /// - a node: the digest's stored form, then a byte that says whether the node
 ///   is a bucket or branches, and for a branch the encoding of the prefix its
 ///   children share;
@@ -65,7 +67,7 @@ impl<K: Encode, L: Encode, G: DigestGroup> Encode for Row<K, L, G> {
     fn encode(&self) -> Vec<u8> {
         match self {
             Row::Meta(meta) => {
-                let mut bytes = vec![META, meta.group];
+                let mut bytes = vec![VERSIONED_META, meta.group, meta.key_encoding];
                 bytes.extend_from_slice(&meta.key_spec.encode());
 
                 bytes
@@ -100,7 +102,8 @@ impl<K: Encode, L: Encode, G: DigestGroup> Encode for Row<K, L, G> {
 
     fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
         match bytes.split_first() {
-            Some((&META, body)) => decode_meta(body).map(Row::Meta),
+            Some((&META, body)) => decode_meta(body, false).map(Row::Meta),
+            Some((&VERSIONED_META, body)) => decode_meta(body, true).map(Row::Meta),
 
             Some((&NODE, body)) => decode_node(body).map(Row::Node),
 
@@ -130,9 +133,15 @@ fn decode_node<G: DigestGroup>(body: &[u8]) -> Result<NodeRow<G>, StoreError> {
     Ok(NodeRow { digest, branches_at })
 }
 
-fn decode_meta<K: Encode>(body: &[u8]) -> Result<Meta<K>, StoreError> {
+fn decode_meta<K: Encode>(body: &[u8], versioned: bool) -> Result<Meta<K>, StoreError> {
     let (&group, key_spec) = body.split_first().ok_or_else(|| StoreError::permanent("a truncated metadata row"))?;
-    Ok(Meta { key_spec: KeySpec::decode(key_spec)?, group })
+    let (key_encoding, key_spec) = if versioned {
+        let (&version, key_spec) = key_spec.split_first().ok_or_else(|| StoreError::permanent("a truncated metadata row"))?;
+        (version, key_spec)
+    } else {
+        (1, key_spec)
+    };
+    Ok(Meta { key_spec: KeySpec::decode(key_spec)?, group, key_encoding })
 }
 
 #[cfg(test)]

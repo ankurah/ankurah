@@ -300,9 +300,15 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
 
 fn missing_or_invalid(error: &RetrievalError) -> bool {
     match error {
-        RetrievalError::StorageError(error) => error
-            .downcast_ref::<crate::sync::Error>()
-            .is_some_and(|error| matches!(error, crate::sync::Error::NoSuchTree(_) | crate::sync::Error::Invalid(_))),
+        RetrievalError::StorageError(error) => {
+            error
+                .downcast_ref::<crate::sync::Error>()
+                .is_some_and(|error| matches!(error, crate::sync::Error::NoSuchTree(_) | crate::sync::Error::Invalid(_)))
+                || matches!(
+                    error.downcast_ref::<ankurah_digest_tree::Error>(),
+                    Some(ankurah_digest_tree::Error::WrongKeyEncoding { found: 1 })
+                )
+        }
         _ => false,
     }
 }

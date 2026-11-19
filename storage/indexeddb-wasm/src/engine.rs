@@ -311,7 +311,7 @@ impl StorageEngine for IndexedDBStorageEngine {
         &self,
         selection: &ankql::ast::Selection<ankql::ast::Resolved>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let selection = ankurah_storage_common::selection::deterministic_limit_order(selection);
+        let selection = ankql::selection::deterministic_order(selection);
         let plan = ankurah_storage_common::materialization_plan::MaterializationPlan::new(&selection);
         if let Some((model, selection)) = plan.indexed_materialization() {
             if registered_materialization_name(&self.db, &model).await?.is_none() {

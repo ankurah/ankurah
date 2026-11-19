@@ -330,9 +330,11 @@ async fn reset_during_selection_is_retryable(
     let locked = if before_boundary { ENTITY_TABLE } else { &table };
     blocker.batch_execute(&format!(r#"BEGIN; LOCK TABLE "{locked}" IN ACCESS EXCLUSIVE MODE"#)).await?;
     let mut opening = Box::pin(engine.state_snapshot(StateScan::Selection(selection)));
-    let waiting_query = if before_boundary { "%LOCK TABLE%_ankurah_entity%IN ACCESS SHARE MODE%" } else { "SELECT \"id\" FROM (%" };
+    // Resolving an ORDER BY property's type can read canonical state while
+    // preparing the query, before the explicit source-boundary lock.
+    let waiting_query = if before_boundary { "%_ankurah_entity%" } else { "SELECT \"id\" FROM (%" };
     tokio::select! {
-        result = &mut opening => panic!("snapshot did not wait after preparing its query: {:?}", result.err()),
+        result = &mut opening => panic!("snapshot did not wait for its source query: {:?}", result.err()),
         result = query_waiters(&inspector, 1, waiting_query) => result?,
     }
     // Reset can retire planned names either before the source boundary is

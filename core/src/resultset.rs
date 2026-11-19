@@ -1,7 +1,8 @@
-use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
+use crate::indexing::KeySpec;
 use crate::internal::prelude::*;
 use crate::model::ComponentViews;
 use crate::reactor::AbstractEntity;
+use crate::value::{Value, ValueExt};
 use ankql::ast::PropertyId;
 use ankurah_proto as proto;
 use ankurah_signals::{
@@ -10,6 +11,7 @@ use ankurah_signals::{
     subscribe::IntoSubscribeListener,
     CurrentObserver, Get, Peek, Signal, Subscribe, SubscriptionGuard,
 };
+use smallvec::SmallVec;
 use std::{
     collections::HashMap,
     ops::Deref,
@@ -18,32 +20,6 @@ use std::{
         Arc,
     },
 };
-
-/// Efficient storage for sort keys - uses fixed array for small keys, Vec for larger ones
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum IVec {
-    /// Keys <= 16 bytes stored in zero-padded fixed array
-    Small([u8; 16]),
-    /// Keys > 16 bytes stored in Vec
-    Large(Vec<u8>),
-}
-
-impl IVec {
-    /// Create from byte slice
-    fn from_slice(bytes: &[u8]) -> Self {
-        if bytes.len() <= 16 {
-            let mut data = [0u8; 16];
-            data[..bytes.len()].copy_from_slice(bytes);
-            Self::Small(data)
-        } else {
-            Self::Large(bytes.to_vec())
-        }
-    }
-}
-
-impl From<Vec<u8>> for IVec {
-    fn from(vec: Vec<u8>) -> Self { Self::from_slice(&vec) }
-}
 
 #[derive(Debug, Clone)]
 pub struct EntityResultSet<E: AbstractEntity = Entity>(Arc<Inner<E>>);
@@ -88,7 +64,7 @@ struct State<E: AbstractEntity> {
 #[derive(Debug, Clone)]
 struct EntityEntry<E: AbstractEntity> {
     entity: E,
-    sort_key: Option<IVec>,
+    sort_key: Option<SmallVec<[u8; 16]>>,
     dirty: bool,
 }
 // TODO - figure out how to maintain ordering of entities
@@ -313,26 +289,24 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         self.changed = true;
     }
 
-    /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &KeySpec<PropertyId>) -> IVec {
-        let mut values = Vec::new();
-
-        // Extract values for each key part
-        for keypart in &key_spec.keyparts {
-            let value = AbstractEntity::value(entity, &keypart.key);
-            // TODO: Handle NULLs properly - for now we'll get encoding errors on NULLs
-            // which will cause unwrap_or_default() to return empty key (sorts first)
-            if let Some(v) = value {
-                values.push(v);
-            } else {
-                // Skip this entity for now if any field is NULL
-                return IVec::from_slice(&[]); // Empty key sorts first
+    /// Use the same nullable, direction-aware components as digest-tree keys.
+    fn compute_sort_key(entity: &E, key_spec: &KeySpec<PropertyId>) -> SmallVec<[u8; 16]> {
+        let mut encoded = Vec::new();
+        for part in &key_spec.keyparts {
+            let value = AbstractEntity::value(entity, &part.key);
+            let value = match &part.sub_path {
+                None => value,
+                Some(path) => value.and_then(|value| value.json_order_at_path(path)).map(Value::Json),
+            };
+            // The initial result can be empty, so Reactor's inferred type may
+            // precede the first value. Encode the actual canonical value type.
+            let mut part = part.clone();
+            if let Some(value) = &value {
+                part.value_type = value.value_type();
             }
+            ankurah_core_types::ordering::append_key_part(&part, value.as_ref(), &mut encoded);
         }
-
-        // Encode the tuple - if this fails, return empty key (will sort first)
-        let encoded = encode_tuple_values_with_key_spec(&values, key_spec).unwrap_or_default();
-        IVec::from(encoded)
+        SmallVec::from_vec(encoded)
     }
 
     /// Set the loaded flag as part of this write transaction.
@@ -758,51 +732,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ivec_small_keys() {
-        // Test that small keys (<=16 bytes) use the Small variant
-        let small_key = IVec::from_slice(b"hello");
-        let another_small = IVec::from_slice(b"world");
-        let empty_key = IVec::from_slice(b"");
-
-        // Verify ordering works correctly with zero padding
-        assert!(small_key < another_small); // "hello" < "world"
-        assert!(empty_key < small_key); // empty sorts first
-
-        // Test that zero padding doesn't affect comparison
-        let key_ab = IVec::from_slice(b"ab");
-        let key_abc = IVec::from_slice(b"abc");
-        assert!(key_ab < key_abc); // "ab" < "abc" even with zero padding
-    }
-
-    #[test]
-    fn test_ivec_large_keys() {
-        // Test that large keys (>16 bytes) use the Large variant
-        let large_key = IVec::from_slice(&[1u8; 20]); // 20 bytes
-        let small_key = IVec::from_slice(&[1u8; 10]); // 10 bytes
-
-        // Verify they can be compared
-        assert!(small_key < large_key); // smaller array should sort first
-    }
-
-    #[test]
-    fn test_ivec_boundary() {
-        // Test the 16-byte boundary
-        let exactly_16 = IVec::from_slice(&[1u8; 16]);
-        let exactly_17 = IVec::from_slice(&[1u8; 17]);
-
-        // Both should work and be comparable
-        assert!(exactly_16 < exactly_17);
-
-        // Verify 16-byte keys use Small variant (this is implicit in the implementation)
-        match exactly_16 {
-            IVec::Small(_) => (), // Expected
-            IVec::Large(_) => panic!("16-byte key should use Small variant"),
-        }
-
-        match exactly_17 {
-            IVec::Large(_) => (), // Expected
-            IVec::Small(_) => panic!("17-byte key should use Large variant"),
-        }
+    fn sort_keys_compare_bytes_across_inline_and_heap_storage() {
+        let keys: Vec<SmallVec<[u8; 16]>> = [b"z".as_slice(), &[1; 17], b"a", b"a\0"].into_iter().map(SmallVec::from_slice).collect();
+        assert!(keys[0] > keys[1]);
+        assert!(keys[2] < keys[3]);
     }
 }
 

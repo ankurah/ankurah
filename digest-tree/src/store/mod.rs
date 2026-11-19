@@ -243,11 +243,18 @@ pub struct NodeRow<G: DigestGroup> {
     pub(crate) branches_at: Option<NodePrefix>,
 }
 
-/// The tree's metadata row: its key spec and the digest group its sums use.
+/// The tree's metadata row: its key spec, key encoding and digest group.
 #[derive(Clone, Debug)]
 pub struct Meta<K> {
     pub(crate) key_spec: KeySpec<K>,
     pub(crate) group: u8,
+    pub(crate) key_encoding: u8,
+}
+
+impl<K> Meta<K> {
+    /// Version of the persisted ordered keys. Legacy version 1 used JSON text
+    /// ordering; the current version is [`ankurah_core_types::ordering::KEY_ENCODING_VERSION`].
+    pub fn key_encoding(&self) -> u8 { self.key_encoding }
 }
 
 /// A member's row: its payload, and its element in the tree's group.

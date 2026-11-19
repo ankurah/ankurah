@@ -5,7 +5,9 @@
 use crate::{error::SqliteError, id_bytes};
 use ankql::ast::{Comparison, ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core_types::Value;
+use ankurah_core_types::ValueType;
 use ankurah_storage_common::{materialization_join::entity_id_bound, EngineColumns};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
@@ -133,6 +135,7 @@ pub struct SqlBuilder {
     params: Vec<rusqlite::types::Value>,
     fields: Vec<String>,
     table_name: Option<String>,
+    order_types: BTreeMap<String, ValueType>,
 }
 
 impl Default for SqlBuilder {
@@ -140,10 +143,20 @@ impl Default for SqlBuilder {
 }
 
 impl SqlBuilder {
-    pub fn new() -> Self { Self { sql: String::new(), params: Vec::new(), fields: Vec::new(), table_name: None } }
+    pub fn order_types(&mut self, types: BTreeMap<String, ValueType>) { self.order_types = types; }
+
+    pub fn new() -> Self {
+        Self { sql: String::new(), params: Vec::new(), fields: Vec::new(), table_name: None, order_types: BTreeMap::new() }
+    }
 
     pub fn with_fields<T: Into<String>>(fields: Vec<T>) -> Self {
-        Self { sql: String::new(), params: Vec::new(), fields: fields.into_iter().map(|f| f.into()).collect(), table_name: None }
+        Self {
+            sql: String::new(),
+            params: Vec::new(),
+            fields: fields.into_iter().map(|f| f.into()).collect(),
+            table_name: None,
+            order_types: BTreeMap::new(),
+        }
     }
 
     pub fn table_name(&mut self, name: impl Into<String>) -> &mut Self {
@@ -326,28 +339,28 @@ impl SqlBuilder {
     }
 
     pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
-        // Use -> for multi-step sort paths.
         if order_by.path.is_simple() && order_by.path.column == "id" {
             // In `MaterializationJoin`'s projection, `id` is the entity id.
             self.push_sql(id_bytes::SQL);
-        } else if order_by.path.is_simple() {
+        } else if !order_by.path.subpath.is_empty() || self.order_types.get(&order_by.path.column) == Some(&ValueType::Json) {
+            let column = order_by.path.column.replace('"', "\"\"");
+            self.push_sql(&format!(r#"ankurah_json_order_key(json("{}"), "#, column));
+            self.push_param(rusqlite::types::Value::Text(
+                serde_json::to_string(&order_by.path.subpath).expect("JSON path strings serialize"),
+            ));
+            self.push_sql(")");
+        } else {
             // Single-step path: regular column reference
             let escaped = order_by.path.column.replace('"', "\"\"");
-            self.push_sql(&format!(r#""{}""#, escaped));
-        } else {
-            // Multi-step path: JSONB traversal using -> operator
-            let first = order_by.path.column.replace('"', "\"\"");
-            self.push_sql(&format!(r#""{}""#, first));
-
-            for step in &order_by.path.subpath {
-                let escaped = step.replace('\'', "''");
-                self.push_sql(&format!("->'{}'", escaped));
+            match self.order_types.get(&order_by.path.column) {
+                Some(ValueType::EntityId) => self.push_sql(&format!(r#"ankurah_id_bytes("{}")"#, escaped)),
+                _ => self.push_sql(&format!(r#""{}""#, escaped)),
             }
         }
 
         match order_by.direction {
-            OrderDirection::Asc => self.push_sql(" ASC"),
-            OrderDirection::Desc => self.push_sql(" DESC"),
+            OrderDirection::Asc => self.push_sql(" ASC NULLS LAST"),
+            OrderDirection::Desc => self.push_sql(" DESC NULLS FIRST"),
         }
 
         Ok(())
@@ -483,6 +496,6 @@ mod tests {
         sql.selection(&selection).unwrap();
         let (sql_string, _) = sql.build_where_clause();
 
-        assert_eq!(sql_string, r#"1=1 ORDER BY ankurah_id_bytes("id") DESC, "p_name" ASC"#);
+        assert_eq!(sql_string, r#"1=1 ORDER BY ankurah_id_bytes("id") DESC NULLS FIRST, "p_name" ASC NULLS LAST"#);
     }
 }

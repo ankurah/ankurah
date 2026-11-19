@@ -2,9 +2,9 @@ use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_core::{error::RetrievalError, storage::StorageEngine};
 use ankurah_proto::{Attested, EntityId, EntityState, PropertyId};
 use ankurah_storage_common::{
-    materialization_join::{MaterializationJoin, MaterializationTable},
+    materialization_join::{property_column, MaterializationJoin, MaterializationTable},
     materialization_plan::MaterializationPlan,
-    selection::{deterministic_limit_order, select_states},
+    selection::StateSelection,
 };
 use tokio_postgres::{types::ToSql, GenericClient};
 
@@ -21,9 +21,30 @@ pub(super) struct Query {
     remaining: Selection<Resolved>,
 }
 
+impl Postgres {
+    /// JSONB's comparator uses the database default collation internally;
+    /// an expression-level COLLATE cannot override it. Other engines and
+    /// digest keys implement its UTF-8, bytewise C/POSIX order.
+    async fn ensure_json_ordering(&self) -> Result<(), RetrievalError> {
+        self.json_ordering.get_or_try_init(|| async {
+            let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+            let row = client.query_one(
+                "SELECT current_setting('server_encoding'), datcollate, COALESCE(to_jsonb(d)->>'datlocprovider', 'c') FROM pg_database d WHERE datname = current_database()", &[],
+            ).await.map_err(RetrievalError::storage)?;
+            let encoding: &str = row.get(0);
+            let collation: &str = row.get(1);
+            let provider: &str = row.get(2);
+            if encoding != "UTF8" || provider != "c" || !matches!(collation, "C" | "POSIX" | "C.UTF-8" | "C.utf8") {
+                return Err(RetrievalError::storage("JSON ordering requires a UTF8 PostgreSQL database with libc C/POSIX collation"));
+            }
+            Ok(())
+        }).await.map(|_| ())
+    }
+}
+
 impl Query {
     pub async fn prepare(engine: &Postgres, selection: &Selection<Resolved>) -> Result<Self, RetrievalError> {
-        let selection = deterministic_limit_order(selection);
+        let selection = ankql::selection::deterministic_order(selection);
         let selection = selection.as_ref();
         let plan = MaterializationPlan::new(selection);
         let properties: Vec<_> = selection.referenced_properties().into_iter().collect();
@@ -47,13 +68,34 @@ impl Query {
             split.sql_predicate = Predicate::True;
             split.remaining_predicate = selection.predicate.clone();
         }
+        let mut order_types = std::collections::BTreeMap::new();
+        let mut native_order = true;
+        for part in selection.order_by.as_deref().unwrap_or_default() {
+            let value_type = if part.path.subpath.is_empty() {
+                ankurah_core::selection::ordering::property_value_type(engine, part.path.property_id()).await?
+            } else {
+                Some(ankurah_core_types::ValueType::Json)
+            };
+            if let Some(value_type) = value_type {
+                order_types.insert(part.path.property_id(), value_type);
+            } else {
+                native_order = false;
+            }
+        }
         let pushed = Selection {
             predicate: split.sql_predicate.clone(),
-            order_by: selection.order_by.clone(),
-            limit: if split.needs_post_filter() { None } else { selection.limit },
+            order_by: native_order.then(|| selection.order_by.clone()).flatten(),
+            limit: if split.needs_post_filter() || !native_order { None } else { selection.limit },
         };
+        let lowered = join.lower(&pushed);
+        let types: std::collections::BTreeMap<_, _> =
+            order_types.into_iter().map(|(property, ty)| (property_column(&property), ty)).collect();
+        if lowered.order_by.iter().flatten().any(|part| types.get(&part.path.column) == Some(&ankurah_core_types::ValueType::Json)) {
+            engine.ensure_json_ordering().await?;
+        }
         let mut builder = SqlBuilder::new();
-        builder.selection(&join.lower(&pushed))?;
+        builder.order_types(types);
+        builder.selection(&lowered)?;
         let (predicate_sql, params) = builder.build_where_clause();
         Ok(Self {
             sql: format!(
@@ -61,7 +103,11 @@ impl Query {
                 join.sql(ENTITY_TABLE, &properties, &plan.models)
             ),
             params,
-            remaining: Selection { predicate: split.remaining_predicate, order_by: None, limit: selection.limit },
+            remaining: Selection {
+                predicate: split.remaining_predicate,
+                order_by: if native_order { None } else { selection.order_by.clone() },
+                limit: selection.limit,
+            },
         })
     }
 
@@ -86,7 +132,13 @@ impl Query {
     /// Run the prepared query and hydrate its states in the caller's read view.
     pub(super) async fn states_in<C: GenericClient + Sync>(&self, snapshot: &C) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let ids = self.read_ids(snapshot).await?;
-        select_states(load_states(snapshot, &ids).await?, &self.remaining)
+        let mut selected = StateSelection::new(&self.remaining);
+        for ids in ids.chunks(256) {
+            for state in load_states(snapshot, ids).await? {
+                selected.push(state)?;
+            }
+        }
+        Ok(selected.finish())
     }
 }
 

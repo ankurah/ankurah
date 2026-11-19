@@ -16,6 +16,7 @@ mod cache;
 mod cancellation;
 mod damage;
 mod failures;
+mod key_migration;
 
 /// A tree of items on the test engine, summed in the group `G`.
 type Tree<G> = fixtures::Tree<TestStorage, G>;

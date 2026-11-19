@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ankurah_core_types::key_spec::KeySpec;
-use ankurah_digest_tree::{Created, DigestGroup, DigestTree, Encode, Member, MemberId, Payload};
+use ankurah_digest_tree::{Created, DigestGroup, DigestTree, Encode, Member, MemberId, Payload, Row, RowKey};
 
 use super::StorageCache;
 use super::{EngineAdapter, Inner, StorageEngineTrx};
 use crate::error::{MutationError, RetrievalError};
-use crate::storage::{MapSnapshot, MapWrite, StorageEngine, StorageTransaction};
+use crate::storage::{MapRead, MapSnapshot, MapWrite, StorageEngine, StorageTransaction};
 use crate::sync::error::{change_failure, open_failure};
 use crate::sync::storage_adapter::guard::PoisonGuard;
 use crate::sync::storage_adapter::layout::entry;
@@ -101,7 +101,7 @@ where
     replace(storage, cache, trx, id, key_spec, members, false).await
 }
 
-/// Initialize a missing or invalid managed tree. A concurrent completed or
+/// Initialize a missing, invalid or legacy-key managed tree. A concurrent completed or
 /// partial build wins; it must never be replaced by an earlier observation.
 pub(in crate::sync) async fn initialize<SE, K, I, L, G, M>(
     storage: Arc<SE>,
@@ -144,8 +144,20 @@ where
 
     let found = trx.map_lock_and_read(&[id.lock()], vec![entry::read([&id])]).await?;
     let previous = entry::found_one(&id, found)?;
-    if only_invalid && previous.is_some_and(|entry| entry.status != entry::Status::Invalid) {
-        return Err(MutationError::WriteConflict);
+    if only_invalid {
+        if let Some(entry) = previous.filter(|entry| entry.status != entry::Status::Invalid) {
+            // Check the encoding while holding the same lock as replacement.
+            // A concurrent builder that already migrated the tree wins.
+            let found = trx.map_read(vec![MapRead::Get { map: entry.incarnation.rows(), keys: vec![RowKey::Meta.encode()] }]).await?;
+            let bytes = super::rows::got(found, 1).map_err(|error| change_failure(error.into()))?.pop().flatten();
+            let row = bytes
+                .map(|bytes| super::rows::decode_row::<K, L, G>(&id, &bytes))
+                .transpose()
+                .map_err(|error| change_failure(error.into()))?;
+            if !matches!(row, Some(Row::Meta(meta)) if meta.key_encoding() == 1) {
+                return Err(MutationError::WriteConflict);
+            }
+        }
     }
     let incarnation = previous.map_or_else(Incarnation::mint, |entry| entry.incarnation);
     if previous.is_some() {

@@ -38,8 +38,11 @@ where
         let mut rows = self.read().await?;
         let meta = rows.meta().await?.ok_or(Error::Inconsistent("the tree has no metadata row"))?;
 
-        if meta.group != G::ROW_VERSION || meta.key_spec != self.inner.key_spec {
-            return Err(Error::Inconsistent("the metadata row names another group or key spec"));
+        if meta.group != G::ROW_VERSION
+            || meta.key_spec != self.inner.key_spec
+            || meta.key_encoding != ankurah_core_types::ordering::KEY_ENCODING_VERSION
+        {
+            return Err(Error::Inconsistent("the metadata row names another group, key spec or key encoding"));
         }
 
         let mut trie = Trie::new(&mut rows);

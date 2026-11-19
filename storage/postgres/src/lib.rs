@@ -1,3 +1,11 @@
+//! PostgreSQL storage for canonical entity state and query materializations.
+//!
+//! Ordered text uses C collation. JSON ordering additionally requires a UTF8
+//! database initialized with libc C/POSIX collation, because PostgreSQL's JSONB
+//! comparator uses the database default internally. Other configurations are
+//! rejected for JSON ordering rather than returning a different LIMIT window
+//! from the other engines or a digest tree.
+
 use ankql::ast::Resolved;
 use ankurah_core::util::safemap::SafeMap;
 use ankurah_storage_common::naming;
@@ -98,6 +106,7 @@ pub struct Postgres {
     resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// Whether this instance created the shared tables since opening or since its last `delete_all`.
     shared_tables_ready: AtomicBool,
+    json_ordering: tokio::sync::OnceCell<()>,
     /// The connections that serve map calls: each storage transaction's from
     /// its first map call to its end, each snapshot's, and each reset's.
     maps: Arc<maps::Pool>,
@@ -123,6 +132,7 @@ impl Postgres {
             materializations: SafeMap::new(),
             resolver: Arc::new(RwLock::new(None)),
             shared_tables_ready: AtomicBool::new(false),
+            json_ordering: tokio::sync::OnceCell::new(),
         };
         engine.check_protocol_version().await?;
         Ok(engine)

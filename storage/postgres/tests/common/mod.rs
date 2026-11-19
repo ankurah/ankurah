@@ -6,7 +6,7 @@ use anyhow::Result;
 use bb8_postgres::PostgresConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 use tracing::Level;
 
@@ -42,11 +42,17 @@ pub async fn create_postgres_container() -> Result<(ContainerAsync<postgres::Pos
 /// Start a test PostgreSQL server and retain a pool for inspecting the
 /// engine-private physical schema.
 pub async fn create_postgres_container_with_pool() -> Result<(ContainerAsync<postgres::Postgres>, Postgres, TestPool)> {
+    create_postgres_container_with_locale("C").await
+}
+
+/// Select a database locale explicitly when testing the ordering contract.
+pub async fn create_postgres_container_with_locale(locale: &str) -> Result<(ContainerAsync<postgres::Postgres>, Postgres, TestPool)> {
     let container: ContainerAsync<postgres::Postgres> = postgres::Postgres::default()
         .with_db_name("ankurah")
         .with_user("postgres")
         .with_password("postgres")
         .with_init_sql(include_str!("../pg_init.sql").to_string().into_bytes())
+        .with_env_var("POSTGRES_INITDB_ARGS", format!("--locale={locale} --encoding=UTF8"))
         .start()
         .await
         .unwrap();

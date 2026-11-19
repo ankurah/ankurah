@@ -1,7 +1,9 @@
 use ankql::ast::{Comparison, ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core::error::RetrievalError;
 use ankurah_core_types::Value;
+use ankurah_core_types::ValueType;
 use ankurah_storage_common::{materialization_join::entity_id_bound, EngineColumns};
+use std::collections::BTreeMap;
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
@@ -171,6 +173,7 @@ pub struct SqlBuilder {
     expressions: Vec<SqlExpr>,
     fields: Vec<String>,
     table_name: Option<String>,
+    order_types: BTreeMap<String, ValueType>,
 }
 
 impl Default for SqlBuilder {
@@ -178,10 +181,17 @@ impl Default for SqlBuilder {
 }
 
 impl SqlBuilder {
-    pub fn new() -> Self { Self { expressions: Vec::new(), fields: Vec::new(), table_name: None } }
+    pub fn order_types(&mut self, types: BTreeMap<String, ValueType>) { self.order_types = types; }
+
+    pub fn new() -> Self { Self { expressions: Vec::new(), fields: Vec::new(), table_name: None, order_types: BTreeMap::new() } }
 
     pub fn with_fields<T: Into<String>>(fields: Vec<T>) -> Self {
-        Self { expressions: Vec::new(), fields: fields.into_iter().map(|f| f.into()).collect(), table_name: None }
+        Self {
+            expressions: Vec::new(),
+            fields: fields.into_iter().map(|f| f.into()).collect(),
+            table_name: None,
+            order_types: BTreeMap::new(),
+        }
     }
 
     pub fn table_name(&mut self, name: impl Into<String>) -> &mut Self {
@@ -399,15 +409,24 @@ impl SqlBuilder {
     }
 
     pub fn order_by_item(&mut self, order_by: &OrderByItem<EngineColumns>) -> Result<(), SqlGenerationError> {
-        if !order_by.path.subpath.is_empty() {
-            return Err(SqlGenerationError::UnsupportedExpression("JSON paths are not supported in ORDER BY"));
-        }
-        if order_by.path.column == "id" {
+        if order_by.path.is_simple() && order_by.path.column == "id" {
             // In `MaterializationJoin`'s projection, `id` is the entity id.
             self.sql(id_bytes::SQL);
         } else {
             let column = order_by.path.column.replace('"', "\"\"");
-            self.sql(format!(r#""{}""#, column));
+            if order_by.path.is_simple() && self.order_types.get(&order_by.path.column) == Some(&ValueType::EntityId) {
+                self.sql(format!(r#"decode(translate("{}", '-_', '+/') || '=', 'base64')"#, column));
+            } else {
+                self.sql(format!(r#""{}""#, column));
+            }
+            if !order_by.path.subpath.is_empty() {
+                // Preserve JSONB types and bind path components as data.
+                self.sql(" #> ");
+                self.arg(order_by.path.subpath.clone());
+                self.sql("::text[]");
+            } else if self.order_types.get(&order_by.path.column) == Some(&ValueType::String) {
+                self.sql(" COLLATE \"C\"");
+            }
         }
 
         // Add the direction
@@ -615,12 +634,15 @@ mod tests {
     }
 
     #[test]
-    fn order_by_rejects_json_subpaths() {
+    fn order_by_json_subpaths_preserves_jsonb_values_and_binds_the_path() {
         let mut path = ColumnPath::simple("data");
-        path.subpath.push("name".into());
+        path.subpath.extend(["profile".into(), "na'me".into()]);
         let item = OrderByItem { path, direction: OrderDirection::Asc };
-        let mut sql = SqlBuilder::with_fields(vec!["id"]);
-        assert!(matches!(sql.order_by_item(&item), Err(SqlGenerationError::UnsupportedExpression(_))));
+        let mut sql = SqlBuilder::new();
+        sql.order_by_item(&item).unwrap();
+        let (expression, params) = sql.build_where_clause();
+        assert_eq!(expression, r#""data" #> $1::text[] ASC"#);
+        assert_eq!(params.len(), 1);
     }
 
     #[test]

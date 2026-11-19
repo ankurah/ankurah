@@ -160,6 +160,20 @@ pub async fn check_indexed(engine: &impl StorageEngine) -> anyhow::Result<()> {
     engine.set_catalog_resolver(Arc::downgrade(&labels));
     let [a, b] = [101, 102].map(|byte| ModelId::EntityId(id(byte)));
     let p = PropertyId::EntityId(id(201));
+    // A native ordered index needs the canonical type, not a type guessed
+    // from the predicate literal. Normal schema creation supplies this record.
+    use ankurah_proto::{SystemModel, SystemProperty};
+    write(
+        engine,
+        201,
+        &[ModelId::System(SystemModel::Property)],
+        &[
+            (PropertyId::System(SystemProperty::Name), "value"),
+            (PropertyId::System(SystemProperty::Backend), "lww"),
+            (PropertyId::System(SystemProperty::ValueType), "string"),
+        ],
+    )
+    .await?;
     write(engine, 1, &[a], &[(p, "a")]).await?;
     write(engine, 2, &[b], &[(p, "b")]).await?;
     write(engine, 3, &[a, b], &[(p, "c")]).await?;

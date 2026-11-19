@@ -11,7 +11,7 @@ use std::ops::{Bound, RangeBounds};
 use serde::{Deserialize, Serialize};
 
 pub use address::leaf_address;
-pub(crate) use address::{address_of, frame_into, key_prefix, split_address};
+pub(crate) use address::{address_of, key_prefix, split_address};
 pub use digest::SpanDigest;
 pub use prefix::NodePrefix;
 

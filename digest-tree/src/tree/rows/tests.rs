@@ -17,7 +17,8 @@ type TestRow = Row<Property, Tag, Ristretto255>;
 fn a_row_of_another_kind_than_its_key_is_inconsistent() {
     let store = MemoryStore::<RowKey, TestRow>::new();
     let mut trx = block_on(store.begin());
-    let metadata = Row::Meta(Meta { key_spec: KeySpec::new(vec![]), group: 1 });
+    let metadata =
+        Row::Meta(Meta { key_spec: KeySpec::new(vec![]), group: 1, key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION });
     block_on(trx.write(vec![WriteItem::Put(RowKey::Node(NodePrefix::root()), metadata)])).unwrap();
     block_on(trx.commit()).unwrap();
 

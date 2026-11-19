@@ -147,12 +147,12 @@ impl Planner {
             return None;
         }
 
-        // Keep later ORDER BY keys out of the index when the primary key must sort in memory:
-        // IndexedDB indexes omit records missing an indexed field.
-        let index_ordered = match self.config.index_orders_primary_key_by_value {
-            true => order_by.len(),
-            false => order_by.iter().position(|item| item.path.is_simple() && item.path.column == primary_key).unwrap_or(order_by.len()),
-        };
+        // Stop at the first key this index cannot order. Later keys cannot
+        // establish a prefix, and adding them would make a sparse index omit rows.
+        let index_ordered = order_by
+            .iter()
+            .position(|item| !item.path.is_simple() || (!self.config.index_orders_primary_key_by_value && item.path.column == primary_key))
+            .unwrap_or(order_by.len());
         let (index_ordered, sorted_in_memory) = order_by.split_at(index_ordered);
 
         // Keyparts: EQ prefix (using asc_path for multi-step path support)
@@ -243,7 +243,7 @@ impl Planner {
                     }
                 }
             }
-            spill.extend(sorted_in_memory.iter().filter(|item| item.path.is_simple()).cloned());
+            spill.extend_from_slice(sorted_in_memory);
             OrderByComponents::new(presort, spill)
         } else {
             OrderByComponents::new(index_ordered.to_vec(), sorted_in_memory.to_vec())
@@ -307,25 +307,9 @@ impl Planner {
             }
         };
 
-        // Build OrderByComponents: presort (EQ columns + pivot) and spill (everything else)
-        // EQ columns are constant so ORDER BY direction doesn't matter for them.
-        // Pivot column ordering depends on scan direction matching ORDER BY direction.
-        let mut covered = std::collections::HashSet::new();
-        covered.extend(equalities.iter().map(|(f, _)| f.as_str()));
-        covered.insert(primary.0);
-        let mut presort = Vec::new();
-        let mut spill = Vec::new();
-        for item in order_by {
-            if item.path.is_simple() {
-                let name = item.path.column.as_str();
-                if covered.contains(name) {
-                    presort.push(item.clone());
-                } else {
-                    spill.push(item.clone());
-                }
-            }
-        }
-        let order_by = OrderByComponents::new(presort, spill);
+        // A range pivot is not necessarily the leading ORDER BY key, or in
+        // its requested direction. Keep the whole order for the fallback sort.
+        let order_by = OrderByComponents::new(Vec::new(), order_by.to_vec());
 
         Some(Plan::Index {
             index_spec: KeySpec::new(index_keyparts),
@@ -410,26 +394,7 @@ impl Planner {
 
         let remaining_predicate = self.calculate_remaining_predicate(conjuncts, &bounds);
 
-        // Build OrderByComponents: presort (EQ + inequality) and spill (rest)
-        let order_by_spill = if let Some(order_by_items) = order_by {
-            let covered_fields: std::collections::HashSet<&str> =
-                equalities.iter().map(|(f, _)| f.as_str()).chain(std::iter::once(inequality_field)).collect();
-            let mut presort = Vec::new();
-            let mut spill = Vec::new();
-            for item in order_by_items {
-                if item.path.is_simple() {
-                    let name = item.path.column.as_str();
-                    if covered_fields.contains(name) {
-                        presort.push(item.clone());
-                    } else {
-                        spill.push(item.clone());
-                    }
-                }
-            }
-            OrderByComponents::new(presort, spill)
-        } else {
-            OrderByComponents::default()
-        };
+        let order_by_spill = OrderByComponents::new(Vec::new(), order_by.unwrap_or_default().to_vec());
 
         let index_spec = KeySpec::new(index_keyparts);
         Some(Plan::Index { index_spec, scan_direction: ScanDirection::Forward, bounds, remaining_predicate, order_by_spill })
@@ -967,6 +932,32 @@ mod tests {
                 &|model| *model.as_id().expect("model ID in physical-column fixture"),
             )
         };
+    }
+
+    #[test]
+    fn json_path_and_every_following_key_are_sorted_together() {
+        let mut selection: ankql::ast::Selection<EngineColumns> = selection!("active = true ORDER BY document, id");
+        selection.order_by.as_mut().unwrap()[0].path.subpath.push("rank".into());
+        for config in [PlannerConfig::full_support(), PlannerConfig::indexeddb()] {
+            let plans = Planner::new(config).plan(&selection, "id");
+            let Plan::Index { index_spec, order_by_spill, .. } = &plans[0] else { panic!("expected equality candidate index") };
+            assert_eq!(index_spec.keyparts.len(), 1);
+            assert_eq!(index_spec.keyparts[0].key, "active");
+            assert!(order_by_spill.presort.is_empty());
+            assert_eq!(order_by_spill.spill, selection.order_by.clone().unwrap());
+        }
+    }
+
+    #[test]
+    fn inequality_candidate_order_does_not_reorder_selection_keys() {
+        let selection = selection!("age > 10 ORDER BY name, age DESC");
+        let planner = Planner::new(PlannerConfig::full_support());
+        let conjuncts = ConjunctFinder::find(&selection.predicate);
+        let (equalities, inequalities) = planner.categorize_conjuncts_excluding_primary_key(&conjuncts, "id");
+        let plan = planner.build_ineq_first_plan(&equalities, &inequalities, selection.order_by.as_ref().unwrap(), &conjuncts).unwrap();
+        let Plan::Index { order_by_spill, .. } = plan else { panic!("expected inequality candidate index") };
+        assert!(order_by_spill.presort.is_empty());
+        assert_eq!(order_by_spill.spill, selection.order_by.unwrap());
     }
 
     // FIX_ME: rename to plan_indexeddb

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ankql::ast::{Resolved, Selection};
 use ankurah_core::error::RetrievalError;
 use ankurah_proto::{Attested, EntityId, EntityState};
-use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::select_states};
+use ankurah_storage_common::{materialization_plan::MaterializationPlan, selection::StateSelection};
 use futures::StreamExt;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::{JsCast, JsValue};
@@ -34,16 +34,16 @@ pub(crate) async fn fetch(database: &Database, selection: &Selection<Resolved>) 
             materializations.insert(model, ids);
         }
         let all = if plan.needs_all_entities() { entity_ids(&entities, "").await? } else { BTreeSet::new() };
-        let mut states = Vec::new();
+        let mut selected = StateSelection::new(selection);
         for id in plan.candidate_ids(&materializations, all) {
             let request = entities.get(&JsValue::from_str(&id.to_base64())).require("get joined entity")?;
             cb_future(&request, "success", "error").await.require("await joined entity")?;
             let value = request.result().require("get joined entity result")?;
             if !value.is_null() && !value.is_undefined() {
-                states.push(entity_state_from_object(id, &Object::new(value))?);
+                selected.push(entity_state_from_object(id, &Object::new(value))?)?;
             }
         }
-        select_states(states, selection)
+        Ok(selected.finish())
     })
     .await
 }

@@ -19,7 +19,7 @@ pub(crate) use self::fetch_gap::GapFetcher;
 use crate::{
     entity::Entity,
     error::{RetrievalError, SubscriptionError},
-    indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
+    indexing::{IndexDirection, IndexKeyPart, KeySpec},
     reactor::{subscription::ReactorSubInner, subscription_state::Subscription, watcherset::WatcherOp},
     resultset::EntityResultSet,
     selection::filter::Filterable,
@@ -262,7 +262,14 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
             ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
         };
 
-        keyparts.push(IndexKeyPart { key, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
+        keyparts.push(IndexKeyPart {
+            key,
+            sub_path: (!item.path.subpath.is_empty()).then(|| item.path.subpath.clone()),
+            direction,
+            value_type: if item.path.subpath.is_empty() { value_type } else { ValueType::Json },
+            nulls: None,
+            collation: None,
+        });
     }
 
     Ok(KeySpec { keyparts })

@@ -50,6 +50,37 @@ async fn a_consistent_tree_passes_with_its_counts() {
 }
 
 #[tokio::test]
+async fn another_key_encoding_requires_an_explicit_rebuild() {
+    for version in [1, u8::MAX] {
+        let tree = hundred().await;
+        let Row::Meta(mut meta) = row(&tree, RowKey::Meta).await else { panic!("metadata") };
+        meta.key_encoding = version;
+        tree.damage(vec![WriteItem::Put(RowKey::Meta, Row::Meta(meta))]).await;
+
+        assert!(matches!(ItemTree::<Ristretto255>::open(tree.store().clone()).await,
+            Err(Error::WrongKeyEncoding { found }) if found == version));
+        assert!(tree.audit().await.is_err());
+
+        let mut trx = tree.store().begin().await;
+        let result =
+            ItemTree::rebuild_in(tree.store().clone(), &mut trx, tree.key_spec().clone(), (0..100).map(|n| item!(n, n as i64, b"payload")))
+                .await;
+        if version != 1 {
+            assert!(matches!(result, Err(Error::WrongKeyEncoding { found }) if found == version));
+            trx.commit().await.unwrap();
+            let Row::Meta(meta) = row(&tree, RowKey::Meta).await else { panic!("metadata") };
+            assert_eq!(meta.key_encoding, version, "a future encoding is left unchanged");
+            continue;
+        }
+        let rebuilt = result.unwrap();
+        trx.commit().await.unwrap();
+        let rebuilt = rebuilt.landed();
+        assert_eq!(rebuilt.audit().await.unwrap().members, 100);
+        assert_eq!(ItemTree::<Ristretto255>::open(tree.store().clone()).await.unwrap().key_spec(), tree.key_spec());
+    }
+}
+
+#[tokio::test]
 async fn the_audit_catches_a_node_whose_digest_is_not_its_members_sum() {
     let tree = hundred().await;
     let nodes = tree.node_prefixes().await;
@@ -212,10 +243,18 @@ async fn the_audit_catches_metadata_of_another_group_or_spec() {
     fn identifier<G: DigestGroup>() -> u8 { G::ROW_VERSION }
 
     for meta in [
-        Meta { key_spec: KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), group: identifier::<crate::LtHash16>() },
-        Meta { key_spec: KeySpec::new(vec![]), group: identifier::<Ristretto255>() },
+        Meta {
+            key_spec: KeySpec::new(vec![asc!(Property::A, ValueType::I64)]),
+            group: identifier::<crate::LtHash16>(),
+            key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION,
+        },
+        Meta {
+            key_spec: KeySpec::new(vec![]),
+            group: identifier::<Ristretto255>(),
+            key_encoding: ankurah_core_types::ordering::KEY_ENCODING_VERSION,
+        },
     ] {
         let fault = fault_after(hundred().await, vec![WriteItem::Put(RowKey::Meta, Row::Meta(meta))]).await;
-        assert_eq!(fault, "the metadata row names another group or key spec");
+        assert_eq!(fault, "the metadata row names another group, key spec or key encoding");
     }
 }

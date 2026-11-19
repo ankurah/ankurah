@@ -99,11 +99,44 @@ fn a_key_range_names_no_more_parts_than_the_key_has() {
 }
 
 #[test]
-fn a_spec_that_names_a_collation_is_refused() {
+fn unsupported_collations_are_refused_but_c_and_posix_are_accepted() {
     let mut named = asc!(Property::A, ValueType::String);
     named.collation = Some("unicode".into());
 
     assert!(matches!(check_spec(&KeySpec::new(vec![ascending().keyparts[0].clone(), named])), Err(Error::Collation { part: 1 })));
+
+    for name in ["C", "POSIX"] {
+        let mut named: IndexKeyPart<Property> = asc!(Property::A, ValueType::String);
+        named.collation = Some(name.into());
+        check_spec(&KeySpec::new(vec![named])).unwrap();
+    }
+}
+
+#[test]
+fn json_ranges_use_numeric_equality_and_jsonb_order_in_both_directions() {
+    let json = |text: &str| Value::Json(serde_json::from_str(text).unwrap());
+    for direction in [IndexDirection::Asc, IndexDirection::Desc] {
+        let part: IndexKeyPart<Property> = IndexKeyPart { direction, ..asc!(Property::A, ValueType::Json) };
+        let key = |value: &str| {
+            let mut bytes = Vec::new();
+            encode_part(&part, Some(&json(value)), &mut bytes);
+            bytes
+        };
+        let spec = KeySpec::new(vec![part.clone()]);
+        let exact = span_for(&spec, &KeyRange::prefix([json("2.0")])).unwrap();
+        let range = span_for(&spec, &KeyRange::from(json("2")..json("10"))).unwrap();
+        for equivalent in ["2", "2.0", "20e-1"] {
+            let address = address_of(&key(equivalent), &Id(1).to_bytes());
+            assert!(exact.contains(&address));
+            assert!(range.contains(&address));
+        }
+        for outside in ["null", "\"2\"", "1", "10", "true", "[]", "{}"] {
+            let address = address_of(&key(outside), &Id(1).to_bytes());
+            assert!(!exact.contains(&address));
+            assert!(!range.contains(&address));
+        }
+        assert!(range.contains(&address_of(&key("9"), &Id(1).to_bytes())));
+    }
 }
 
 /// A part of `property` holding `I64`s, in `direction`, with `nulls`.

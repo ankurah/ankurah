@@ -1,19 +1,46 @@
 //! Open an exact Selection and reconcile its tree before serving it.
 
 use super::{DigestTree, TreeManager};
+#[cfg(any(test, feature = "test-helpers"))]
 use crate::entity::TemporaryEntity;
 use crate::error::RetrievalError;
-use crate::schema::resolver::system_property_value_type;
-use crate::selection::filter::Filterable;
 use crate::storage::StorageEngine;
 use crate::sync::{EngineAdapter, EntityHead, EntityMemberId, TreeProperty};
 use ankql::ast::{OrderDirection, Resolved, Selection};
 use ankurah_core_types::key_spec::{IndexDirection, IndexKeyPart, KeySpec};
-use ankurah_core_types::{PropertyId, Value, ValueType};
+use ankurah_core_types::{PropertyId, ValueType};
 use ankurah_digest_tree::{DigestGroup, DigestTreeView};
-use ankurah_proto::{ModelId, SystemModel, SystemProperty};
 
 impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
+    /// Order an independent fixture through the production member/key mapping.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) async fn fixture_order(
+        &self,
+        selection: &Selection<Resolved>,
+        states: &[ankurah_proto::Attested<ankurah_proto::EntityState>],
+    ) -> Result<Vec<ankurah_proto::EntityId>, RetrievalError> {
+        use ankurah_digest_tree::MemoryStore;
+        use futures::TryStreamExt;
+        let entities = states
+            .iter()
+            .map(|state| TemporaryEntity::new(state.payload.entity_id, &state.payload.state))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tree = ankurah_digest_tree::DigestTree::<_, _, _, G, _>::create(
+            MemoryStore::new(),
+            self.key_spec(selection).await?,
+            entities.iter().map(crate::sync::member::EntityMember),
+        )
+        .await
+        .map_err(crate::sync::error::open_failure)?;
+        tree.view()
+            .range(..)
+            .map_err(crate::sync::error::open_failure)?
+            .map_ok(|leaf| leaf.id.0)
+            .try_collect()
+            .await
+            .map_err(crate::sync::error::open_failure)
+    }
+
     /// Open the exact Selection, including its LIMIT membership, and reconcile
     /// all canonical-state changes since its last completed read boundary.
     pub async fn open(&self, selection: Selection<Resolved>) -> Result<DigestTree<SE, G>, RetrievalError> {
@@ -59,33 +86,10 @@ impl<SE: StorageEngine + 'static, G: DigestGroup> TreeManager<SE, G> {
     }
 
     async fn value_type(&self, property: PropertyId) -> Result<ValueType, RetrievalError> {
-        match property {
-            PropertyId::Id => Ok(ValueType::EntityId),
-            PropertyId::System(property) => Ok(system_property_value_type(property)),
-            PropertyId::EntityId(id) => {
-                let state = match self.storage.get_state(id).await {
-                    Ok(state) => state,
-                    Err(RetrievalError::EntityNotFound(_)) => {
-                        return self
-                            .catalog
-                            .upgrade()
-                            .and_then(|catalog| catalog.bound_value_type(&id))
-                            .ok_or(RetrievalError::EntityNotFound(id));
-                    }
-                    Err(error) => return Err(error),
-                };
-                let model_id = ModelId::System(SystemModel::Property);
-                if !state.payload.state.memberships.contains(&model_id) {
-                    return Err(RetrievalError::MissingComponent { entity_id: id, model_id });
-                }
-                let entity = TemporaryEntity::new(id, &state.payload.state)?;
-                let value = entity.value(&PropertyId::System(SystemProperty::ValueType));
-                match value {
-                    Some(Value::String(value)) => ValueType::from_property_str(&value),
-                    _ => None,
-                }
-                .ok_or_else(|| RetrievalError::InvalidState(format!("property {id} has no valid value_type")))
-            }
+        if let Some(value_type) = crate::selection::ordering::property_value_type(&*self.storage, property).await? {
+            return Ok(value_type);
         }
+        let PropertyId::EntityId(id) = property else { unreachable!("system property types are known") };
+        self.catalog.upgrade().and_then(|catalog| catalog.bound_value_type(&id)).ok_or(RetrievalError::EntityNotFound(id))
     }
 }

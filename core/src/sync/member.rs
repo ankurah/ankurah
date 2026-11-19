@@ -65,7 +65,7 @@ impl Member<TreeProperty> for EntityMember<'_> {
             // A nested JSON property can change scalar type between entities.
             // Preserve JSON's type tags rather than pretending the path has the
             // enclosing property's declared type (or the first value's type).
-            Some(path) => value.and_then(|value| value.json_at_path(path)).map(Value::Json),
+            Some(path) => value.and_then(|value| value.json_order_at_path(path)).map(Value::Json),
         })
     }
 

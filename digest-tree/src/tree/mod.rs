@@ -92,11 +92,15 @@ where
     /// The tree a store already holds, keyed by the spec stored with it:
     /// [`Error::NoTree`] for a store that holds none, [`Error::WrongGroup`]
     /// for a tree summed in another digest group, and [`Error::Collation`]
-    /// for a spec that names a collation.
+    /// for an unsupported collation. [`Error::WrongKeyEncoding`] requires a
+    /// rebuild from canonical members before this version can open the tree.
     pub async fn open(store: S) -> Result<Self, Error> {
         let meta = TreeRows::new(store.begin_read().await?).meta().await?.ok_or(Error::NoTree)?;
         if meta.group != G::ROW_VERSION {
             return Err(Error::WrongGroup);
+        }
+        if meta.key_encoding != ankurah_core_types::ordering::KEY_ENCODING_VERSION {
+            return Err(Error::WrongKeyEncoding { found: meta.key_encoding });
         }
 
         check_spec(&meta.key_spec)?;
