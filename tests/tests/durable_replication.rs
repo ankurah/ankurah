@@ -8,7 +8,7 @@ use ankurah::core::{
     error::{RetrievalError, ValidationError},
     node::{NodeInner, ReplicationState},
     policy::{AccessDenied, DefaultContext, PolicyAgent},
-    storage::{StateScan, StorageTransaction},
+    storage::StateScan,
     util::Iterable,
 };
 use common::*;
