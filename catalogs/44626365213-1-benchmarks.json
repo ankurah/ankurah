@@ -1,0 +1,64 @@
+{
+  "observed": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "status": "registered",
+      "target": "event_dag",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-digest-tree/digest",
+      "package": "ankurah-digest-tree",
+      "reason": "Cannot compile digest with this instrument/compiler; inspect durable diagnostics",
+      "status": "failed",
+      "target": "digest",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-digest-tree/tree",
+      "package": "ankurah-digest-tree",
+      "reason": "Cannot compile tree with this instrument/compiler; inspect durable diagnostics",
+      "status": "failed",
+      "target": "tree",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "package": "ankurah-tests",
+      "status": "registered",
+      "target": "lane_perf",
+      "workloads": []
+    }
+  ],
+  "registered": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "status": "registered",
+      "target": "event_dag",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-digest-tree/digest",
+      "package": "ankurah-digest-tree",
+      "status": "registered",
+      "target": "digest",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-digest-tree/tree",
+      "package": "ankurah-digest-tree",
+      "status": "registered",
+      "target": "tree",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "package": "ankurah-tests",
+      "status": "registered",
+      "target": "lane_perf",
+      "workloads": []
+    }
+  ]
+}
