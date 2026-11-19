@@ -4,39 +4,29 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::sync::{Mutex, OnceCell};
+use tempfile::TempDir;
+use tokio::sync::Mutex;
 
 use crate::error::SqliteError;
 
-/// Configuration for SQLite connections
-#[derive(Clone, Debug)]
-pub enum SqliteConfig {
-    /// File-based database
-    File(PathBuf),
-    /// In-memory database (for testing)
-    Memory,
-}
-
-/// Opens file connections for bb8 and owns one private-memory database.
+/// Opens connections to one database file for bb8.
+#[derive(Clone)]
 pub struct SqliteConnectionManager {
-    config: SqliteConfig,
-    /// Pool expiry replaces handles without discarding the private database.
-    /// Every handle shares the connection's mutex, including retained snapshots.
-    memory: OnceCell<PooledConnection>,
+    path: PathBuf,
+    /// Each connection also holds the directory, because it can outlive its manager.
+    directory: Option<Arc<TempDir>>,
 }
 
 impl SqliteConnectionManager {
-    pub fn new(config: SqliteConfig) -> Self { Self { config, memory: OnceCell::new() } }
+    pub fn file(path: impl Into<PathBuf>) -> Self { Self { path: path.into(), directory: None } }
 
-    pub fn file(path: impl Into<PathBuf>) -> Self { Self::new(SqliteConfig::File(path.into())) }
+    /// A manager for a new database file in `directory`.
+    pub(crate) fn temporary(directory: TempDir) -> Self {
+        Self { path: directory.path().join("ankurah.sqlite"), directory: Some(Arc::new(directory)) }
+    }
 
-    pub fn memory() -> Self { Self::new(SqliteConfig::Memory) }
-
-    fn create_connection(&self) -> Result<Connection, SqliteError> {
-        let conn = match &self.config {
-            SqliteConfig::File(path) => Connection::open(path)?,
-            SqliteConfig::Memory => Connection::open_in_memory()?,
-        };
+    fn create_connection(&self) -> Result<PooledConnection, SqliteError> {
+        let conn = Connection::open(&self.path)?;
 
         // Performance optimizations
         conn.execute_batch(
@@ -50,20 +40,32 @@ impl SqliteConnectionManager {
         crate::id_bytes::register(&conn)?;
         crate::order_keys::register(&conn)?;
 
-        Ok(conn)
+        Ok(PooledConnection::new(conn, self.directory.clone()))
     }
+}
+
+/// An SQLite connection and the temporary directory of its database, if it
+/// has one. `connection` comes first so that it closes before the directory
+/// can be deleted, and a call whose caller was cancelled holds both until the
+/// call ends.
+struct OpenConnection {
+    connection: Connection,
+    _directory: Option<Arc<TempDir>>,
 }
 
 /// A pooled SQLite connection wrapper
 ///
-/// Wraps the rusqlite Connection in an Arc<Mutex> for thread-safe access
-/// since rusqlite connections are not Send.
+/// Serializes access to the connection; its blocking calls run on the
+/// runtime's blocking threads.
 pub struct PooledConnection {
-    inner: Arc<Mutex<Connection>>,
+    inner: Arc<Mutex<OpenConnection>>,
 }
 
 impl PooledConnection {
-    pub fn new(conn: Connection) -> Self { Self { inner: Arc::new(Mutex::new(conn)) } }
+    /// Wrap `conn` and the temporary directory of its database, if it has one.
+    fn new(conn: Connection, directory: Option<Arc<TempDir>>) -> Self {
+        Self { inner: Arc::new(Mutex::new(OpenConnection { connection: conn, _directory: directory })) }
+    }
 
     /// Execute a function with the connection, as [`run`](Self::run) runs it.
     pub async fn with_connection<F, T>(&self, f: F) -> Result<T, SqliteError>
@@ -97,7 +99,7 @@ impl PooledConnection {
         T: Send + 'static,
     {
         let mut guard = self.inner.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || f(&mut guard)).await.map_err(|e| SqliteError::TaskJoin(e.to_string()))?
+        tokio::task::spawn_blocking(move || f(&mut guard.connection)).await.map_err(|e| SqliteError::TaskJoin(e.to_string()))?
     }
 }
 
@@ -110,18 +112,8 @@ impl bb8::ManageConnection for SqliteConnectionManager {
     type Error = SqliteError;
 
     fn connect(&self) -> impl std::future::Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        async move {
-            let open = || async {
-                let config = self.config.clone();
-                tokio::task::spawn_blocking(move || Self::new(config).create_connection().map(PooledConnection::new))
-                    .await
-                    .map_err(|e| SqliteError::TaskJoin(e.to_string()))?
-            };
-            match &self.config {
-                SqliteConfig::Memory => self.memory.get_or_try_init(open).await.cloned(),
-                SqliteConfig::File(_) => open().await,
-            }
-        }
+        let manager = self.clone();
+        async move { tokio::task::spawn_blocking(move || manager.create_connection()).await.map_err(|e| SqliteError::TaskJoin(e.to_string()))? }
     }
 
     #[allow(refining_impl_trait)]
@@ -153,7 +145,7 @@ mod tests {
         let (occupied, free) = (one_blocking_thread()?, one_blocking_thread()?);
 
         free.block_on(async {
-            let connection = PooledConnection::new(Connection::open_in_memory()?);
+            let connection = PooledConnection::new(Connection::open_in_memory()?, None);
             connection
                 .with_connection(|connection| Ok(connection.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1)")?))
                 .await?;
@@ -178,5 +170,65 @@ mod tests {
             assert_eq!(read.await?, 2, "the read sees the write that took the lock before it");
             Ok(())
         })
+    }
+
+    /// A connection keeps the temporary directory of its database after its
+    /// manager drops, as a pool's idle connections do: bb8 drops a pool's
+    /// manager before them.
+    #[tokio::test]
+    async fn a_connection_keeps_its_temporary_directory_after_its_manager_drops() -> anyhow::Result<()> {
+        use bb8::ManageConnection;
+
+        let manager = SqliteConnectionManager::temporary(tempfile::tempdir()?);
+        let directory = manager.path.parent().expect("the database file is in the directory").to_path_buf();
+        let connection = manager.connect().await?;
+
+        drop(manager);
+        assert!(directory.exists(), "the connection holds the directory");
+        connection.with_connection(|connection| Ok(connection.execute_batch("CREATE TABLE t (v INTEGER)")?)).await?;
+
+        drop(connection);
+        assert!(!directory.exists(), "the directory is deleted once its last connection closes");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_call_keeps_its_directory_until_the_connection_closes() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        use bb8::ManageConnection;
+
+        let manager = SqliteConnectionManager::temporary(tempfile::tempdir()?);
+        let directory = manager.path.parent().unwrap().to_path_buf();
+        let connection = manager.connect().await?;
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, resume) = mpsc::channel();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn(async move {
+            connection
+                .with_connection(move |connection| {
+                    let _ = started.send(());
+                    resume.recv_timeout(Duration::from_secs(5)).expect("release the blocking call");
+                    let result = connection.execute_batch("CREATE TABLE t (v INTEGER)");
+                    let _ = finished.send(result);
+                    Ok(())
+                })
+                .await
+        });
+        entered.await?;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        drop(manager);
+        assert!(directory.exists(), "the blocking call still owns the connection and directory");
+
+        release.send(())?;
+        completion.await??;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while directory.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
     }
 }

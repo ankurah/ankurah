@@ -69,7 +69,7 @@ pub struct Track {
 
 #[tokio::test]
 async fn test_json_property_storage_and_simple_query() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -115,7 +115,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
     // Verify pushdown before running the actual query
     assert_fully_pushes_down("licensing.territory = 'US'");
 
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -159,7 +159,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_query_numeric_comparison() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -190,7 +190,7 @@ async fn test_json_path_query_numeric_comparison() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_nested_query() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -231,7 +231,7 @@ async fn test_json_path_nested_query() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_combined_with_regular_field() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -255,7 +255,7 @@ async fn test_json_path_combined_with_regular_field() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_query_with_or() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -282,7 +282,7 @@ async fn test_json_path_query_with_or() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_query_numeric_ordering() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();

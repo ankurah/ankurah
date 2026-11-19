@@ -39,8 +39,8 @@ Queries referencing columns that don't exist yet (before any data is written) ne
 3. Treats missing columns as NULL (which fails most comparisons, returning empty results)
 4. Refreshes cache after writes that may add columns
 
-### Connection Pooling for In-Memory Databases
-In-memory SQLite databases are tied to their connection - closing the connection destroys the database. The implementation uses a single-connection pool for in-memory mode to keep the database alive while still using the same pool-based API.
+### Temporary Databases Use a File
+The ordered maps need several connections to one database, with write-ahead logging so that snapshots read while another connection writes, and SQLite runs no write-ahead log for a database in memory. `open_temporary()` therefore opens a database file in a temporary directory. The connection manager and each connection hold the directory, because bb8 drops a pool's manager before its idle connections.
 
 ## Gotchas
 

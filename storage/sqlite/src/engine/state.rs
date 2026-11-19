@@ -1,5 +1,4 @@
-//! Canonical-state continuation through a WAL read transaction, or validated
-//! short reads on the sole connection of a private-memory database.
+//! Canonical-state continuation through a WAL read transaction.
 
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
@@ -74,16 +73,11 @@ pub(super) fn advance(connection: &Connection) -> Result<u64, SqliteError> {
 }
 
 pub(super) struct SqliteStateSnapshot {
-    source: Source,
+    lease: Lease,
     target: CounterCursor,
     after: (u64, String),
     selected: Option<std::vec::IntoIter<Attested<EntityState>>>,
     query: Option<Arc<Query>>,
-}
-
-enum Source {
-    File(Lease),
-    Memory(crate::connection::PooledConnection),
 }
 
 impl SqliteStateSnapshot {
@@ -116,21 +110,14 @@ impl SqliteStateSnapshot {
                 (Some(Arc::new(Query::prepare(engine, selection).await?)), Some(prepared_at))
             }
         };
-        let (source, target) = if let Some(connection) = engine.maps.memory_connection().await? {
-            engine.ensure_shared_tables(&connection).await?;
-            let target = connection.with_connection(current).await?;
-            (Source::Memory(connection), target)
-        } else {
-            let mut lease = engine.maps.lease().await?;
-            engine.ensure_shared_tables(lease.connection()).await?;
-            let target = lease
-                .run(|connection| {
-                    connection.execute_batch("BEGIN")?;
-                    current(connection)
-                })
-                .await?;
-            (Source::File(lease), target)
-        };
+        let mut lease = engine.maps.lease().await?;
+        engine.ensure_shared_tables(lease.connection()).await?;
+        let target = lease
+            .run(|connection| {
+                connection.execute_batch("BEGIN")?;
+                current(connection)
+            })
+            .await?;
         // A commit during planning may introduce a materialization the query
         // did not include. It cannot be certified by the later source cursor.
         if prepared_at.is_some_and(|prepared_at| prepared_at != target) {
@@ -138,46 +125,16 @@ impl SqliteStateSnapshot {
         }
         let since = target.resume(since, ENGINE)?;
         let after = since.map_or((0, String::new()), |position| (position, "\u{10ffff}".into()));
-        let mut snapshot = Self { source, target, after, selected: None, query: None };
+        let mut snapshot = Self { lease, target, after, selected: None, query: None };
         if let Some(query) = query {
             if selection_changes {
                 snapshot.query = Some(query);
                 return Ok(snapshot);
             }
-            let selected = snapshot.read(move |connection| Ok(query.states_in(connection))).await??;
+            let selected = snapshot.lease.run(move |connection| Ok(query.states_in(connection))).await??;
             snapshot.selected = Some(selected.into_iter());
         }
         Ok(snapshot)
-    }
-
-    async fn read<T: Send + 'static>(
-        &mut self,
-        call: impl FnOnce(&Connection) -> Result<T, SqliteError> + Send + 'static,
-    ) -> Result<T, SqliteError> {
-        let target = self.target;
-        match &mut self.source {
-            Source::File(lease) => lease.run(call).await,
-            Source::Memory(connection) => {
-                connection
-                    .with_connection_mut(move |connection| {
-                        let snapshot = connection.transaction()?;
-                        let now = match current(&snapshot) {
-                            // Reset removes both the cursor and its index. A
-                            // missing cursor with the index intact is damage,
-                            // not a reason to retry a moved read boundary.
-                            Err(SqliteError::InvalidStateCursor) if !super::table_exists(&snapshot, CHANGES_TABLE)? => {
-                                return Err(SqliteError::SnapshotChanged);
-                            }
-                            result => result?,
-                        };
-                        if now != target {
-                            return Err(SqliteError::SnapshotChanged);
-                        }
-                        call(&snapshot)
-                    })
-                    .await
-            }
-        }
     }
 }
 
@@ -185,12 +142,12 @@ impl SqliteStateSnapshot {
 impl StateSnapshot for SqliteStateSnapshot {
     async fn next_page(&mut self, limit: NonZeroUsize) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         if self.selected.is_some() {
-            self.read(|_| Ok(())).await?;
             return Ok(self.selected.as_mut().unwrap().by_ref().take(limit.get()).collect());
         }
         let after = self.after.clone();
         let (states, last) = self
-            .read(move |connection| {
+            .lease
+            .run(move |connection| {
                 let mut statement = connection.prepare(&format!(
                     r#"
                 SELECT "position", "entity_id" FROM "{CHANGES_TABLE}"
@@ -225,7 +182,8 @@ impl StateSnapshot for SqliteStateSnapshot {
     async fn get_states(&mut self, ids: &[EntityId]) -> Result<Vec<Option<Attested<EntityState>>>, RetrievalError> {
         let ids = ids.to_vec();
         Ok(self
-            .read(move |connection| {
+            .lease
+            .run(move |connection| {
                 let states: BTreeMap<_, _> =
                     load_states(connection, &ids)?.into_iter().map(|state| (state.payload.entity_id, state)).collect();
                 Ok(ids.iter().map(|id| states.get(id).cloned()).collect())
@@ -236,7 +194,7 @@ impl StateSnapshot for SqliteStateSnapshot {
     async fn matching_ids(&mut self, ids: &[EntityId]) -> Result<Vec<EntityId>, RetrievalError> {
         let query = self.query.clone().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
         let ids = ids.to_vec();
-        self.read(move |connection| Ok(query.matching_ids_in(connection, &ids))).await?
+        self.lease.run(move |connection| Ok(query.matching_ids_in(connection, &ids))).await?
     }
 
     async fn select_after(
@@ -246,14 +204,11 @@ impl StateSnapshot for SqliteStateSnapshot {
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let query = self.query.clone().ok_or_else(|| RetrievalError::Other("snapshot has no prepared selection".into()))?;
         let after = after.cloned();
-        self.read(move |connection| Ok(query.select_after_in(connection, after.as_ref(), limit))).await?
+        self.lease.run(move |connection| Ok(query.select_after_in(connection, after.as_ref(), limit))).await?
     }
 
     async fn finish(mut self: Box<Self>) -> Result<StateCursor, RetrievalError> {
-        match &mut self.source {
-            Source::File(lease) => lease.run(|connection| Ok(connection.execute_batch("ROLLBACK")?)).await?,
-            Source::Memory(_) => self.read(|_| Ok(())).await?,
-        }
+        self.lease.run(|connection| Ok(connection.execute_batch("ROLLBACK")?)).await?;
         Ok(self.target.encode(ENGINE))
     }
 }

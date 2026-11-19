@@ -11,10 +11,6 @@ pub struct SqliteTransaction<'a> {
     /// turn and the native transaction begun there, held to the
     /// transaction's end.
     lease: Option<Lease>,
-    /// A private-memory database releases its sole connection between calls.
-    memory_maps: Option<maps::memory::Writes>,
-    memory_locks: ankurah_core::storage::HeldLocks<'a>,
-
     /// Set by `poison`, and by each map call from its start until it returns
     /// `Ok`, so that a call that fails, or is dropped part way, leaves it set:
     /// every later call and the commit then fail.
@@ -74,16 +70,7 @@ pub(super) fn insert_events(conn: &Connection, events: &[EventRow]) -> Result<()
 
 impl<'a> SqliteTransaction<'a> {
     pub(super) fn new(engine: &'a SqliteStorageEngine) -> Self {
-        Self {
-            engine,
-            entities: Vec::new(),
-            events: Vec::new(),
-            lease: None,
-            memory_maps: None,
-            memory_locks: ankurah_core::storage::HeldLocks::of(&engine.maps.names),
-            poisoned: false,
-            last_lock: None,
-        }
+        Self { engine, entities: Vec::new(), events: Vec::new(), lease: None, poisoned: false, last_lock: None }
     }
 }
 
@@ -101,7 +88,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
         if self.poisoned {
             return Err(MutationError::TransactionFailed);
         }
-        if self.lease.is_some() || self.memory_maps.is_some() {
+        if self.lease.is_some() {
             return Err(MutationError::InvalidUpdate("state set after the transaction's first map call"));
         }
         let entity_id = state.payload.entity_id;
@@ -143,7 +130,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
         if self.poisoned {
             return Err(MutationError::TransactionFailed);
         }
-        let Self { engine, entities, events, lease, memory_maps, memory_locks: _memory_locks, .. } = self;
+        let Self { engine, entities, events, lease, .. } = self;
         let holds_records = !entities.is_empty() || !events.is_empty();
 
         match lease {
@@ -170,35 +157,19 @@ impl StorageTransaction for SqliteTransaction<'_> {
                     .map_err(MutationError::from)
             }
 
-            None if !holds_records && memory_maps.is_none() => Ok(StorageCommitOutcome::Committed(StorageCommitResult::default())),
+            None if !holds_records => Ok(StorageCommitOutcome::Committed(StorageCommitResult::default())),
 
             None => {
-                let (conn, _lease) = match engine.maps.memory_connection().await? {
-                    Some(connection) => (connection, None),
-                    None => {
-                        let pooled = engine.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
-                        ((*pooled).clone(), Some(pooled))
-                    }
-                };
-                if holds_records {
-                    engine.ensure_shared_tables(&conn).await?;
-                }
+                let conn = engine.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
+                engine.ensure_shared_tables(&conn).await?;
                 conn.with_connection_mut(move |c| {
                     // BEGIN IMMEDIATE serializes writers before expectations
                     // are read, including concurrent first inserts.
                     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    if let Some(maps) = &memory_maps {
-                        maps.validate(&tx)?;
-                    }
                     let outcome = write_entity_rows(&entities, &events, &tx)?;
                     match outcome {
                         StorageCommitOutcome::Conflict { .. } => tx.rollback()?,
-                        StorageCommitOutcome::Committed(_) => {
-                            if let Some(maps) = memory_maps {
-                                maps.land(&tx)?;
-                            }
-                            tx.commit()?;
-                        }
+                        StorageCommitOutcome::Committed(_) => tx.commit()?,
                     }
 
                     Ok(outcome)
@@ -210,30 +181,11 @@ impl StorageTransaction for SqliteTransaction<'_> {
     }
 
     async fn map_lock_and_read(&mut self, locks: &[LockName], reads: Vec<MapRead>) -> Result<Vec<MapRows>, MutationError> {
-        let (engine, lease, memory, held) = (self.engine, &mut self.lease, &mut self.memory_maps, &mut self.memory_locks);
-        transaction_call(&mut self.poisoned, &mut self.last_lock, locks, async move {
-            if let Some(connection) = engine.maps.memory_connection().await? {
-                for name in locks {
-                    held.take(name).await;
-                }
-                Ok(memory.get_or_insert_with(Default::default).read(&connection, reads).await?)
-            } else {
-                calls::read(lease, &engine.maps, reads).await
-            }
-        })
-        .await
+        transaction_call(&mut self.poisoned, &mut self.last_lock, locks, calls::read(&mut self.lease, &self.engine.maps, reads)).await
     }
 
     async fn map_write(&mut self, writes: Vec<MapWrite>) -> Result<(), MutationError> {
-        let (engine, lease, memory) = (self.engine, &mut self.lease, &mut self.memory_maps);
-        transaction_call(&mut self.poisoned, &mut self.last_lock, &[], async move {
-            if let Some(connection) = engine.maps.memory_connection().await? {
-                Ok(memory.get_or_insert_with(Default::default).write(&connection, writes).await?)
-            } else {
-                calls::write(lease, &engine.maps, writes).await
-            }
-        })
-        .await
+        transaction_call(&mut self.poisoned, &mut self.last_lock, &[], calls::write(&mut self.lease, &self.engine.maps, writes)).await
     }
 
     fn poison(&mut self) { self.poisoned = true; }

@@ -7,6 +7,9 @@ pub enum SqliteError {
     #[error("SQLite error: {0}")]
     Rusqlite(#[from] rusqlite::Error),
 
+    #[error("SQLite requires a database file; use open_temporary for a short-lived database")]
+    FileRequired,
+
     #[error("Connection pool error: {0}")]
     Pool(String),
 

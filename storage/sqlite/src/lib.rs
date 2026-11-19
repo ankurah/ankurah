@@ -27,8 +27,8 @@
 //! // Open a file-based database
 //! let storage = SqliteStorageEngine::open("myapp.db").await?;
 //!
-//! // Or use an in-memory database for testing
-//! let storage = SqliteStorageEngine::open_in_memory().await?;
+//! // Or a database in a temporary directory, for tests and short-lived nodes
+//! let storage = SqliteStorageEngine::open_temporary().await?;
 //! ```
 
 mod connection;

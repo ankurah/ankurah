@@ -18,18 +18,25 @@ async fn put(engine: &SqliteStorageEngine, previous: &Clock, state: &Attested<En
 }
 
 #[tokio::test]
-async fn memory_pages_validate_the_counter_and_release_the_single_connection() -> anyhow::Result<()> {
-    let engine = SqliteStorageEngine::open_in_memory().await?;
+async fn temporary_state_snapshots_survive_writes_and_reset() -> anyhow::Result<()> {
+    let engine = SqliteStorageEngine::open_temporary().await?;
     let (state, _) = entity!(5);
     put(&engine, &Clock::default(), &state).await?;
     let mut snapshot = engine.state_snapshot(StateScan::Changes(None)).await?;
-    assert_eq!(snapshot.next_page(NonZeroUsize::new(1).unwrap()).await?.len(), 1);
+    assert_eq!(snapshot.next_page(NonZeroUsize::MIN).await?, [state.clone()]);
     put(&engine, &state.payload.state.head, &state).await?;
-    assert!(matches!(snapshot.finish().await, Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict)));
-    let snapshot = engine.state_snapshot(StateScan::Changes(None)).await?;
     engine.delete_all().await?;
-    assert!(matches!(snapshot.finish().await, Err(RetrievalError::MutationError(error)) if matches!(*error, MutationError::WriteConflict)));
-    let snapshot = engine.state_snapshot(StateScan::Changes(None)).await?;
+    assert_eq!(snapshot.get_states(&[state.payload.entity_id]).await?, [Some(state)]);
+    assert!(snapshot.next_page(NonZeroUsize::MIN).await?.is_empty());
+    let cursor = snapshot.finish().await?;
+    assert!(matches!(engine.state_snapshot(StateScan::Changes(Some(&cursor))).await, Err(RetrievalError::InvalidStateCursor)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_cursor_is_not_a_retryable_boundary_move() -> anyhow::Result<()> {
+    let engine = SqliteStorageEngine::open_temporary().await?;
+    engine.state_snapshot(StateScan::Changes(None)).await?.finish().await?;
     engine
         .pool()
         .get()
@@ -39,29 +46,30 @@ async fn memory_pages_validate_the_counter_and_release_the_single_connection() -
             Ok(())
         })
         .await?;
-    assert!(matches!(snapshot.finish().await, Err(RetrievalError::StorageError(_))), "corrupt metadata is not a retryable boundary move");
+    assert!(matches!(engine.state_snapshot(StateScan::Changes(None)).await, Err(RetrievalError::StorageError(_))));
     Ok(())
 }
 
 #[tokio::test]
-async fn memory_operations_share_the_database_after_pool_connection_expiry() -> anyhow::Result<()> {
+async fn file_operations_share_the_database_after_pool_connection_expiry() -> anyhow::Result<()> {
     use std::time::Duration;
 
     use ankurah_core::storage::{MapId, MapRead, MapRows, MapSnapshot, MapWrite};
     use ankurah_proto::{EntityId, ModelId};
 
+    let directory = tempfile::tempdir()?;
     let pool = bb8::Pool::builder()
         .max_size(1)
         .idle_timeout(None)
         .max_lifetime(Duration::from_millis(100))
         .reaper_rate(Duration::from_millis(20))
-        .build(SqliteConnectionManager::memory())
+        .build(SqliteConnectionManager::file(directory.path().join("expiry.sqlite")))
         .await?;
     let engine = SqliteStorageEngine::new(pool).await?;
     let (mut first, event) = entity!(1);
     let model = ModelId::EntityId(EntityId::from_bytes([101; 32]));
     first.payload.state.memberships.insert(model);
-    let map = MapId::new("memory");
+    let map = MapId::new("expiry");
     let read = MapRead::Get { map: map.clone(), keys: vec![b"key".to_vec()] };
     let mut transaction = engine.transaction();
     transaction.set_state(&Clock::default(), &first).await?;
@@ -161,25 +169,6 @@ async fn wal_pages_point_reads_and_refill_share_a_snapshot_while_writes_continue
 }
 
 #[tokio::test]
-async fn memory_selection_queries_refuse_a_changed_boundary() -> anyhow::Result<()> {
-    let engine = SqliteStorageEngine::open_in_memory().await?;
-    let (state, _) = entity!(5);
-    put(&engine, &Clock::default(), &state).await?;
-    let selection = Selection { predicate: Predicate::True, order_by: None, limit: Some(1) };
-    for membership in [true, false] {
-        let mut snapshot = engine.state_snapshot(StateScan::SelectionChanges { selection: &selection, since: None }).await?;
-        put(&engine, &state.payload.state.head, &state).await?;
-        let error = if membership {
-            snapshot.matching_ids(&[state.payload.entity_id]).await.unwrap_err()
-        } else {
-            snapshot.select_after(None, NonZeroUsize::MIN).await.unwrap_err()
-        };
-        assert!(matches!(error, RetrievalError::MutationError(error) if matches!(*error, MutationError::WriteConflict)));
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn event_only_writes_and_failed_resets_leave_continuation_intact() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("reset.sqlite");
@@ -231,16 +220,13 @@ async fn event_only_writes_and_failed_resets_leave_continuation_intact() -> anyh
 }
 
 #[path = "../../common/tests/support/state_selection.rs"]
+#[allow(dead_code)] // The optimistic-snapshot case does not apply to WAL snapshots.
 mod selection_cases;
 
 #[tokio::test]
 async fn selection_snapshots_match_fetch_ordering_and_membership() -> anyhow::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let engine = SqliteStorageEngine::open(directory.path().join("selection.sqlite")).await?;
+    let engine = SqliteStorageEngine::open_temporary().await?;
     selection_cases::selection_matches_fetch(&engine).await?;
-    let engine = SqliteStorageEngine::open_in_memory().await?;
-    selection_cases::selection_matches_fetch(&engine).await?;
-    selection_cases::selection_rejects_changed_boundary(&engine).await?;
     selection_cases::selection_tracks_updated_keys(&engine).await
 }
 

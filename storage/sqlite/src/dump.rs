@@ -169,7 +169,7 @@ mod tests {
     async fn dump_crosses_cursor_pages_without_skipping_records() -> anyhow::Result<()> {
         const RECORDS: usize = PAGE_SIZE as usize + 1;
 
-        let storage = SqliteStorageEngine::open_in_memory().await?;
+        let storage = SqliteStorageEngine::open_temporary().await?;
         let mut expected = BTreeSet::new();
         for _ in 0..RECORDS {
             let event = Event::genesis(None, AuthorId::Unknown, OperationSet::default());

@@ -3,10 +3,9 @@
 //! Sled stages writes for its synchronous native transaction closure, and
 //! IndexedDB stages them because a browser transaction cannot remain open
 //! across arbitrary async work. PostgreSQL uses the same buffer to send writes
-//! with its next read request or commit, saving a network round trip. SQLite
-//! writes directly into file-backed transactions; its private-memory mode
-//! stages writes so its sole connection remains available between calls.
-//! Those engines submit all pending writes before their storage commit completes.
+//! with its next read request or commit, saving a network round trip. Those
+//! engines submit all pending writes before their storage commit completes.
+//! SQLite writes directly into native transactions without this buffer.
 //! The digest-tree adapter also uses this overlay for deferred persistence of
 //! rebuildable trees. The owner determines when writes become visible and durable;
 //! this helper supplies neither a commit boundary nor a recovery checkpoint.

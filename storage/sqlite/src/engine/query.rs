@@ -169,7 +169,7 @@ mod tests {
     /// plus a property condition.
     #[tokio::test]
     async fn an_id_range_ordered_by_id_is_searched_in_the_id_bytes_index() -> anyhow::Result<()> {
-        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let engine = SqliteStorageEngine::open_temporary().await?;
         let mut ids = Vec::new();
         for byte in 1..=40u8 {
             let backend = LWWBackend::new();

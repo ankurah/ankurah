@@ -17,7 +17,7 @@ use anyhow::Result;
 
 /// Helper to run a SQL query that returns a boolean (0 or 1 in SQLite)
 async fn query_bool(sql: &str) -> Result<bool> {
-    let engine = SqliteStorageEngine::open_in_memory().await?;
+    let engine = SqliteStorageEngine::open_temporary().await?;
     let conn = engine.pool().get().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let sql = sql.to_owned();

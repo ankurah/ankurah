@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn test_sqlite_create_and_query() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -41,7 +41,7 @@ async fn test_sqlite_create_and_query() -> Result<()> {
 
 #[tokio::test]
 async fn test_sqlite_update_entity() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -72,7 +72,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
 
 #[tokio::test]
 async fn test_sqlite_state_change_detection() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -101,7 +101,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
 
 #[tokio::test]
 async fn test_sqlite_multiple_updates() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -134,7 +134,7 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
 
 #[tokio::test]
 async fn test_sqlite_query_with_subscription() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -174,7 +174,7 @@ async fn test_sqlite_query_with_subscription() -> Result<()> {
 #[tokio::test]
 async fn test_sqlite_fetch_by_id_prefix() -> Result<()> {
     use common::EntityId;
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = SqliteStorageEngine::open_temporary().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();

@@ -3,5 +3,5 @@ mod cases;
 
 #[tokio::test]
 async fn id_comparisons_and_ordering_follow_byte_order() -> anyhow::Result<()> {
-    cases::check(&ankurah_storage_sqlite::SqliteStorageEngine::open_in_memory().await?).await
+    cases::check(&ankurah_storage_sqlite::SqliteStorageEngine::open_temporary().await?).await
 }

@@ -198,12 +198,27 @@ impl SqliteStorageEngine {
         .map_err(RetrievalError::from)
     }
 
-    /// Create a new storage engine with an existing pool.
+    /// Create a new storage engine with an existing pool over a database file.
+    /// Refuses connections without a database file; use [`Self::open_temporary`]
+    /// for a short-lived database.
     ///
     /// Records or checks the store's protocol version (see
     /// `check_protocol_version`) so every construction path verifies
     /// the store it is about to serve.
     pub async fn new(pool: bb8::Pool<SqliteConnectionManager>) -> anyhow::Result<Self> {
+        {
+            let connection = pool.get().await?;
+            connection
+                .with_connection(|connection| {
+                    let file: String =
+                        connection.query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |row| row.get(0))?;
+                    if file.is_empty() {
+                        return Err(SqliteError::FileRequired);
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
         let engine = Self {
             maps: Maps::new(pool.clone()),
             pool,
@@ -211,7 +226,6 @@ impl SqliteStorageEngine {
             resolver: Arc::new(std::sync::RwLock::new(None)),
         };
         engine.check_protocol_version().await?;
-        engine.maps.memory_connection().await?;
         Ok(engine)
     }
 
@@ -222,11 +236,15 @@ impl SqliteStorageEngine {
         Self::new(pool).await
     }
 
-    /// Open an in-memory SQLite database (for testing)
-    pub async fn open_in_memory() -> anyhow::Result<Self> {
-        let manager = SqliteConnectionManager::memory();
-        // For in-memory, we use a single connection to keep the database alive
-        let pool = bb8::Pool::builder().max_size(1).build(manager).await?;
+    /// Open a new database file in a temporary directory: a store for tests
+    /// and short-lived nodes. `TempDir` tries to delete the directory once the
+    /// engine and everything using its database have dropped, and a failure
+    /// leaves it in place. It is a file because the engine's connections share
+    /// the database with write-ahead logging, which SQLite doesn't support for
+    /// a database in memory.
+    pub async fn open_temporary() -> anyhow::Result<Self> {
+        let manager = SqliteConnectionManager::temporary(tempfile::tempdir()?);
+        let pool = bb8::Pool::builder().max_size(DEFAULT_POOL_SIZE).build(manager).await?;
         Self::new(pool).await
     }
 
@@ -368,8 +386,7 @@ impl StorageEngine for SqliteStorageEngine {
 
     fn transaction(&self) -> Self::Transaction<'_> { SqliteTransaction::new(self) }
 
-    /// A WAL read transaction on a connection of its own, or revision-checked
-    /// short reads for a private-memory database. Neither takes named locks.
+    /// A WAL read transaction on a connection of its own, without named locks.
     async fn map_snapshot(&self, _locks: &[LockName]) -> Result<SqliteMapSnapshot, RetrievalError> {
         Ok(SqliteMapSnapshot::begin(&self.maps).await?)
     }
@@ -442,7 +459,6 @@ impl StorageEngine for SqliteStorageEngine {
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
         self.materializations.clear();
-        let memory = self.maps.in_memory().await?;
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
         conn.with_connection_mut(move |c| {
@@ -456,9 +472,6 @@ impl StorageEngine for SqliteStorageEngine {
             // in turn. Past the busy timeout, whichever waits fails as busy.
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let emptied = maps::statements::empty(&tx)?;
-            if memory {
-                maps::memory::advance(&tx)?;
-            }
 
             // Dynamic materializations are engine-owned only when named by the
             // durable model map. Arbitrary tables may belong to the embedding
@@ -670,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_names_survive_late_labels_and_engine_reopen() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = SqliteStorageEngine::open_temporary().await.unwrap();
         let model = ModelId::EntityId(entity_id(0xe1));
         let property = PropertyId::EntityId(entity_id(0xe2));
         let entity = entity_id(0xe3);
@@ -862,15 +875,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_in_memory() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
-        let all = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-        assert!(engine.fetch_states(&all.clone().and_member_of(ModelId::System(SystemModel::System))).await.unwrap().is_empty());
+    async fn all_constructors_refuse_a_database_without_a_file() -> anyhow::Result<()> {
+        let error = SqliteStorageEngine::open(":memory:").await.err().expect("in-memory databases are unsupported");
+        assert!(matches!(error.downcast_ref::<SqliteError>(), Some(SqliteError::FileRequired)));
+
+        let pool = bb8::Pool::builder().max_size(1).build(SqliteConnectionManager::file(":memory:")).await?;
+        let error = SqliteStorageEngine::new(pool).await.err().expect("a custom pool must also use a file");
+        assert!(matches!(error.downcast_ref::<SqliteError>(), Some(SqliteError::FileRequired)));
+        Ok(())
+    }
+
+    /// A temporary database is a file the engine's connections share, so its
+    /// maps work, and a snapshot that outlives the engine keeps the database
+    /// and its directory until the snapshot drops.
+    #[tokio::test]
+    async fn a_temporary_database_lasts_as_long_as_a_snapshot_that_outlives_the_engine() -> anyhow::Result<()> {
+        use ankurah_core::storage::{MapId, MapSnapshot};
+
+        let engine = SqliteStorageEngine::open_temporary().await?;
+        let map = MapId::new("m");
+        let mut trx = engine.transaction();
+        trx.map_write(vec![MapWrite::Put { map: map.clone(), key: b"k".to_vec(), value: vec![1] }]).await?;
+        trx.commit().await?.committed()?;
+        let file: String = engine
+            .pool
+            .get()
+            .await?
+            .with_connection(|connection| {
+                Ok(connection.query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |row| row.get(0))?)
+            })
+            .await?;
+        let directory = std::path::PathBuf::from(file).parent().expect("the database file is in a directory").to_path_buf();
+
+        let mut snapshot = engine.map_snapshot(&[]).await?;
+        drop(engine);
+        let read = snapshot.map_read(vec![MapRead::Get { map, keys: vec![b"k".to_vec()] }]).await?;
+        assert_eq!(read, [MapRows::Got(vec![Some(vec![1])])]);
+        assert!(directory.exists(), "the snapshot keeps the directory after the engine drops");
+
+        drop(snapshot);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while directory.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_list_models_reads_durable_registrations() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = SqliteStorageEngine::open_temporary().await.unwrap();
         assert!(engine.list_materializations().await.unwrap().is_empty());
 
         let expected = [SystemModel::System, SystemModel::Model, SystemModel::Property].map(ModelId::System);
@@ -890,7 +945,7 @@ mod tests {
     /// normalized to lowercase.
     #[tokio::test]
     async fn colliding_model_and_property_labels_get_distinct_lowercase_names() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = SqliteStorageEngine::open_temporary().await.unwrap();
         let conn = engine.pool.get().await.unwrap();
         conn.with_connection(|connection| {
             connection.execute(r#"CREATE TABLE "sales_report" ("application_value" TEXT)"#, [])?;
@@ -946,7 +1001,7 @@ mod tests {
     /// canonical membership set.
     #[tokio::test]
     async fn write_refreshes_every_canonical_membership_materialization() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = SqliteStorageEngine::open_temporary().await.unwrap();
         let model_a = ModelId::EntityId(entity_id(0x61));
         let model_b = ModelId::EntityId(entity_id(0x62));
         let property_a = PropertyId::EntityId(entity_id(0x71));
@@ -979,7 +1034,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_head_rolls_back_the_complete_batch() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = SqliteStorageEngine::open_temporary().await.unwrap();
         let model_a = ModelId::EntityId(entity_id(0x81));
         let model_b = ModelId::EntityId(entity_id(0x82));
         let property = PropertyId::EntityId(entity_id(0x83));
@@ -1038,7 +1093,7 @@ mod tests {
     /// 4. JSONB storage and retrieval works correctly
     #[tokio::test]
     async fn test_jsonb_function_availability() -> Result<(), SqliteError> {
-        let engine = SqliteStorageEngine::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
+        let engine = SqliteStorageEngine::open_temporary().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
         let conn = engine.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
         // Test 1: Verify jsonb() function exists and works
@@ -1083,7 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Result<()> {
-        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let engine = SqliteStorageEngine::open_temporary().await?;
         let property = PropertyId::System(ankurah_proto::SystemProperty::Name);
         let initial = [
             state_with_strings(entity_id(0x91), 1, &[(property, "before")]),
@@ -1150,7 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result<()> {
-        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let engine = SqliteStorageEngine::open_temporary().await?;
         let entity = entity_id(0x51);
         let mut state = state_with_strings(entity, 1, &[(PropertyId::System(ankurah_proto::SystemProperty::Name), "value")]);
         // Synthetic tips with distinct generations: the engine must retain each association.
@@ -1197,7 +1252,7 @@ mod tests {
     /// This mimics exactly what the real code does.
     #[tokio::test]
     async fn test_jsonb_storage_and_parameterized_query() -> Result<(), SqliteError> {
-        let engine = SqliteStorageEngine::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
+        let engine = SqliteStorageEngine::open_temporary().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
         let conn = engine.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
         conn.with_connection(|c| {
