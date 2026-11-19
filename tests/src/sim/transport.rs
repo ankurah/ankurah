@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 /// keys everything on `src`/`dst` logical indices instead.)
 pub struct Outbound {
     pub src: usize,
-    pub recipient: proto::EntityId,
+    pub recipient: proto::NodeId,
     pub message: proto::NodeMessage,
 }
 
@@ -55,13 +55,12 @@ impl Captured {
 #[derive(Clone)]
 pub struct SimSender {
     src: usize,
-    /// The recipient's real node id, required by the `PeerSender` contract.
-    recipient: proto::EntityId,
+    recipient: proto::NodeId,
     captured: Captured,
 }
 
 impl SimSender {
-    pub fn new(src: usize, recipient: proto::EntityId, captured: Captured) -> Self { Self { src, recipient, captured } }
+    pub fn new(src: usize, recipient: proto::NodeId, captured: Captured) -> Self { Self { src, recipient, captured } }
 }
 
 #[async_trait::async_trait]
@@ -70,8 +69,6 @@ impl PeerSender for SimSender {
         self.captured.push(Outbound { src: self.src, recipient: self.recipient, message });
         Ok(())
     }
-
-    fn recipient_node_id(&self) -> proto::EntityId { self.recipient }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

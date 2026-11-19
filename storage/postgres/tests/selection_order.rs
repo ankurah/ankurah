@@ -11,6 +11,12 @@ async fn numeric_order_matches_digest_trees() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn node_id_order_matches_digest_trees() -> anyhow::Result<()> {
+    let (_container, engine) = common::create_postgres_container().await?;
+    selection_conformance::node_id_ordering(Arc::new(engine)).await
+}
+
+#[tokio::test]
 async fn json_order_matches_digest_trees() -> anyhow::Result<()> {
     let (_container, engine) = common::create_postgres_container().await?;
     selection_conformance::json_ordering(Arc::new(engine)).await

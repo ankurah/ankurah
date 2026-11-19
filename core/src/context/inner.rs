@@ -55,8 +55,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Access this context's descriptor binding and selection resolution.
     fn schema_resolver(&self) -> &dyn SchemaResolver { self }
 
-    /// Return the node's identity, even if its weak handle can no longer upgrade.
-    fn node_id(&self) -> proto::EntityId { self.node.node_id() }
+    /// The node's id, even if its weak handle can no longer upgrade: `None` while the node is unkeyed.
+    fn node_id(&self) -> Option<proto::NodeId> { self.node.node_id() }
 
     /// This node's system root entity id, which every non-root genesis binds
     /// into its own id. `None` before the node has created or adopted a system.
@@ -72,7 +72,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn get_entity(&self, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
-        debug!("Node({}).get_entity {:?}", node.id, id);
+        debug!("{}.get_entity {:?}", &*node, id);
         let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
         let cdata = policy.credentials();
 
@@ -88,7 +88,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
 
         if let Some(local) = node.entities.get(&id) {
-            debug!("Node({}).get_entity found local entity - returning", node.id);
+            debug!("{}.get_entity found local entity - returning", &*node);
             let state = local.to_state()?;
             let entity_id = local.id();
             policy.check_read(&entity_id, &state)?;

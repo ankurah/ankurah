@@ -118,7 +118,7 @@ async fn get_next_record(state: ScanState) -> Option<(Result<Object, RetrievalEr
                 for i in 0..(eq_prefix_len as u32) {
                     let lhs = key_arr.get(i);
                     let rhs = &eq_prefix_js[i as usize];
-                    if !js_sys::Object::is(&lhs, rhs) {
+                    if !same_key(&lhs, rhs) {
                         // Prefix doesn't match - end of range
                         return None;
                     }
@@ -142,4 +142,15 @@ async fn get_next_record(state: ScanState) -> Option<(Result<Object, RetrievalEr
 
     // Return the record and continue scanning
     Some((Ok(entity_obj), Some(ScanState::Scanning { stream, eq_prefix_len, eq_prefix_js })))
+}
+
+// IndexedDB returns binary keys as ArrayBuffers even when the bound used a
+// Uint8Array. Compare their bytes, not the identity of the two JS objects.
+fn same_key(left: &JsValue, right: &JsValue) -> bool {
+    let binary = |value: &JsValue| value.is_instance_of::<js_sys::ArrayBuffer>() || value.is_instance_of::<js_sys::Uint8Array>();
+    if binary(left) && binary(right) {
+        js_sys::Uint8Array::new(left).to_vec() == js_sys::Uint8Array::new(right).to_vec()
+    } else {
+        js_sys::Object::is(left, right)
+    }
 }

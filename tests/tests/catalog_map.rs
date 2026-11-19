@@ -72,7 +72,7 @@ async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
 
     server.wait_ready().await?;
 
-    let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let models = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let (model_id, property_id, membership_id) = (models.id, models.properties[0].id, models.properties[0].membership_id);
 
     let resolved = wait_resolve(&server, "album", "name").await.expect("catalog should resolve album.name on the durable node");
@@ -120,12 +120,12 @@ async fn durable_map_updates_incrementally() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.wait_ready().await?;
 
-    let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let models = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let model_id = models.id;
     let name_property_id = models.properties[0].id;
     wait_resolve(&server, "album", "name").await.expect("name resolves");
 
-    let year = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
+    let year = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_year_request()).await?);
     let year_property_id = year.properties[0].id;
     let year_id = wait_resolve(&server, "album", "year").await.expect("year resolves incrementally");
     assert_eq!(year_id, year_property_id, "resolution answers year with the allocated id");
@@ -169,14 +169,14 @@ async fn standing_query_membership_can_change_but_version_cannot_regress() -> an
     };
 
     assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 2)).await?,
+        client.request(server.id().unwrap(), &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 2)).await?,
         proto::NodeResponseBody::QuerySubscribed { .. }
     ));
-    let stale = client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 1)).await?;
+    let stale = client.request(server.id().unwrap(), &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 1)).await?;
     assert!(matches!(stale, proto::NodeResponseBody::Error(message) if message.contains("stale subscription version")));
-    let rebound = client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Property, 3)).await?;
+    let rebound = client.request(server.id().unwrap(), &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Property, 3)).await?;
     assert!(matches!(rebound, proto::NodeResponseBody::QuerySubscribed { .. }), "membership is part of the updatable predicate");
-    let stale = client.request(server.id, &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 2)).await?;
+    let stale = client.request(server.id().unwrap(), &DEFAULT_CONTEXT, subscribe(proto::SystemModel::Model, 2)).await?;
     assert!(matches!(stale, proto::NodeResponseBody::Error(message) if message.contains("stale subscription version")));
     Ok(())
 }
@@ -240,14 +240,14 @@ async fn rename_updates_resolution() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.wait_ready().await?;
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let property_id = first.properties[0].id;
     wait_resolve(&server, "album", "name").await.expect("resolves under original name");
 
     let mut rename_entry = album_entry("title", "yrs", "string", false);
     rename_entry.properties[0].renamed_from = Some("name".into());
     let rename = proto::NodeRequestBody::RegisterSchema { model: rename_entry };
-    let renamed = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
+    let renamed = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename).await?);
     assert_eq!(renamed.properties[0].id, property_id, "the hint preserves the lineage id");
 
     let renamed_id = wait_resolve(&server, "album", "title").await.expect("resolves under new name after rename");

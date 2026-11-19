@@ -181,11 +181,11 @@ where
         }
 
         // Try remote peer
-        let Some(peer_id) = self.node.get_durable_peer_random() else {
+        let Some(connection) = self.node.get_durable_peer_random() else {
             return Err(RetrievalError::EventNotFound(event_id.clone()));
         };
 
-        match self.node.request(peer_id, self.cdata, proto::NodeRequestBody::GetEvents { event_ids: vec![event_id.clone()] }).await? {
+        match self.node.request_on(connection, self.cdata, proto::NodeRequestBody::GetEvents { event_ids: vec![event_id.clone()] }).await? {
             proto::NodeResponseBody::GetEvents(peer_events) => {
                 // Deliberately not checked here: the policy hook
                 // (validate_received_event) that the other three peer-event

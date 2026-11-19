@@ -155,9 +155,8 @@ async fn an_ephemeral_node_admits_an_honest_update_over_parents_it_does_not_hold
         predicate_relevance: vec![],
     };
     let body = proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] };
-    client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate { id: proto::UpdateId::new(), from: server.id, to: client.id, body }))
-        .await?;
+    let update = proto::NodeUpdate { id: proto::UpdateId::new(), from: server.id().unwrap(), to: client.id().unwrap(), body };
+    client.handle_message(client.connections_of(server.id().unwrap())[0], proto::NodeMessage::Update(update)).await?;
 
     assert_eq!(record.title()?, "t1", "the honest update is admitted");
     assert!(!requested.lock().unwrap().contains(&genesis), "nothing asked the server for the parent");

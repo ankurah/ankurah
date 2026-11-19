@@ -378,5 +378,6 @@ pub(crate) fn type_label(ty: ValueType) -> &'static str {
         ValueType::Object => "object",
         ValueType::Binary => "binary",
         ValueType::Json => "json",
+        ValueType::NodeId => "nodeid",
     }
 }

@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
 
 async fn log_generation_task(node: Node<SledStorageEngine, PermissiveAgent>) -> Result<()> {
     let context = node.context_async(c).await?;
+    let node_id = node.wait_id().await?.to_base64();
 
     // Subscribe to flags changes
     let flags_query = context.query_wait::<FlagsView>("name = 'generate_logs'").await?;
@@ -97,7 +98,7 @@ async fn log_generation_task(node: Node<SledStorageEngine, PermissiveAgent>) -> 
                     level,
                     message,
                     source: source.to_string(),
-                    node_id: node.id.to_base64(),
+                    node_id: node_id.clone(),
                     payload,
                 })
                 .await

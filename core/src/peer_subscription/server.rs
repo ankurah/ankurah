@@ -3,6 +3,7 @@ use ankurah_proto::{self as proto, Attested};
 use tracing::warn;
 
 use crate::{
+    connector::ConnectionId,
     entity::Entity,
     error::SubscriptionError,
     node::Node,
@@ -19,7 +20,7 @@ use std::collections::HashMap;
 
 /// Owns one peer's reactor subscription and per-query credential sources.
 pub struct SubscriptionHandler<CD: ContextData> {
-    peer_id: proto::EntityId,
+    connection: ConnectionId,
     release_comparison: Box<dyn Fn(proto::ComparisonId) + Send + Sync>,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
@@ -47,7 +48,7 @@ impl<CD: ContextData> Drop for SubscriptionHandler<CD> {
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub fn new<SE, PA>(peer_id: proto::EntityId, node: &Node<SE, PA>) -> Self
+    pub fn new<SE, PA>(connection: ConnectionId, node: &Node<SE, PA>) -> Self
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -57,25 +58,25 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let comparison_node = weak_node.clone();
         let release_comparison = Box::new(move |id| {
             if let Some(node) = comparison_node.upgrade() {
-                node.release_comparison(peer_id, id);
+                node.release_comparison(connection, id);
             }
         });
 
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
-            tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
+            tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", connection, update.items.len());
 
             if let Some(node) = weak_node.upgrade() {
-                tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
+                tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", connection, connection);
                 node.send_update(
-                    peer_id,
+                    connection,
                     proto::NodeUpdateBody::SubscriptionUpdate {
-                        items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
+                        items: update.items.into_iter().filter_map(|item| convert_item(&node, connection, item)).collect(),
                     },
                 );
             }
         });
 
-        Self { peer_id, release_comparison, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
+        Self { connection, release_comparison, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
     }
 
     /// Get the subscription ID for this peer.
@@ -166,8 +167,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             let included_entities = context.0.fetch_entities_from_local(&selection).await?;
             // Install future updates before fixing the initial comparison target.
             self.subscription.upsert_query(query_id, selection.clone(), included_entities, gap_fetcher, context.0, version).await?;
-            let target =
-                node.begin_scoped_comparison(self.peer_id, comparison, requested, selection, key_spec, known_state, &credentials).await?;
+            let target = node
+                .begin_scoped_comparison(self.connection, comparison, requested, selection, key_spec, known_state, &credentials)
+                .await?;
             Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target })
         }
         .await;
@@ -203,7 +205,7 @@ impl<CD: ContextData> Drop for Installation<'_, CD> {
 /// Convert a single ReactorUpdateItem to a SubscriptionUpdateItem.
 fn convert_item<SE, PA>(
     node: &Node<SE, PA>,
-    peer_id: proto::EntityId,
+    connection: ConnectionId,
     item: crate::reactor::ReactorUpdateItem,
 ) -> Option<proto::SubscriptionUpdateItem>
 where
@@ -214,7 +216,7 @@ where
     let entity_state = match item.entity.to_entity_state() {
         Ok(entity_state) => entity_state,
         Err(e) => {
-            warn!("Failed to convert entity {} to EntityState for peer {}: {}", item.entity.id(), peer_id, e);
+            warn!("Failed to convert entity {} to EntityState for peer {}: {}", item.entity.id(), connection, e);
             return None;
         }
     };

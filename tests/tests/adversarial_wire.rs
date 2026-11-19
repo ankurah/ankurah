@@ -81,7 +81,7 @@ fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> pr
     }
 }
 
-fn deliver(from: proto::EntityId, to: proto::EntityId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+fn deliver(from: proto::NodeId, to: proto::NodeId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
     proto::NodeMessage::Update(proto::NodeUpdate {
         id: proto::UpdateId::new(),
         from,
@@ -103,6 +103,14 @@ struct Fixture {
     model: proto::ModelId,
     _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent>,
     _relay: ankurah::LiveQuery<RecordView>,
+}
+
+impl Fixture {
+    /// Deliver `items` to the client as an update from the server.
+    async fn deliver_to_client(&self, items: Vec<proto::SubscriptionUpdateItem>) -> Result<()> {
+        let connection = self.client.connections_of(self.server.id().unwrap())[0];
+        self.client.handle_message(connection, deliver(self.server.id().unwrap(), self.client.id().unwrap(), items)).await
+    }
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -195,7 +203,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
             proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
+    f.deliver_to_client(vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])]).await?;
 
     // The head is now the antichain {ev_b, ev_c}. Take one merge event and
     // re-parent a copy of it on the same two ids in the opposite order;
@@ -210,7 +218,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_merge_a.clone())])).await?;
+    f.deliver_to_client(vec![event_only_item(ev_merge_a.clone())]).await?;
     let head = view.entity().head();
     assert_eq!(head.len(), 1, "merge collapses the antichain to one tip");
     assert!(head.contains(&ev_merge_a.id()), "the merge event is the head");
@@ -244,7 +252,7 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
+    f.deliver_to_client(vec![event_only_item(ev_a), event_only_item(ev_b_forged)]).await?;
 
     // A applied; B is unchanged, its head did not move, the forged event is not
     // committed, and B's real state survives.
@@ -292,7 +300,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     // security property is: the legitimate child's write is not lost, and the
     // foreign root does not get adopted as the sole head (which would discard
     // the real genesis lineage).
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b, ev_x])])).await?;
+    f.deliver_to_client(vec![event_only_multi(rec_id, vec![ev_b, ev_x])]).await?;
 
     let head = view.entity().head();
     // The original genesis lineage must not have been wholesale-replaced by the
@@ -385,7 +393,7 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     let id1 = ev1.id();
     let id2 = ev2.id();
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev1, ev2])])).await?;
+    f.deliver_to_client(vec![event_only_multi(rec_id, vec![ev1, ev2])]).await?;
 
     // Neither fabricated-parent event grounds (their parents do not exist), so
     // the entity is unchanged and no fabricated event enters the head.
@@ -420,11 +428,11 @@ async fn replay_flood_is_idempotent() -> Result<()> {
 
     // Flood: 10 identical single-event deliveries, none may error.
     for _ in 0..10 {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev.clone())])).await?;
+        f.deliver_to_client(vec![event_only_item(ev.clone())]).await?;
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])])).await?;
+    f.deliver_to_client(vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])]).await?;
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -459,7 +467,12 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
     let alt = forge_genesis_claiming(&f, rec_id, "ALT-GENESIS");
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
-    f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
+    f.server
+        .handle_message(
+            f.server.connections_of(f.client.id().unwrap())[0],
+            deliver(f.client.id().unwrap(), f.server.id().unwrap(), vec![event_only_item(alt)]),
+        )
+        .await?;
 
     // The durable node rejected it (Disjoint): the committed event set is
     // unchanged and the alt genesis is not present.
@@ -486,7 +499,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
 
     let alt = forge_genesis_claiming(&f, rec_id, "ALT-EPH");
     let alt_id = alt.id();
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
+    f.deliver_to_client(vec![event_only_item(alt)]).await?;
 
     assert_eq!(view.title().unwrap(), "t0", "ephemeral node must not adopt the forged genesis' value");
     let head_after = view.entity().head();
@@ -510,7 +523,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     // Non-creation event (non-empty parent) for an entity the client never saw.
     let ev_unknown = forge_title_event(&f, unknown_id, proto::Clock::genesis(proto::EventId::from_bytes([7u8; 32])), "ghost");
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
+    f.deliver_to_client(vec![event_only_item(ev_a), event_only_item(ev_unknown)]).await?;
 
     assert_eq!(view_a.title().unwrap(), "a1", "sibling valid item applies");
     // The phantom empty-head resident was evicted: get() forces a retrieval
@@ -559,7 +572,7 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     // handle_message returns Ok regardless (error rides the ack path); the
     // observable expectation once #246 lands is that NOTHING from an oversized
     // batch is committed. Today many events commit, so this assertion fails.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, events)])).await?;
+    f.deliver_to_client(vec![event_only_multi(rec_id, events)]).await?;
     let after = committed_event_ids(&f.client, rec_id).await?.len();
 
     assert_eq!(after, before, "an oversized batch must be rejected wholesale, committing nothing (G-3, #246)");
@@ -621,7 +634,7 @@ async fn equivocation_flood_antichain_is_bounded() -> Result<()> {
     const FLOOD: usize = 256;
     let siblings: Vec<proto::Event> = (0..FLOOD).map(|i| forge_title_event(&f, rec_id, head0.clone(), &format!("equiv-{i}"))).collect();
     for ev in siblings {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev)])).await?;
+        f.deliver_to_client(vec![event_only_item(ev)]).await?;
     }
 
     // A finite cap (whatever #246 chooses) would keep the head far below the

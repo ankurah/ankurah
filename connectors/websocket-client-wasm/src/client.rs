@@ -178,6 +178,6 @@ impl std::ops::Drop for ClientInner {
         if let Some(connection) = self.connection.get_mut().take() {
             connection.disconnect();
         }
-        info!("Websocket client inner dropped for node {}", self.node.id());
+        info!("Websocket client inner dropped for node {}", self.node.id().map_or_else(|| "unkeyed".to_owned(), |id| id.to_string()));
     }
 }

@@ -2,15 +2,18 @@ mod common;
 
 use ankurah::{Model, Node, Ref};
 use ankurah_core::{
-    connector::{PeerSender, SendError},
+    connector::{ConnectionId, PeerSender, SendError},
     error::{MutationError, RetrievalError},
-    policy::AccessDenied,
+    policy::{AccessDenied, PermissiveAgent},
     schema::catalog::SysModelRowView,
     signals::Get,
     storage::StorageEngine,
 };
 use ankurah_jwt_auth::{JwtAgent, JwtContext, Role};
-use ankurah_proto::{self as proto, EntityId};
+use ankurah_proto::{
+    self as proto,
+    ConnectionSide::{Accepting, Dialing},
+};
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,7 +52,6 @@ async fn catalog_states(node: &TestNode) -> anyhow::Result<Vec<proto::Attested<p
 
 #[derive(Clone)]
 struct ReplySender {
-    peer: EntityId,
     tx: mpsc::UnboundedSender<proto::NodeMessage>,
 }
 
@@ -57,25 +59,44 @@ impl PeerSender for ReplySender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         self.tx.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> EntityId { self.peer }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+}
+
+/// A peer registered on the node under test.
+struct WirePeer {
+    id: proto::NodeId,
+    /// The node's connection to this peer.
+    connection: ConnectionId,
+    /// Messages the node sends to this peer.
+    replies: mpsc::UnboundedReceiver<proto::NodeMessage>,
+}
+
+/// A connection to an ephemeral peer for testing requests after the handshake.
+async fn connect_peer(node: &TestNode) -> anyhow::Result<WirePeer> {
+    let peer = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let (tx, replies) = mpsc::unbounded_channel();
+    let challenge = proto::Challenge::random();
+    let presence = peer.presence(Dialing, &challenge).await?;
+    let connection = node.register_peer(Accepting, &challenge, presence, Box::new(ReplySender { tx })).await?;
+    Ok(WirePeer { id: peer.id().unwrap(), connection, replies })
 }
 
 async fn wire_register(
     node: &TestNode,
-    peer: EntityId,
-    replies: &mut mpsc::UnboundedReceiver<proto::NodeMessage>,
+    peer: &mut WirePeer,
     auth: proto::AuthData,
     model: proto::RegisterModel,
 ) -> anyhow::Result<proto::NodeResponseBody> {
     let id = proto::RequestId::new();
-    node.handle_message(proto::NodeMessage::Request {
-        // One empty entry is an anonymous credential, not an empty credential set.
-        auth: vec![auth],
-        request: proto::NodeRequest { id: id.clone(), from: peer, to: node.id, body: proto::NodeRequestBody::RegisterSchema { model } },
-    })
-    .await?;
-    match replies.try_recv()? {
+    let request = proto::NodeRequest {
+        id: id.clone(),
+        from: peer.id,
+        to: node.id().unwrap(),
+        body: proto::NodeRequestBody::RegisterSchema { model },
+    };
+    // One empty entry is an anonymous credential, not an empty credential set.
+    node.handle_message(peer.connection, proto::NodeMessage::Request { auth: vec![auth], request }).await?;
+    match peer.replies.try_recv()? {
         proto::NodeMessage::Response(response) => {
             assert_eq!(response.request_id, id);
             Ok(response.body)
@@ -93,15 +114,9 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     assert!(error.to_string().contains("Anonymous contexts cannot change the catalog"), "{error}");
     assert_eq!(catalog_states(&node).await?, before, "no model, reference target, property, or membership may be persisted");
 
-    let peer = EntityId::random();
-    let (tx, mut replies) = mpsc::unbounded_channel();
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(ReplySender { peer, tx }),
-    )
-    .await?;
+    let mut peer = connect_peer(&node).await?;
     let model = proto::RegisterModel::from(RegistrationRecord::descriptor());
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), model.clone()).await?;
+    let response = wire_register(&node, &mut peer, proto::AuthData::default(), model.clone()).await?;
     assert!(
         matches!(response, proto::NodeResponseBody::Error(ref error) if error.contains("Anonymous contexts cannot change the catalog")),
         "{response:?}"
@@ -110,7 +125,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
 
     let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
     let token = common::sign_token(&common::test_keys(), &claims);
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData(token.into_bytes()), model.clone()).await?;
+    let response = wire_register(&node, &mut peer, proto::AuthData(token.into_bytes()), model.clone()).await?;
     let registered = match response {
         proto::NodeResponseBody::SchemaRegistered { model } => model,
         other => anyhow::bail!("authenticated registration must succeed: {other:?}"),
@@ -118,7 +133,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     let after = catalog_states(&node).await?;
     assert!(after.len() > before.len());
 
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), model.clone()).await?;
+    let response = wire_register(&node, &mut peer, proto::AuthData::default(), model.clone()).await?;
     assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { model } if model.id == registered.id));
     assert_eq!(catalog_states(&node).await?, after, "anonymous no-op registration is still allowed");
     assert_eq!(anonymous.resolve_model_id::<RegistrationRecord>().await?, proto::ModelId::EntityId(registered.id));
@@ -129,13 +144,13 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     extra.name = "extra".into();
     extra.build_id = [0x42; 16];
     extension.properties.push(extra);
-    let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), extension).await?;
+    let response = wire_register(&node, &mut peer, proto::AuthData::default(), extension).await?;
     assert!(
         matches!(response, proto::NodeResponseBody::Error(ref error) if error.contains("Anonymous contexts cannot change the catalog")),
         "{response:?}"
     );
     assert_eq!(catalog_states(&node).await?, after, "an existing model must not permit anonymous schema extension");
-    node.deregister_peer(peer);
+    node.deregister_peer(peer.connection);
     Ok(())
 }
 
@@ -143,13 +158,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
 async fn signed_registration_cannot_change_policy_membership_optionality() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         let node = setup().await?;
-        let peer = EntityId::random();
-        let (tx, mut replies) = mpsc::unbounded_channel();
-        node.register_peer(
-            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-            Box::new(ReplySender { peer, tx }),
-        )
-        .await?;
+        let mut peer = connect_peer(&node).await?;
         let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
         let auth = proto::AuthData(common::sign_token(&common::test_keys(), &claims).into_bytes());
         let model = proto::RegisterModel::from(Role::descriptor());
@@ -162,7 +171,7 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
         let mut changed = model.clone();
         assert_eq!(changed.properties.len(), 1);
         changed.properties[0].optional = true;
-        let response = wire_register(&node, peer, &mut replies, auth.clone(), changed).await?;
+        let response = wire_register(&node, &mut peer, auth.clone(), changed).await?;
         assert!(
             matches!(response, proto::NodeResponseBody::Error(ref error) if error.contains("Only privileged contexts may change JWT policy schema")),
             "{response:?}"
@@ -175,16 +184,16 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
         shared.label = "shared_role_name".into();
         shared.name = "SharedRoleName".into();
         shared.properties[0].explicit_id = Some(property_id);
-        let response = wire_register(&node, peer, &mut replies, auth.clone(), shared.clone()).await?;
+        let response = wire_register(&node, &mut peer, auth.clone(), shared.clone()).await?;
         assert!(matches!(response, proto::NodeResponseBody::SchemaRegistered { .. }), "{response:?}");
         shared.properties[0].optional = true;
-        let response = wire_register(&node, peer, &mut replies, auth, shared).await?;
+        let response = wire_register(&node, &mut peer, auth, shared).await?;
         assert!(
             matches!(response, proto::NodeResponseBody::SchemaRegistered { ref model } if model.properties[0].optional),
             "{response:?}"
         );
         assert!(!node.catalog.membership_by_id(&membership_id)?.expect("unchanged role membership").optional);
-        node.deregister_peer(peer);
+        node.deregister_peer(peer.connection);
         Ok::<(), anyhow::Error>(())
     })
     .await?
@@ -237,28 +246,12 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
         let (server_tx, mut server_rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
-        client
-            .register_peer(
-                proto::Presence {
-                    node_id: server.id,
-                    durable: true,
-                    system_root: server.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
-                Box::new(ReplySender { peer: server.id, tx: server_tx }),
-            )
-            .await?;
-        server
-            .register_peer(
-                proto::Presence {
-                    node_id: client.id,
-                    durable: false,
-                    system_root: client.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
-                Box::new(ReplySender { peer: client.id, tx: client_tx }),
-            )
-            .await?;
+        let challenge = proto::Challenge::random();
+        let presence = server.presence(Accepting, &challenge).await?;
+        let to_server = client.register_peer(Dialing, &challenge, presence, Box::new(ReplySender { tx: server_tx })).await?;
+        let challenge = proto::Challenge::random();
+        let presence = client.presence(Dialing, &challenge).await?;
+        let to_client = server.register_peer(Accepting, &challenge, presence, Box::new(ReplySender { tx: client_tx })).await?;
 
         let held = Arc::new(Mutex::new(None::<Vec<proto::NodeMessage>>));
         let server_task = {
@@ -267,7 +260,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                 while let Some(message) = server_rx.recv().await {
                     let server = server.clone();
                     tokio::spawn(async move {
-                        server.handle_message(message).await.unwrap();
+                        server.handle_message(to_client, message).await.unwrap();
                     });
                 }
             })
@@ -285,7 +278,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                     }
                     let client = client.clone();
                     tokio::spawn(async move {
-                        client.handle_message(message).await.unwrap();
+                        client.handle_message(to_server, message).await.unwrap();
                     });
                 }
             })
@@ -336,7 +329,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         }
         let updates = held.lock().unwrap().take().unwrap();
         for update in updates {
-            client.handle_message(update).await?;
+            client.handle_message(to_server, update).await?;
         }
 
         let query = context.query::<ScopeProbeView>("body = 'hello'")?;
@@ -344,8 +337,8 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         assert!(query.get().iter().any(|row| row.id() == id));
         assert_eq!(context.fetch::<ScopeProbeView>("body = 'hello'").await?.len(), 1);
 
-        server.deregister_peer(client.id);
-        client.deregister_peer(server.id);
+        server.deregister_peer(to_client);
+        client.deregister_peer(to_server);
         server_task.abort();
         client_task.abort();
         Ok::<(), anyhow::Error>(())

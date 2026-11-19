@@ -45,7 +45,7 @@ pub const MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 /// Key encoding rules:
 /// - Bool → number (0/1) because booleans are not valid IndexedDB keys
 /// - I64 → number, or zero-padded text for positive values above 2^53 - 1
-/// - Binary/Object → Uint8Array for lexicographic byte ordering
+/// - Binary/Object/NodeId → Uint8Array for lexicographic byte ordering
 /// - All other types → standard JsValue encoding
 pub struct IdbValue(Value);
 
@@ -68,6 +68,13 @@ impl IdbValue {
             ValueType::Bool => value.as_f64().filter(|n| *n == 0.0 || *n == 1.0).map(|n| Value::Bool(n == 1.0)),
             ValueType::String => value.as_string().map(Value::String),
             ValueType::EntityId => value.as_string().and_then(|text| text.parse().ok()).map(Value::EntityId),
+            ValueType::NodeId => {
+                if value.is_instance_of::<js_sys::Uint8Array>() || value.is_instance_of::<js_sys::ArrayBuffer>() {
+                    js_sys::Uint8Array::new(&value).to_vec().try_into().ok().map(ankurah_proto::NodeId::from_bytes).map(Value::NodeId)
+                } else {
+                    None
+                }
+            }
             ValueType::Binary | ValueType::Object => {
                 if value.is_instance_of::<js_sys::Uint8Array>() || value.is_instance_of::<js_sys::ArrayBuffer>() {
                     let bytes = js_sys::Uint8Array::new(&value).to_vec();
@@ -128,6 +135,7 @@ impl From<IdbValue> for JsValue {
             Value::Bool(b) => JsValue::from_f64(if b { 1.0 } else { 0.0 }), // IndexedDB keys don't support boolean
             Value::String(s) => JsValue::from_str(&s),
             Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
+            Value::NodeId(node_id) => js_sys::Uint8Array::from(node_id.to_bytes().as_slice()).into(),
             Value::Binary(bytes) | Value::Object(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
             // Json is stored as a parsed JS object to enable IndexedDB's native nested property indexing.
             // IMPORTANT: We must use serialize_maps_as_objects(true) to create plain JS objects,
@@ -162,6 +170,7 @@ mod tests {
             Value::Bool(false),
             Value::String("00009007199254740992".into()),
             Value::EntityId(ankurah_proto::EntityId::from_bytes([1; 32])),
+            Value::NodeId(ankurah_proto::NodeId::from_bytes([1; 32])),
             Value::Binary(vec![0, 1, 255]),
             Value::Object(vec![0, 1, 255]),
             Value::Json(serde_json::json!({"name": "123", "count": 7})),

@@ -57,13 +57,12 @@ pub struct Record {
 // crate so the shipped connector keeps its minimal API.
 // ---------------------------------------------------------------------------
 
-use ankurah::core::connector::{PeerSender, SendError};
+use ankurah::core::connector::{ConnectionId, PeerSender, SendError};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
 struct GatedSender {
     sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::EntityId,
 }
 
 #[async_trait::async_trait]
@@ -72,7 +71,6 @@ impl PeerSender for GatedSender {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
-    fn recipient_node_id(&self) -> proto::EntityId { self.node_id }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -81,6 +79,8 @@ impl PeerSender for GatedSender {
 pub struct MessageGate {
     filter: Arc<dyn Fn(&proto::NodeMessage) -> bool + Send + Sync>,
     held: Arc<Mutex<Vec<proto::NodeMessage>>>,
+    /// The gated node's connection to the other node, on which the held messages arrived.
+    connection: ConnectionId,
 }
 
 impl MessageGate {
@@ -106,7 +106,7 @@ impl MessageGate {
             held.drain(..count).collect()
         };
         for message in drained {
-            let _ = node.handle_message(message).await;
+            let _ = node.handle_message(self.connection, message).await;
         }
     }
 
@@ -123,7 +123,7 @@ impl MessageGate {
             held.drain(start..).collect()
         };
         for message in drained {
-            let _ = node.handle_message(message).await;
+            let _ = node.handle_message(self.connection, message).await;
         }
     }
 }
@@ -151,45 +151,31 @@ impl GatedConnection {
     {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
-        other.system.wait_loaded().await.unwrap();
-        gated.system.wait_loaded().await.unwrap();
         let register_other = async {
+            let challenge = proto::Challenge::random();
+            let presence = gated.presence(proto::ConnectionSide::Accepting, &challenge).await.expect("the gated node is not halted");
             other
-                .register_peer(
-                    proto::Presence {
-                        node_id: gated.id,
-                        durable: gated.durable,
-                        system_root: gated.system.root(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                    },
-                    Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
-                )
+                .register_peer(proto::ConnectionSide::Dialing, &challenge, presence, Box::new(GatedSender { sender: gated_tx }))
                 .await
-                .expect("gated peers use the current protocol version");
+                .expect("gated peers use the current protocol version")
         };
         let register_gated = async {
+            let challenge = proto::Challenge::random();
+            let presence = other.presence(proto::ConnectionSide::Dialing, &challenge).await.expect("the other node is not halted");
             gated
-                .register_peer(
-                    proto::Presence {
-                        node_id: other.id,
-                        durable: other.durable,
-                        system_root: other.system.root(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                    },
-                    Box::new(GatedSender { sender: other_tx, node_id: other.id }),
-                )
+                .register_peer(proto::ConnectionSide::Accepting, &challenge, presence, Box::new(GatedSender { sender: other_tx }))
                 .await
-                .expect("gated peers use the current protocol version");
+                .expect("gated peers use the current protocol version")
         };
-        if other.durable && !gated.durable {
-            register_gated.await;
-            register_other.await;
+        let (other_connection, gated_connection) = if other.durable && !gated.durable {
+            let gated_connection = register_gated.await;
+            (register_other.await, gated_connection)
         } else {
-            register_other.await;
-            register_gated.await;
-        }
+            let other_connection = register_other.await;
+            (other_connection, register_gated.await)
+        };
 
-        let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())) };
+        let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())), connection: gated_connection };
 
         // Messages flowing INTO `other` are always handled immediately.
         let task_a = {
@@ -198,7 +184,7 @@ impl GatedConnection {
                 while let Some(message) = other_rx.recv().await {
                     let node = node.clone();
                     tokio::spawn(async move {
-                        let _ = node.handle_message(message).await;
+                        let _ = node.handle_message(other_connection, message).await;
                     });
                 }
             })
@@ -215,8 +201,9 @@ impl GatedConnection {
                         continue;
                     }
                     let node = node.clone();
+                    let connection = gate.connection;
                     tokio::spawn(async move {
-                        let _ = node.handle_message(message).await;
+                        let _ = node.handle_message(connection, message).await;
                     });
                 }
             })

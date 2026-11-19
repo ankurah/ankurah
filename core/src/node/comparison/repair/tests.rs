@@ -62,7 +62,7 @@ impl PolicyAgent for ReadPolicy {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &Attested<Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -73,7 +73,7 @@ impl PolicyAgent for ReadPolicy {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -107,7 +107,7 @@ impl PolicyAgent for ReadPolicy {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -115,16 +115,15 @@ impl PolicyAgent for ReadPolicy {
 }
 
 #[derive(Clone)]
-struct Sender(EntityId);
+struct Sender;
 impl PeerSender for Sender {
     fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
-    fn recipient_node_id(&self) -> EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 struct Fixture {
     node: Node<TestStorage, ReadPolicy>,
-    peer: EntityId,
+    peer: ConnectionId,
     model: proto::ModelId,
     root: Event,
     current: Event,
@@ -139,17 +138,7 @@ impl Fixture {
         let node = Node::new_durable(storage, ReadPolicy::default());
         node.system.create().await?;
         node.wait_ready().await?;
-        let peer = EntityId::random();
-        node.register_peer(
-            proto::Presence {
-                node_id: peer,
-                durable,
-                system_root: if durable { node.system.root() } else { None },
-                protocol_version: proto::PROTOCOL_VERSION,
-            },
-            Box::new(Sender(peer)),
-        )
-        .await?;
+        let peer = crate::test_utils::connect_peer(&node, &crate::node::NodeKey::generate(), durable, Sender).await?;
         let model = proto::ModelId::EntityId(EntityId::random());
         let root = Event::genesis(
             None,

@@ -93,11 +93,11 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     };
     let update = proto::NodeUpdate {
         id: proto::UpdateId::new(),
-        from: server.id,
-        to: client.id,
+        from: server.id().unwrap(),
+        to: client.id().unwrap(),
         body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
     };
-    client.handle_message(proto::NodeMessage::Update(update)).await?;
+    client.handle_message(client.connections_of(server.id().unwrap())[0], proto::NodeMessage::Update(update)).await?;
 
     // Both events applied in causal order: the parent's write survives.
     assert_eq!(view.title().unwrap(), "t-child", "child's write applied");
@@ -158,8 +158,8 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
 
     let update = proto::NodeUpdate {
         id: proto::UpdateId::new(),
-        from: server.id,
-        to: client.id,
+        from: server.id().unwrap(),
+        to: client.id().unwrap(),
         body: proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![event_only_item(ev_a), event_only_item(ev_unknown), event_only_item(ev_b)],
         },
@@ -169,7 +169,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     // NodeUpdateAck::Error rather than its own return value; the aggregate
     // ApplyError::Items surfaces there. What this test pins is the state
     // outcome: containment, not batch poisoning.
-    client.handle_message(proto::NodeMessage::Update(update)).await?;
+    client.handle_message(client.connections_of(server.id().unwrap())[0], proto::NodeMessage::Update(update)).await?;
 
     // Items one and three applied despite the failure in the middle.
     assert_eq!(view_a.title().unwrap(), "a1", "item 1 must apply");

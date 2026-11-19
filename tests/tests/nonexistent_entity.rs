@@ -48,7 +48,7 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
 
     let resp = client
         .request(
-            server.id,
+            server.id().unwrap(),
             &DEFAULT_CONTEXT,
             proto::NodeRequestBody::CommitTransaction {
                 id: proto::TransactionId::new(),
@@ -96,7 +96,7 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
 
     let resp = client
         .request(
-            server.id,
+            server.id().unwrap(),
             &DEFAULT_CONTEXT,
             proto::NodeRequestBody::CommitTransaction {
                 id: proto::TransactionId::new(),

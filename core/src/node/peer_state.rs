@@ -9,6 +9,8 @@ use crate::{
 use tokio::sync::oneshot;
 
 pub struct PeerState<CD: ContextData> {
+    /// The node id the peer registered for this connection.
+    pub(super) node_id: proto::NodeId,
     pub(super) sender: Box<dyn PeerSender>,
     pub(super) durable: bool,
     pub(super) subscription_handler: SubscriptionHandler<CD>,
@@ -18,8 +20,14 @@ pub struct PeerState<CD: ContextData> {
 }
 
 impl<CD: ContextData> PeerState<CD> {
-    pub(super) fn new(sender: Box<dyn PeerSender>, durable: bool, subscription_handler: SubscriptionHandler<CD>) -> Self {
+    pub(super) fn new(
+        node_id: proto::NodeId,
+        sender: Box<dyn PeerSender>,
+        durable: bool,
+        subscription_handler: SubscriptionHandler<CD>,
+    ) -> Self {
         Self {
+            node_id,
             sender,
             durable,
             subscription_handler,

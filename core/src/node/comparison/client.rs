@@ -25,6 +25,7 @@ use super::{
     RepairReceipt,
 };
 use crate::{
+    connector::ConnectionId,
     error::{RequestError, RetrievalError},
     node::{trees::ComparisonTree, Node},
     policy::{ComparisonLimits, ContextPolicy, PolicyAgent},
@@ -92,14 +93,14 @@ impl ComparisonBudget {
 impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     pub(in crate::node) async fn compare_query(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         selection: &Selection<Resolved>,
         capture: &ComparisonTree<SE>,
         target: ComparisonTarget,
         credentials: &Vec<PA::ContextData>,
         budget: &mut ComparisonBudget,
     ) -> Result<(), RetrievalError> {
-        let exchange = NodeExchange { node: self, peer, selection, comparison: target.id, credentials, budget };
+        let exchange = NodeExchange { node: self, connection_id, selection, comparison: target.id, credentials, budget };
         compare(capture, target, &exchange, budget).await
     }
 }
@@ -115,7 +116,7 @@ trait Exchange: Sync {
 
 struct NodeExchange<'a, SE, PA: PolicyAgent> {
     node: &'a Node<SE, PA>,
-    peer: EntityId,
+    connection_id: ConnectionId,
     selection: &'a Selection<Resolved>,
     comparison: ComparisonId,
     credentials: &'a Vec<PA::ContextData>,
@@ -151,7 +152,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Exchange for NodeExchange<'_,
             selection: self.selection.clone(),
             request: ComparisonRequest::Pages { spans },
         };
-        match self.node.request(self.peer, self.credentials, body).await? {
+        match self.node.request_on(self.connection_id, self.credentials, body).await? {
             NodeResponseBody::Compared(Ok(ComparisonReply::Pages(pages))) => Ok(pages),
             NodeResponseBody::Compared(Err(error)) => Err(failure(error)),
             NodeResponseBody::Error(error) => Err(RequestError::ServerError(error).into()),
@@ -181,8 +182,10 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Exchange for NodeExchange<'_,
             return Ok(RepairReceipt { unavailable: withheld, bytes: 0, events: 0 });
         }
         self.budget.bytes(serialized_size(&members)?)?;
-        let mut receipt =
-            self.node.request_comparison_repair(self.peer, self.comparison, self.selection, members, events_only, self.credentials).await?;
+        let mut receipt = self
+            .node
+            .request_comparison_repair(self.connection_id, self.comparison, self.selection, members, events_only, self.credentials)
+            .await?;
         receipt.unavailable.extend(withheld);
         Ok(receipt)
     }
@@ -214,7 +217,7 @@ fn disclosable_members(
             withheld.push(id);
             continue;
         }
-        // A captured remote address was already disclosed by the peer. It can
+        // A captured remote address was already disclosed by the connection_id. It can
         // still be repaired cold without revealing a denied local head.
         member.known.head = state.filter(|_| readable).map(|state| state.payload.state.head).unwrap_or_default();
         disclosed.push(member);

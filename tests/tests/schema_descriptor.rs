@@ -72,7 +72,7 @@ async fn reference_get_binds_target_lazily_and_reuses_the_binding() -> anyhow::R
     let mut declaration = proto::RegisterModel::from(DescArtist::descriptor());
     declaration.name = "Edited catalog name".into();
     assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: declaration }).await?,
+        client.request(server.id().unwrap(), &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: declaration }).await?,
         proto::NodeResponseBody::SchemaRegistered { .. }
     ));
 
@@ -279,7 +279,7 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
     // hand-written descriptors.
     let request = proto::NodeRequestBody::RegisterSchema { model: proto::RegisterModel::from(DescAllTypes::descriptor()) };
 
-    let reg_models = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
+    let reg_models = match client.request(server.id().unwrap(), &DEFAULT_CONTEXT, request).await? {
         proto::NodeResponseBody::SchemaRegistered { model } => model,
         other => panic!("expected SchemaRegistered, got {other}"),
     };

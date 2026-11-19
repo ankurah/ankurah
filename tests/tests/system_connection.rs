@@ -15,13 +15,17 @@ use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 
 type Socket = WebSocketStream<TcpStream>;
 
+/// A server handshake for testing the client's response to `server`'s system root.
 async fn advertise(socket: &mut Socket, server: &Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<()> {
-    let presence = proto::Presence {
-        node_id: server.id,
-        durable: server.durable,
-        system_root: server.system.root(),
-        protocol_version: proto::PROTOCOL_VERSION,
+    let client_challenge = match socket.next().await.transpose()? {
+        Some(Message::Binary(bytes)) => match bincode::deserialize(&bytes)? {
+            proto::Message::Challenge(challenge) => challenge,
+            other => anyhow::bail!("expected client Challenge, got {other:?}"),
+        },
+        other => anyhow::bail!("expected client Challenge frame, got {other:?}"),
     };
+    socket.send(Message::Binary(bincode::serialize(&proto::Message::Challenge(proto::Challenge::random()))?.into())).await?;
+    let presence = server.presence(proto::ConnectionSide::Accepting, &client_challenge).await?;
     socket.send(Message::Binary(bincode::serialize(&proto::Message::Presence(presence))?.into())).await?;
     Ok(())
 }
@@ -29,7 +33,7 @@ async fn advertise(socket: &mut Socket, server: &Node<SledStorageEngine, Permiss
 async fn client_presence(socket: &mut Socket) -> anyhow::Result<proto::Presence> {
     match socket.next().await.transpose()? {
         Some(Message::Binary(bytes)) => match bincode::deserialize(&bytes)? {
-            proto::Message::Presence(presence) => Ok(presence),
+            proto::Message::Presence(signed) => Ok(signed.presence),
             other => anyhow::bail!("expected client Presence, got {other:?}"),
         },
         other => anyhow::bail!("expected client Presence frame, got {other:?}"),

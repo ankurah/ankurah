@@ -309,7 +309,7 @@ impl ModelDescription {
 
     /// Generate UniFFI getter methods for View fields.
     /// Returns projected field values (String, i64, etc.) via the underlying View methods.
-    /// Entity id fields return the EntityId and Ref objects that `IdBinding` describes, as the
+    /// Id fields return the EntityId, NodeId and Ref objects that `IdBinding` describes, as the
     /// Input record takes them.
     /// Uses `uniffi_` prefix internally with `#[uniffi::method(name = "...")]` to expose
     /// with original field names, avoiding conflicts with core Rust methods.

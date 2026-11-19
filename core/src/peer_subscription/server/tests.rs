@@ -15,24 +15,18 @@ use crate::{
 };
 
 #[derive(Clone)]
-struct Sender(proto::EntityId);
+struct Sender;
 
 impl PeerSender for Sender {
     fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, proto::EntityId, ankql::ast::Selection<Resolved>)> {
+async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, ankql::ast::Selection<Resolved>)> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
     node.system.create().await?;
     node.wait_ready().await?;
-    let peer = proto::EntityId::random();
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(Sender(peer)),
-    )
-    .await?;
+    let peer = crate::test_utils::connect_peer(&node, &crate::node::NodeKey::generate(), false, Sender).await?;
     Ok((node, peer, Predicate::MemberOf(proto::ModelId::EntityId(proto::EntityId::random())).into()))
 }
 

@@ -14,6 +14,7 @@ use futures::TryStreamExt;
 
 use super::serve::CheckedCapture;
 use crate::{
+    connector::ConnectionId,
     error::RetrievalError,
     event_dag::{compare, AbstractCausalRelation},
     node::Node,
@@ -104,14 +105,14 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     /// captured tree; an omitted key is a known-ID read, including predicate exits.
     pub(in crate::node) async fn prepare_comparison_repair(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         id: proto::ComparisonId,
         selection: &Selection<Resolved>,
         members: Vec<proto::RepairMember>,
         events_only: bool,
         credentials: &Vec<PA::ContextData>,
     ) -> Result<PreparedRepair<SE, PA::ContextData>, RetrievalError> {
-        let checked = self.checked_comparison(peer, id, selection, credentials, members.len()).await?;
+        let checked = self.checked_comparison(connection_id, id, selection, credentials, members.len()).await?;
         let durable = checked.connection()?.durable;
         let remaining = checked.remaining();
         let prepare = async {

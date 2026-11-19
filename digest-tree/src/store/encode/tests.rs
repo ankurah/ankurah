@@ -64,6 +64,7 @@ fn rows_round_trip<G: DigestGroup>() {
     // collation that a tree refuses when opening the spec.
     let key_spec = KeySpec::new(vec![
         asc!(Property::A, ValueType::I64),
+        asc!(Property::A, ValueType::NodeId),
         desc!(Property::B, ValueType::String),
         IndexKeyPart {
             key: Property::Year,

@@ -65,6 +65,9 @@ fn generate_expr_sql<S: Stage>(
             Value::EntityId(id) => {
                 write_string(&id.to_base64(), buffer);
             }
+            Value::NodeId(id) => {
+                write_string(&id.to_base64(), buffer);
+            }
             Value::Object(_) | Value::Binary(_) => {
                 return Err(SqlGenerationError::InvalidExpression("Object and Binary values have no AnkQL literal syntax".to_string()));
             }

@@ -41,7 +41,8 @@ async fn peer_get_preserves_denial_and_absence_even_with_a_cached_entity() -> Re
 
     let model = *Pet::descriptor().bind_local(&server.catalog, server.system.system_epoch().unwrap())?.as_entity_id().unwrap();
     let missing = proto::EntityId::random();
-    let response = client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id, missing, model] }).await?;
+    let response =
+        client.request(server.id().unwrap(), &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id, missing, model] }).await?;
     // Exercise the actual wire shape, including a successful catalog bootstrap read in the same batch.
     let response: proto::NodeResponseBody = bincode::deserialize(&bincode::serialize(&response)?)?;
     match response {
@@ -188,7 +189,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         self.validate_calls.fetch_add(1, Ordering::SeqCst);
@@ -202,7 +203,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -250,7 +251,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _assertion: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -339,8 +340,12 @@ async fn fetch_and_subscription_summaries_exclude_states_denied_after_predicate_
     // A relay retry keeps the installed selection, but policy may have narrowed.
     // Its digest must not disclose a formerly allowed member on reconnect.
     drop(connection);
-    client.deregister_peer(server.id);
-    server.deregister_peer(client.id);
+    for connection in client.connections_of(server.id().unwrap()) {
+        client.deregister_peer(connection);
+    }
+    for connection in server.connections_of(client.id().unwrap()) {
+        server.deregister_peer(connection);
+    }
     let missing_property = Predicate::Comparison {
         left: Box::new(ankql::ast::Expr::Path(proto::PropertyId::EntityId(proto::EntityId::random()).into())),
         operator: ankql::ast::ComparisonOperator::Equal,
@@ -413,7 +418,7 @@ async fn matching_limited_known_state_skips_pages_for_fetch_and_subscription() -
             } else {
                 proto::NodeRequestBody::Fetch { selection: selection.clone(), comparison, key_spec: key_spec.clone(), known_state: summary }
             };
-            let response = client.request(server.id, &DEFAULT_CONTEXT, request).await?;
+            let response = client.request(server.id().unwrap(), &DEFAULT_CONTEXT, request).await?;
             let target = match response {
                 proto::NodeResponseBody::Fetch(target) | proto::NodeResponseBody::QuerySubscribed { target, .. } => target,
                 response => panic!("unexpected response: {response:?}"),
@@ -425,7 +430,12 @@ async fn matching_limited_known_state_skips_pages_for_fetch_and_subscription() -
                 let Some(ankurah_digest_tree::Page::Members(members)) = target.page else { panic!("small unequal target has leaves") };
                 assert_eq!(members.iter().map(|member| member.id).collect::<Vec<_>>(), ids[..2]);
             }
-            server.handle_message(proto::NodeMessage::ReleaseComparison { from: client.id, comparison }).await?;
+            server
+                .handle_message(
+                    server.connections_of(client.id().unwrap())[0],
+                    proto::NodeMessage::ReleaseComparison { from: client.id().unwrap(), comparison },
+                )
+                .await?;
         }
     }
     Ok(())
@@ -488,7 +498,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             proto::NodeRequestBody::Get { ids: vec![entity_id] },
             proto::NodeRequestBody::GetEvents { event_ids: events.iter().map(|event| event.payload.id()).collect() },
         ] {
-            match client.request(server.id, &credentials, request).await? {
+            match client.request(server.id().unwrap(), &credentials, request).await? {
                 proto::NodeResponseBody::Get(results) => assert!(matches!(results.as_slice(), [proto::GetResult::Found(_)])),
                 proto::NodeResponseBody::GetEvents(received) => assert_eq!(received.len(), events.len()),
                 response => panic!("catalog read failed for {label}: {response:?}"),
@@ -510,12 +520,17 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             } else {
                 proto::NodeRequestBody::Fetch { selection, comparison, key_spec, known_state: proto::KnownState::empty() }
             };
-            let target = match client.request(server.id, &credentials, request).await? {
+            let target = match client.request(server.id().unwrap(), &credentials, request).await? {
                 proto::NodeResponseBody::Fetch(target) | proto::NodeResponseBody::QuerySubscribed { target, .. } => target,
                 response => panic!("catalog capture failed for {label}: {response:?}"),
             };
             assert_eq!(target.known_state.digest.count() as usize, states.len());
-            server.handle_message(proto::NodeMessage::ReleaseComparison { from: client.id, comparison }).await?;
+            server
+                .handle_message(
+                    server.connections_of(client.id().unwrap())[0],
+                    proto::NodeMessage::ReleaseComparison { from: client.id().unwrap(), comparison },
+                )
+                .await?;
         }
 
         // Reconnect the standing catalog queries through the complete comparison
@@ -543,7 +558,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     ] {
         let response = client
             .request(
-                server.id,
+                server.id().unwrap(),
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::Fetch {
                     selection: Predicate::MemberOf(model).into(),
@@ -681,7 +696,11 @@ async fn get_events_retrieves_identities_across_model_memberships() -> Result<()
         trx.commit_and_return_events().await?.into_iter().next().expect("album genesis event")
     };
     let response = client
-        .request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::GetEvents { event_ids: vec![pet_event.id(), album_event.id()] })
+        .request(
+            server.id().unwrap(),
+            &DEFAULT_CONTEXT,
+            proto::NodeRequestBody::GetEvents { event_ids: vec![pet_event.id(), album_event.id()] },
+        )
         .await?;
 
     match response {
@@ -694,7 +713,11 @@ async fn get_events_retrieves_identities_across_model_memberships() -> Result<()
 
     agent.deny_read_events.lock().unwrap().insert(pet_event.id());
     let response = client
-        .request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::GetEvents { event_ids: vec![pet_event.id(), album_event.id()] })
+        .request(
+            server.id().unwrap(),
+            &DEFAULT_CONTEXT,
+            proto::NodeRequestBody::GetEvents { event_ids: vec![pet_event.id(), album_event.id()] },
+        )
         .await?;
     assert!(
         matches!(response, proto::NodeResponseBody::GetEvents(events)
@@ -708,7 +731,7 @@ async fn get_events_retrieves_identities_across_model_memberships() -> Result<()
     agent.deny_reads.store(true, Ordering::SeqCst);
     let response = client
         .request(
-            server.id,
+            server.id().unwrap(),
             &DEFAULT_CONTEXT,
             proto::NodeRequestBody::GetEvents {
                 event_ids: vec![pet_event.id(), album_event.id(), catalog_event.payload.id(), EventId::from_bytes([0xfe; 32])],

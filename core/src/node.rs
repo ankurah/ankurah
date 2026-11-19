@@ -1,7 +1,7 @@
 use crate::{internal::prelude::*, schema::registration::RegistrationError};
 use ankql::ast::Resolved;
 use ankurah_proto::Attested;
-use ankurah_signals::{Calculated, Get, Mut, Wait};
+use ankurah_signals::{Calculated, Get, Mut, Read, Wait};
 use anyhow::anyhow;
 use futures::{FutureExt, TryFutureExt};
 
@@ -10,11 +10,14 @@ use rand::rngs::SmallRng;
 use std::{
     fmt,
     ops::Deref,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+    },
 };
 use tokio::sync::oneshot;
 
-use crate::connector::{PeerConnectionError, PeerSender};
+use crate::connector::{ConnectionId, PeerConnectionError, PeerSender};
 use crate::context::{Context, ContextAuth, ContextInner};
 use crate::entity::WeakEntitySet;
 use crate::error::{NodeHaltReason, NodeReadinessError, RequestError};
@@ -40,6 +43,8 @@ mod erased;
 pub(crate) mod event_admissibility;
 pub(crate) mod handler;
 pub mod handles;
+mod key;
+mod key_lookup;
 mod match_args;
 mod peer_state;
 mod replication;
@@ -51,6 +56,7 @@ mod trees;
 
 pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
+pub use key::{InvalidNodeKey, NodeKey};
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
 pub use replication::{Replication, ReplicationState};
@@ -71,19 +77,22 @@ pub struct WeakNode<SE, PA>
 where PA: PolicyAgent
 {
     node: Weak<NodeInner<SE, PA>>,
-    node_id: proto::EntityId,
+    /// The node's keypair, readable after the node drops so that a weak handle still gives the node id.
+    keypair: Read<Option<NodeKey>>,
 }
 impl<SE, PA> Clone for WeakNode<SE, PA>
 where PA: PolicyAgent
 {
-    fn clone(&self) -> Self { Self { node: self.node.clone(), node_id: self.node_id } }
+    fn clone(&self) -> Self { Self { node: self.node.clone(), keypair: self.keypair.clone() } }
 }
 
 impl<SE, PA> WeakNode<SE, PA>
 where PA: PolicyAgent
 {
     pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.node.upgrade().map(Node) }
-    pub fn node_id(&self) -> proto::EntityId { self.node_id }
+
+    /// The node's id, or `None` while the node is unkeyed.
+    pub fn node_id(&self) -> Option<proto::NodeId> { self.keypair.value().map(|key| key.public_key().node_id()) }
 }
 
 impl<SE, PA> Deref for Node<SE, PA>
@@ -98,7 +107,9 @@ pub use crate::session::ContextData;
 pub struct NodeInner<SE, PA>
 where PA: PolicyAgent
 {
-    pub id: proto::EntityId,
+    /// The node's keypair, which gives its node id and signs its presence: `None` while the node is unkeyed, until
+    /// the lookup that [`Node::new`] and [`Node::new_durable`] start finds the stored keypair or stores a new one.
+    keypair: Mut<Option<NodeKey>>,
     pub durable: bool,
     pub storage: Arc<SE>,
 
@@ -113,8 +124,9 @@ where PA: PolicyAgent
     /// or update one already registered there. Otherwise a competing writer could retry
     /// from stale in-memory state after storage advances. Reactor notification follows later.
     pub(crate) commit_publication_lock: Arc<tokio::sync::Mutex<()>>,
-    peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
-    durable_peers: SafeSet<proto::EntityId>,
+    peer_connections: SafeMap<ConnectionId, Arc<PeerState<PA::ContextData>>>,
+    next_connection: AtomicU64,
+    durable_peers: SafeSet<ConnectionId>,
 
     /// Per-node source of randomness for peer selection. Seeded from entropy in production;
     /// an explicit seed can be injected at construction so the simulation harness and tests
@@ -144,6 +156,17 @@ where PA: PolicyAgent
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 }
 
+impl<SE, PA> NodeInner<SE, PA>
+where PA: PolicyAgent
+{
+    /// This node's id, the public key of its keypair: `None` while the node is unkeyed.
+    pub fn id(&self) -> Option<proto::NodeId> { self.keypair.with(|key| key.as_ref().map(|key| key.public_key().node_id())) }
+
+    /// This node's id, on a path that runs only on a connection: [`Node::register_peer`] waits for the keypair,
+    /// so a node with a connection is keyed.
+    fn keyed_id(&self) -> proto::NodeId { self.id().expect("a node with a connection is keyed") }
+}
+
 impl<SE, PA> NodeErased for NodeInner<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -166,20 +189,39 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, SmallRng::from_entropy()) }
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, true, SmallRng::from_entropy()) }
+    /// An ephemeral node with the keypair its storage engine keeps, so its node id stays the same for as long as the
+    /// store keeps that keypair. The node starts unkeyed, and looks the keypair up, or stores a new one, as it initializes.
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, None, SmallRng::from_entropy()) }
 
-    /// Wipe local storage when a different system is offered, so a new node can adopt it.
+    /// A durable node with the keypair its storage engine keeps, so its node id stays the same for as long as the
+    /// store keeps that keypair. The node starts unkeyed, and looks the keypair up, or stores a new one, as it initializes.
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
+        Self::build(engine, policy_agent, true, None, SmallRng::from_entropy())
+    }
+
+    /// An ephemeral node, keyed from the start with a keypair supplied by the application; its storage engine's keypair
+    /// is not read. Reusing the same keypair preserves the node id across runs.
+    pub fn new_with_key(engine: Arc<SE>, policy_agent: PA, key: NodeKey) -> Self {
+        Self::build(engine, policy_agent, false, Some(key), SmallRng::from_entropy())
+    }
+
+    /// A durable node, keyed from the start with a keypair supplied by the application; its storage engine's keypair
+    /// is not read. Reusing the same keypair preserves the node id across runs.
+    pub fn new_durable_with_key(engine: Arc<SE>, policy_agent: PA, key: NodeKey) -> Self {
+        Self::build(engine, policy_agent, true, Some(key), SmallRng::from_entropy())
+    }
+
+    /// Wipe local storage, the stored keypair included, when a different system is offered, so a new node can adopt it.
     /// Disabled by default. A different system always halts this node; it never recovers in place.
     pub fn set_allow_system_replacement(&self, allow: bool) { self.system.set_allow_system_replacement(allow); }
 
     /// Initialization and terminal halt state; independent of peer connectivity.
     pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }
 
-    /// Require completed system, catalog, and policy initialization, or return why the node is unavailable.
+    /// Require completed keypair, system, catalog, and policy initialization, or return why the node is unavailable.
     pub fn check_ready(&self) -> Result<(), NodeReadinessError> { self.state().value().check_ready() }
 
-    /// Wait for system, catalog, and policy initialization without retaining the node; return an error if it halts.
+    /// Wait for keypair, system, catalog, and policy initialization without retaining the node; return an error if it halts.
     pub fn wait_ready(&self) -> impl std::future::Future<Output = Result<(), NodeReadinessError>> + Send + 'static {
         let state = self.state();
         async move {
@@ -192,21 +234,23 @@ where
         }
     }
 
-    /// Construct an ephemeral node whose peer-selection RNG is seeded explicitly.
-    /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new`].
+    /// Construct an ephemeral node whose peer-selection RNG is seeded explicitly, keyed from the start with a keypair
+    /// generated for this run. Intended for the simulation harness and deterministic tests; production paths use
+    /// [`Node::new`].
     pub fn new_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
-        Self::build(engine, policy_agent, false, SmallRng::seed_from_u64(rng_seed))
+        Self::build(engine, policy_agent, false, Some(NodeKey::generate()), SmallRng::seed_from_u64(rng_seed))
     }
 
-    /// Construct a durable node whose peer-selection RNG is seeded explicitly.
-    /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new_durable`].
+    /// Construct a durable node whose peer-selection RNG is seeded explicitly, keyed from the start with a keypair
+    /// generated for this run. Intended for the simulation harness and deterministic tests; production paths use
+    /// [`Node::new_durable`].
     pub fn new_durable_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
-        Self::build(engine, policy_agent, true, SmallRng::seed_from_u64(rng_seed))
+        Self::build(engine, policy_agent, true, Some(NodeKey::generate()), SmallRng::seed_from_u64(rng_seed))
     }
 
-    fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
+    fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, key: Option<NodeKey>, rng: SmallRng) -> Self {
         let entityset = WeakEntitySet::new(SystemEpoch::allocate());
-        let id = proto::EntityId::random();
+        let unkeyed = key.is_none();
         let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
         let alive = Mut::new(true);
         let state = system_manager.node_state();
@@ -216,7 +260,6 @@ where
             Calculated::new(move || alive.get() && !matches!(state.get(), NodeState::Halted(_)))
         };
         let reactor = Reactor::new(run.clone());
-        notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let live_queries = crate::livequery::LiveQueryRegistry::new();
 
@@ -234,7 +277,7 @@ where
         .with_catalog(&catalog);
 
         let node = Node(Arc::new(NodeInner {
-            id,
+            keypair: Mut::new(key),
             storage: engine,
             trees: Arc::new(trees),
             tree_maintenance: Arc::new(tokio::sync::Notify::new()),
@@ -242,6 +285,7 @@ where
             entities: entityset,
             commit_publication_lock,
             peer_connections: SafeMap::new(),
+            next_connection: AtomicU64::new(0),
             durable_peers: SafeSet::new(),
             rng: Mutex::new(rng),
             reactor,
@@ -255,6 +299,7 @@ where
             live_queries,
             subscription_relay,
         }));
+        notice_info!("{node} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let resolver: Arc<dyn crate::storage::CatalogResolver> = node.catalog.clone();
         node.storage.set_catalog_resolver(Arc::downgrade(&resolver));
@@ -272,8 +317,22 @@ where
         let system = node.system.clone();
         let run = node.run.clone();
         let agent = node.policy_agent.clone();
+        let storage = node.storage.clone();
         crate::task::spawn(async move {
-            let initialized = futures::future::try_join(system.wait_system_ready(), catalog.start(weak_node.clone()).err_into());
+            let keyed = {
+                let weak_node = weak_node.clone();
+                async move {
+                    if unkeyed {
+                        let key = key_lookup::look_up(&*storage).await?;
+                        if let Some(node) = weak_node.upgrade() {
+                            node.keypair.set(Some(key));
+                            notice_info!("{node} has its keypair");
+                        }
+                    }
+                    Ok::<_, NodeHaltReason>(())
+                }
+            };
+            let initialized = futures::future::try_join3(system.wait_system_ready(), catalog.start(weak_node.clone()).err_into(), keyed);
             let initialized = async move {
                 initialized.await?;
                 agent.start(weak_node).await.map_err(|error| NodeHaltReason::PolicyAgentStartFailed(error.to_string()))
@@ -290,29 +349,63 @@ where
 
         node
     }
-    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
+    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), keypair: self.0.keypair.read() } }
 
-    /// Build our handshake identity after local system storage loads; an unadopted node has no root.
-    pub async fn presence(&self) -> Result<proto::Presence, NodeHaltReason> {
+    /// Wait for this node's keypair and return the node id it gives, or the reason the node halted unkeyed.
+    pub async fn wait_id(&self) -> Result<proto::NodeId, NodeHaltReason> { Ok(self.wait_keypair().await?.public_key().node_id()) }
+
+    /// This node's keypair once it has one, or the reason the node halted unkeyed.
+    async fn wait_keypair(&self) -> Result<NodeKey, NodeHaltReason> {
+        tokio::select! {
+            biased;
+            key = self.keypair.wait_for(|key: &Option<NodeKey>| key.clone()) => Ok(key),
+            reason = self.system.wait_halted() => Err(reason),
+        }
+    }
+
+    /// A signed presence for the peer's `challenge`, using this node's `side` of the connection.
+    /// The node waits for its keypair, and for system storage to load so its presence includes any stored system root.
+    pub async fn presence(
+        &self,
+        side: proto::ConnectionSide,
+        challenge: &proto::Challenge,
+    ) -> Result<proto::SignedPresence, NodeHaltReason> {
         self.system.wait_loaded().await?;
-        Ok(proto::Presence {
-            node_id: self.id,
+        let key = self.wait_keypair().await?;
+        let presence = proto::Presence {
+            key: key.public_key(),
             durable: self.durable,
             system_root: self.system.root(),
             protocol_version: proto::PROTOCOL_VERSION,
-        })
+        };
+        Ok(presence.sign(side, challenge, |bytes| key.sign(bytes)))
     }
 
-    /// Register a peer connection after its Presence handshake.
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
-    pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError> {
-        action_info!(self, "register_peer", "{}", &presence);
+    /// The node accepts a peer connection only if its presence passes signature, protocol version and system checks.
+    /// `side` is this node's side; the peer's signature must cover the opposite side and the `challenge` this node sent.
+    /// It waits for this node's keypair first, so a node with a connection is keyed.
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %signed.presence.node_id().to_base64_short(), durable = %signed.presence.durable)))]
+    pub async fn register_peer(
+        &self,
+        side: proto::ConnectionSide,
+        challenge: &proto::Challenge,
+        signed: proto::SignedPresence,
+        sender: Box<dyn PeerSender>,
+    ) -> Result<ConnectionId, PeerConnectionError> {
+        let id = self.wait_id().await?;
+        action_info!(self, "register_peer", "{}", &signed.presence);
+        let node_id = signed.presence.node_id();
 
-        if !proto::protocol_compatible(presence.protocol_version) {
-            let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
-            warn!("Node({}) refusing peer {}: {}", self.id, presence.node_id, rejection);
+        if !proto::protocol_compatible(signed.presence.protocol_version) {
+            let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: signed.presence.protocol_version };
+            warn!("Node({}) refusing peer {}: {}", id, node_id, rejection);
             return Err(rejection.into());
         }
+        if !signed.answers(side.opposite(), challenge) {
+            warn!("Node({}) refusing peer {}: {}", id, node_id, PeerConnectionError::UnprovenKey);
+            return Err(PeerConnectionError::UnprovenKey);
+        }
+        let presence = signed.presence;
 
         self.system.wait_loaded().await?;
         if presence.durable && !self.durable {
@@ -322,44 +415,80 @@ where
                 return Err(PeerConnectionError::SystemMismatch { current, offered: offered.payload.entity_id });
             }
         }
-        self.captures.release_peer(presence.node_id);
-        if let Some(previous) = self.peer_connections.get(&presence.node_id) {
-            previous.clear_pending();
-        }
-        let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
-        self.peer_connections.insert(presence.node_id, Arc::new(PeerState::new(sender, presence.durable, subscription_handler)));
+        let connection = ConnectionId(self.next_connection.fetch_add(1, Ordering::Relaxed));
+        notice_info!("Node({:#}) register_peer {:#} as {}", id, node_id, connection);
+        let subscription_handler = SubscriptionHandler::new(connection, self);
+        self.peer_connections.insert(connection, Arc::new(PeerState::new(node_id, sender, presence.durable, subscription_handler)));
         if presence.durable {
-            self.durable_peers.insert(presence.node_id);
+            self.durable_peers.insert(connection);
             if let Some(ref relay) = self.subscription_relay {
-                relay.notify_peer_connected(presence.node_id);
+                relay.notify_peer_connected(connection);
             }
         }
         // TODO send hello message to the peer, including present head state for all relevant collections
-        Ok(())
+        Ok(connection)
     }
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %node_id.to_base64_short())))]
-    pub fn deregister_peer(&self, node_id: proto::EntityId) {
-        notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(connection = %connection)))]
+    pub fn deregister_peer(&self, connection: ConnectionId) {
+        notice_info!("{self} deregister_peer {connection}");
 
-        self.durable_peers.remove(&node_id);
-        self.captures.release_peer(node_id);
+        self.durable_peers.remove(&connection);
+        self.captures.release_peer(connection);
         // Get and cleanup subscriptions before removing the peer
-        if let Some(peer_state) = self.peer_connections.remove(&node_id) {
+        if let Some(peer_state) = self.peer_connections.remove(&connection) {
             peer_state.clear_pending();
-            action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
+            action_info!(
+                self,
+                "unsubscribing",
+                "subscription {} for peer {}",
+                peer_state.subscription_handler.subscription_id(),
+                peer_state.node_id
+            );
             // ReactorSubscription is automatically unsubscribed on drop
         }
 
         // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)
         if let Some(ref relay) = self.subscription_relay {
-            relay.notify_peer_disconnected(node_id);
+            relay.notify_peer_disconnected(connection);
         }
     }
-    /// Send a request to a connected peer and wait for its response.
-    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
+    /// The node id the peer registered for `connection`.
+    pub(crate) fn peer_node_id(&self, connection: ConnectionId) -> Result<proto::NodeId, RequestError> {
+        Ok(self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?.node_id)
+    }
+
+    /// The connections to peers with `node_id`, in registration order.
+    pub fn connections_of(&self, node_id: proto::NodeId) -> Vec<ConnectionId> {
+        let mut connections: Vec<_> = self
+            .peer_connections
+            .to_vec()
+            .into_iter()
+            .filter(|(_, peer)| peer.node_id == node_id)
+            .map(|(connection, _)| connection)
+            .collect();
+        connections.sort();
+        connections
+    }
+
+    /// The node sends a request on the most recently registered connection for `node_id` and waits for the response.
     pub async fn request<'a, C>(
         &self,
-        node_id: proto::EntityId,
+        node_id: proto::NodeId,
+        cdata: &C,
+        request_body: proto::NodeRequestBody,
+    ) -> Result<proto::NodeResponseBody, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        let connection = self.connections_of(node_id).pop().ok_or(RequestError::PeerNotConnected)?;
+        self.request_on(connection, cdata, request_body).await
+    }
+
+    /// The node sends a request on `connection` and accepts its response only on that connection.
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(connection = %connection, request_body = %request_body)))]
+    pub(crate) async fn request_on<'a, C>(
+        &self,
+        connection: ConnectionId,
         cdata: &C,
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError>
@@ -370,7 +499,8 @@ where
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
-        let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
+        let request =
+            proto::NodeRequest { id: request_id.clone(), to: self.peer_node_id(connection)?, from: self.keyed_id(), body: request_body };
 
         // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
         // follow-on uses #426's node session union for catalog queries.
@@ -381,10 +511,10 @@ where
         };
 
         let _pending = {
-            let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
-            let pending = peer_state::PendingRequest { connection: Arc::downgrade(&connection), id: request_id.clone() };
-            connection.pending_requests.insert(request_id, response_tx);
-            connection.send_message(proto::NodeMessage::Request { auth, request })?;
+            let peer = self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?;
+            let pending = peer_state::PendingRequest { connection: Arc::downgrade(&peer), id: request_id.clone() };
+            peer.pending_requests.insert(request_id, response_tx);
+            peer.send_message(proto::NodeMessage::Request { auth, request })?;
             pending
         };
 
@@ -392,61 +522,64 @@ where
     }
 
     // TODO LATER: rework this to be retried in the background some number of times
-    pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
+    pub fn send_update(&self, connection: ConnectionId, notification: proto::NodeUpdateBody) {
         if self.system.check_not_halted().is_err() {
             return;
         }
         // same as request, minus cdata and the sign_request step
-        debug!("{self}.send_update({node_id:#}, {notification})");
+        debug!("{self}.send_update({connection}, {notification})");
         let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let id = proto::UpdateId::new();
 
         // Get the peer connection
-        let Some(connection) = self.peer_connections.get(&node_id) else {
-            warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
+        let Some(peer) = self.peer_connections.get(&connection) else {
+            warn!("Failed to send update on {}: {}", connection, RequestError::PeerNotConnected);
             return;
         };
 
         // Store the response channel
-        connection.pending_updates.insert(id.clone(), response_tx);
+        peer.pending_updates.insert(id.clone(), response_tx);
 
-        let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body: notification });
+        let notification =
+            proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.keyed_id(), to: peer.node_id, body: notification });
 
-        match connection.send_message(notification) {
+        match peer.send_message(notification) {
             Ok(_) => {}
             Err(e) => {
-                warn!("Failed to send update to peer {}: {}", node_id, e);
+                warn!("Failed to send update to peer {}: {}", peer.node_id, e);
             }
         };
 
         // response_rx.await.map_err(|_| RequestError::InternalChannelClosed)??;
     }
 
-    // TODO add a node id argument to this function rather than getting it from the message
-    // (does this actually make it more secure? or just move the place they could lie to us to the handshake?)
-    // Not if its signed by a node key.
+    /// The node accepts a message only if its sender node id matches the peer registered for `connection`.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
-    pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+    pub async fn handle_message(&self, connection: ConnectionId, message: proto::NodeMessage) -> anyhow::Result<()> {
         self.system.check_not_halted()?;
+        let peer_node_id = self.peer_node_id(connection)?;
+        if message.sender() != peer_node_id {
+            return Err(anyhow!("peer {} sent a message as {}", peer_node_id, message.sender()));
+        }
+        let own_id = self.keyed_id();
         match message {
             proto::NodeMessage::Update(update) => {
-                debug!("Node({}) received update {}", self.id, update);
+                debug!("Node({}) received update {}", own_id, update);
 
-                if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
+                if let Some(sender) = { self.peer_connections.get(&connection).map(|c| c.sender.cloned()) } {
                     let _from = update.from;
                     let _id = update.id.clone();
-                    if update.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
+                    if update.to != own_id {
+                        warn!("{} received message from {} but is not the intended recipient", own_id, update.from);
                         return Ok(());
                     }
 
                     // take down the return address
                     let id = update.id.clone();
                     let to = update.from;
-                    let from = self.id;
+                    let from = own_id;
 
-                    // TODO - validate the from node id is the one we're connected to
-                    let body = match self.handle_update(update).await {
+                    let body = match self.handle_update(connection, update).await {
                         Ok(_) => proto::NodeUpdateAckBody::Success,
                         Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
                     };
@@ -455,25 +588,25 @@ where
                 }
             }
             proto::NodeMessage::UpdateAck(ack) => {
-                debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
+                debug!("Node({}) received ack notification {} {}", own_id, ack.id, ack.body);
                 // let connection = self.peer_connections.get(&ack.from).ok_or(RequestError::PeerNotConnected)?;
                 // if let Some(tx) = connection.pending_updates.remove(&ack.id) {
                 //     tx.send(Ok(proto::NodeResponseBody::Success)).unwrap();
                 // }
             }
             proto::NodeMessage::Request { auth, request } => {
-                debug!("Node({}) received request {}", self.id, request);
+                debug!("Node({}) received request {}", own_id, request);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
                 // I think we want timeouts to be handled by the node, not the connector,
                 // which would lend itself to spawning a task here and making this function synchronous.
 
-                // double check to make sure we have a connection to the peer based on the node id
-                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
+                // double check to make sure we have a connection to the peer
+                if let Some(sender) = { self.peer_connections.get(&connection).map(|c| c.sender.cloned()) } {
                     let from = request.from;
                     let request_id = request.id.clone();
-                    if request.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
+                    if request.to != own_id {
+                        warn!("{} received message from {} but is not the intended recipient", own_id, request.from);
                         return Ok(());
                     }
 
@@ -485,36 +618,32 @@ where
                         self.policy_agent.check_request(self, &auth, &request).await
                     };
                     let body = match cdata {
-                        Ok(cdata) => match self.handle_request(&cdata, request).await {
+                        Ok(cdata) => match self.handle_request(connection, &cdata, request).await {
                             Ok(result) => result,
                             Err(e) => comparison::response_error(e),
                         },
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                     };
-                    let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
-                        request_id,
-                        from: self.id,
-                        to: from,
-                        body,
-                    }));
+                    let _result =
+                        sender.send_message(proto::NodeMessage::Response(proto::NodeResponse { request_id, from: own_id, to: from, body }));
                 }
             }
             proto::NodeMessage::Response(response) => {
-                debug!("Node {} received response {}", self.id, response);
-                if response.to != self.id {
+                debug!("Node {} received response {}", own_id, response);
+                if response.to != own_id {
                     return Err(anyhow!("response addressed to another node"));
                 }
-                let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
-                if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
+                let peer = self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?;
+                if let Some(tx) = peer.pending_requests.remove(&response.request_id) {
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
-            proto::NodeMessage::ReleaseComparison { from, comparison } => {
-                self.captures.release(from, comparison);
+            proto::NodeMessage::ReleaseComparison { comparison, .. } => {
+                self.captures.release(connection, comparison);
             }
-            proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
+            proto::NodeMessage::UnsubscribeQuery { query_id, .. } => {
                 // Remove predicate from the peer's subscription
-                if let Some(peer_state) = self.peer_connections.get(&from) {
+                if let Some(peer_state) = self.peer_connections.get(&connection) {
                     peer_state.subscription_handler.remove_predicate(query_id).await?;
                 }
             }
@@ -523,8 +652,15 @@ where
     }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
-    async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
-    where C: Iterable<PA::ContextData> {
+    async fn handle_request<C>(
+        &self,
+        connection: ConnectionId,
+        cdata: &C,
+        request: proto::NodeRequest,
+    ) -> anyhow::Result<proto::NodeResponseBody>
+    where
+        C: Iterable<PA::ContextData>,
+    {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => handler::commit_transaction(self, cdata, id, events).await,
             proto::NodeRequestBody::RegisterSchema { model } => {
@@ -542,12 +678,12 @@ where
             }
             proto::NodeRequestBody::Fetch { selection, comparison, key_spec, known_state } => {
                 let credentials = cdata.iterable().cloned().collect();
-                let target = self.begin_comparison(request.from, comparison, selection, key_spec, known_state, &credentials).await?;
+                let target = self.begin_comparison(connection, comparison, selection, key_spec, known_state, &credentials).await?;
                 Ok(proto::NodeResponseBody::Fetch(target))
             }
             proto::NodeRequestBody::Compare { comparison, selection, request: exchange } => {
                 let credentials = cdata.iterable().cloned().collect();
-                let result = self.handle_comparison(request.from, comparison, &selection, exchange, &credentials).await;
+                let result = self.handle_comparison(connection, comparison, &selection, exchange, &credentials).await;
                 match result {
                     Ok(reply) => Ok(proto::NodeResponseBody::Compared(Ok(reply))),
                     Err(error) => Ok(comparison::response_error(error.into())),
@@ -562,7 +698,7 @@ where
             }
             proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
             proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, comparison, key_spec, known_state } => {
-                let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
+                let peer_state = self.peer_connections.get(&connection).ok_or(RequestError::PeerNotConnected)?;
                 // Catalog subscriptions carry no credential; others carry exactly one.
                 let cdata = match cdata.iterable().at_most_one() {
                     Ok(cdata) => cdata,
@@ -580,20 +716,16 @@ where
         }
     }
 
-    async fn handle_update(&self, notification: proto::NodeUpdate) -> anyhow::Result<()> {
-        let Some(_connection) = self.peer_connections.get(&notification.from) else {
-            return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
-        };
-
+    async fn handle_update(&self, connection: ConnectionId, notification: proto::NodeUpdate) -> anyhow::Result<()> {
         match notification.body {
             proto::NodeUpdateBody::Comparison { comparison, deltas } => {
-                self.receive_comparison_repair(notification.from, comparison, notification.id, deltas).boxed().await?;
+                self.receive_comparison_repair(connection, comparison, notification.id, deltas).boxed().await?;
                 Ok(())
             }
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
-                tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
+                tracing::debug!("Node({}) received subscription update from peer {}", self.keyed_id(), notification.from);
                 self.system.require_system_ready()?;
-                crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
+                crate::node::applier::NodeApplier::apply_updates(self, &connection, &notification.from, items).await?;
                 Ok(())
             }
         }
@@ -607,18 +739,20 @@ where
     ) -> Result<(), MutationError> {
         // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
         // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
-        for peer_id in self.get_durable_peers() {
-            match self.request(peer_id, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() }).await
+        for connection in self.get_durable_peers() {
+            match self
+                .request_on(connection, cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() })
+                .await
             {
                 Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
                 Err(error) => return Err(RetrievalError::from(error).into()),
                 Ok(proto::NodeResponseBody::Error(e)) => {
-                    return Err(MutationError::General(Box::new(std::io::Error::other(format!("Peer {} rejected: {}", peer_id, e)))));
+                    return Err(MutationError::General(Box::new(std::io::Error::other(format!("Peer {} rejected: {}", connection, e)))));
                 }
                 _ => {
                     return Err(MutationError::General(Box::new(std::io::Error::other(format!(
                         "Peer {} returned unexpected response",
-                        peer_id
+                        connection
                     )))));
                 }
             }
@@ -672,16 +806,17 @@ where
     /// Retrieve peer states and persist them in this node.
     pub(crate) async fn get_from_peer(&self, ids: Vec<proto::EntityId>, cdata: &Vec<PA::ContextData>) -> Result<(), RetrievalError> {
         self.system.require_system_ready().map_err(MutationError::from)?;
-        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+        let connection = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+        let peer_node_id = self.peer_node_id(connection)?;
 
-        match self.request(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
+        match self.request_on(connection, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
             proto::NodeResponseBody::Get(results) => {
                 if results.len() != ids.len() || results.iter().zip(&ids).any(|(result, id)| result.entity_id() != *id) {
                     return Err(RetrievalError::Other("Peer Get did not answer the requested identities".into()));
                 }
                 let deltas = results.into_iter().map(proto::EntityDelta::try_from).collect::<Result<Vec<_>, _>>()?;
                 let event_getter = CachedEventGetter::new(self, cdata);
-                applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, self.storage.as_ref()).await?;
+                applier::NodeApplier::apply_deltas(self, &peer_node_id, deltas, &event_getter, self.storage.as_ref()).await?;
                 Ok(())
             }
             proto::NodeResponseBody::Error(e) => {
@@ -707,21 +842,21 @@ where
         self.fetch_entities_from_local(&selection).await
     }
 
-    /// Get a random durable peer node ID.
+    /// A randomly selected connection to a durable peer.
     ///
     /// Draws from the node's seeded RNG (not `thread_rng`) so the simulation harness can reproduce
     /// selections. The candidate slice is sorted first: `choose` indexes by position, so a stable
     /// candidate order is required for a given seed to yield a given peer.
-    pub fn get_durable_peer_random(&self) -> Option<proto::EntityId> {
+    pub fn get_durable_peer_random(&self) -> Option<ConnectionId> {
         let peers = self.get_durable_peers();
         let mut rng = self.rng.lock().expect("node rng mutex poisoned");
         peers.choose(&mut *rng).copied()
     }
 
-    /// Get all durable peer node IDs, sorted by id for a stable fan-out order.
+    /// Connections to durable peers in registration order, so the node sends requests in a reproducible order.
     /// The underlying set is unordered; callers that emit per peer (relay, random selection)
     /// depend on this stable order for the C1 determinism audit.
-    pub fn get_durable_peers(&self) -> Vec<proto::EntityId> {
+    pub fn get_durable_peers(&self) -> Vec<ConnectionId> {
         let mut peers = self.durable_peers.to_vec();
         peers.sort();
         peers
@@ -741,14 +876,18 @@ where
         self.entities.conjure_evil_phantom(id, initial_model_membership)
     }
 
-    /// TEST ONLY: Register a durable peer id directly, bypassing the connection handshake.
+    /// TEST ONLY: Register a durable peer connection directly, bypassing the connection handshake.
     ///
     /// Lets tests populate the durable-peer set to exercise fan-out ordering and seeded random
     /// selection without standing up real peer connections.
     ///
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
-    pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.durable_peers.insert(peer_id); }
+    pub fn insert_durable_peer_for_test(&self) -> ConnectionId {
+        let connection = ConnectionId(self.next_connection.fetch_add(1, Ordering::Relaxed));
+        self.durable_peers.insert(connection);
+        connection
+    }
 
     /// TEST ONLY: Observe the session registry — the current credential
     /// of every session backing a context on this node, in the
@@ -769,12 +908,12 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
-        for (peer_id, item) in self.peer_connections.get_list(peers) {
-            if let Some(connection) = item {
-                connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: self.id, query_id })?;
+    pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, connections: Vec<ConnectionId>) -> anyhow::Result<()> {
+        for (connection, peer) in self.peer_connections.get_list(connections) {
+            if let Some(peer) = peer {
+                peer.send_message(proto::NodeMessage::UnsubscribeQuery { from: self.keyed_id(), query_id })?;
             } else {
-                warn!("Peer {} not connected", peer_id);
+                warn!("Peer {} not connected", connection);
             }
         }
 
@@ -787,7 +926,7 @@ where PA: PolicyAgent
 {
     fn drop(&mut self) {
         self.alive.set(false);
-        notice_info!("Node({}) dropped", self.id);
+        notice_info!("{self} dropped");
     }
 }
 
@@ -823,11 +962,17 @@ where
         Ok(entities)
     }
 }
-impl<SE, PA> fmt::Display for Node<SE, PA>
+impl<SE, PA> fmt::Display for NodeInner<SE, PA>
 where PA: PolicyAgent
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id = self.id().map_or_else(|| "unkeyed".to_owned(), |id| id.to_base64_short());
         // bold blue, dimmed brackets
-        write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
+        write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{id}\x1b[2m]\x1b[0m")
     }
+}
+impl<SE, PA> fmt::Display for Node<SE, PA>
+where PA: PolicyAgent
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&*self.0, f) }
 }

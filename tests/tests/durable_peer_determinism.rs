@@ -1,6 +1,6 @@
 //! Determinism of the two node-level durable-peer emission paths (issue #279).
 //!
-//! - `get_durable_peers` must return a stable, id-sorted order so peer fan-out is reproducible.
+//! - `get_durable_peers` returns connections in registration order so nodes send requests to durable peers in a reproducible order.
 //! - `get_durable_peer_random` must draw from the node's seeded RNG, so two nodes seeded
 //!   identically produce an identical selection sequence for identical peer sets.
 //!
@@ -8,39 +8,31 @@
 //! scenarios do not exercise; the C1 simulation audit will arm them for C5.
 
 mod common;
-use ankurah::{proto, Node, PermissiveAgent};
+use ankurah::core::connector::ConnectionId;
+use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use std::sync::Arc;
 
-/// Insert a batch of durable peers into a node via the test-only seam.
-fn seed_peers(node: &Node<SledStorageEngine, PermissiveAgent>, peers: &[proto::EntityId]) {
-    for p in peers {
-        node.insert_durable_peer_for_test(*p);
-    }
+/// Connection numbers for testing durable peer selection without opening connections.
+fn seed_peers(node: &Node<SledStorageEngine, PermissiveAgent>, count: usize) -> Vec<ConnectionId> {
+    (0..count).map(|_| node.insert_durable_peer_for_test()).collect()
 }
 
-/// Path 2: get_durable_peers returns a stable, id-sorted order across repeated calls.
+/// Path 2: get_durable_peers returns connections in registration order on every call.
 ///
-/// The peers are inserted in a deliberately unsorted sequence; the underlying set is unordered,
-/// so a naive to_vec could surface any order. The returned order must equal the ascending-id sort
-/// and be identical on every call.
+/// The underlying set does not preserve insertion order, so the returned connections must have the same
+/// registration order on every call.
 #[tokio::test]
 async fn test_get_durable_peers_is_stable_and_sorted() -> Result<()> {
     let node = common::durable_sled_setup().await?;
-
-    // Generate several peer ids, then insert them in an order that is not their sorted order.
-    let mut peers: Vec<proto::EntityId> = (0..8).map(|_| proto::EntityId::random()).collect();
-    peers.sort();
-    let mut insertion = peers.clone();
-    insertion.reverse();
-    seed_peers(&node, &insertion);
+    let peers = seed_peers(&node, 8);
 
     let run1 = node.get_durable_peers();
     let run2 = node.get_durable_peers();
 
     assert_eq!(run1, run2, "get_durable_peers must be identical across calls");
-    assert_eq!(run1, peers, "get_durable_peers must be sorted ascending by id");
+    assert_eq!(run1, peers, "get_durable_peers must be in registration order");
 
     Ok(())
 }
@@ -52,12 +44,10 @@ async fn test_get_durable_peers_is_stable_and_sorted() -> Result<()> {
 /// long sequence and a wide peer set) diverge, proving randomness is preserved, not removed.
 #[tokio::test]
 async fn test_get_durable_peer_random_same_seed_same_sequence() -> Result<()> {
-    // Shared peer set; both seeded nodes see the identical set.
-    let peers: Vec<proto::EntityId> = (0..16).map(|_| proto::EntityId::random()).collect();
-
-    let draw_sequence = |seed: u64| -> Vec<proto::EntityId> {
+    // Each test node assigns the same sixteen connection numbers, so identical seeds select from identical inputs.
+    let draw_sequence = |seed: u64| -> Vec<ConnectionId> {
         let node = Node::new_durable_with_seed(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new(), seed);
-        seed_peers(&node, &peers);
+        seed_peers(&node, 16);
         (0..64).map(|_| node.get_durable_peer_random().expect("peer set is non-empty")).collect()
     };
 
@@ -80,8 +70,7 @@ async fn test_get_durable_peer_random_same_seed_same_sequence() -> Result<()> {
 #[tokio::test]
 async fn test_get_durable_peer_random_default_stays_in_set() -> Result<()> {
     let node = common::durable_sled_setup().await?;
-    let peers: Vec<proto::EntityId> = (0..4).map(|_| proto::EntityId::random()).collect();
-    seed_peers(&node, &peers);
+    let peers = seed_peers(&node, 4);
 
     let peer_set: std::collections::HashSet<_> = peers.iter().copied().collect();
     for _ in 0..32 {

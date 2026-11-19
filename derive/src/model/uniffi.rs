@@ -152,19 +152,19 @@ pub fn uniffi_custom_wrappers(model: &crate::model::description::ModelDescriptio
     }
 }
 
-/// How the bindings carry an entity id a model holds, so that a foreign caller handles every id as
-/// an object and never as a string: a plain `EntityId` crosses as the EntityId Object and a `Ref<T>`
-/// as T's generated Ref object, each behind the `Arc` that UniFFI needs to put an Object in a
-/// Record, an `Option` or an owned argument; an `Option` of either crosses as an `Option` of that.
+/// How the bindings carry an id a model holds, so that a foreign caller handles every id as an
+/// object and never as a string: a plain `EntityId` or `NodeId` crosses as its own Object and a
+/// `Ref<T>` as T's generated Ref object, each behind the `Arc` that UniFFI needs to put an Object in
+/// a Record, an `Option` or an owned argument; an `Option` of any of them crosses as an `Option` of that.
 pub(crate) struct IdBinding {
-    /// `EntityId`, or `<T as UniffiModel>::RefObject` for a `Ref<T>`
+    /// `EntityId` or `NodeId`, or `<T as UniffiModel>::RefObject` for a `Ref<T>`
     object: TokenStream,
     is_ref: bool,
     optional: bool,
 }
 
 impl IdBinding {
-    /// How the bindings carry a value of type `ty`, or None when `ty` is not an entity id
+    /// How the bindings carry a value of type `ty`, or None when `ty` is not an id
     pub(crate) fn of(ty: &syn::Type) -> Option<Self> {
         match generic_argument(ty, "Option") {
             Some(inner) => Self::required(inner).map(|binding| Self { optional: true, ..binding }),
@@ -178,11 +178,12 @@ impl IdBinding {
         }
         let syn::Type::Path(path) = ty else { return None };
         let segment = path.path.segments.last()?;
-        (segment.ident == "EntityId" && segment.arguments.is_none()).then(|| Self {
-            object: quote! { ::ankurah::proto::EntityId },
-            is_ref: false,
-            optional: false,
-        })
+        let object = match segment.ident.to_string().as_str() {
+            "EntityId" => quote! { ::ankurah::proto::EntityId },
+            "NodeId" => quote! { ::ankurah::proto::NodeId },
+            _ => return None,
+        };
+        segment.arguments.is_none().then(|| Self { object, is_ref: false, optional: false })
     }
 
     /// The type the bindings carry the value as
@@ -359,8 +360,8 @@ fn uniffi_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -
 /// MessageInput - UniFFI Record for creating new entities
 ///
 /// This is a value type that can be passed across FFI boundaries.
-/// Entity id fields carry objects, as `IdBinding` describes: `Arc<EntityId>` for an EntityId and
-/// T's Ref object for a Ref<T>.
+/// Id fields carry objects, as `IdBinding` describes: `Arc<EntityId>` for an EntityId, `Arc<NodeId>`
+/// for a NodeId and T's Ref object for a Ref<T>.
 fn uniffi_input_record(model: &crate::model::description::ModelDescription, input_name: &Ident, model_name: &Ident) -> TokenStream {
     let fields = model.active_fields();
 
@@ -390,7 +391,7 @@ fn uniffi_input_record(model: &crate::model::description::ModelDescription, inpu
 
     quote! {
         /// Input record for creating new entities.
-        /// Its entity id fields carry EntityId and Ref objects, so an id is never a string.
+        /// Its id fields carry EntityId, NodeId and Ref objects, so an id is never a string.
         #[derive(::uniffi::Record)]
         pub struct #input_name {
             #(#input_fields),*
@@ -494,7 +495,7 @@ fn uniffi_ops_wrapper(
             }
 
             /// Create a new entity within a transaction, returning its Mutable
-            /// Use the Input record type, whose id fields take EntityId and Ref objects
+            /// Use the Input record type, whose id fields take EntityId, NodeId and Ref objects
             pub async fn create(
                 &self,
                 trx: &::ankurah::transaction::Transaction,
@@ -505,7 +506,7 @@ fn uniffi_ops_wrapper(
             }
 
             /// Create a new entity with an auto-committed transaction
-            /// Use the Input record type, whose id fields take EntityId and Ref objects
+            /// Use the Input record type, whose id fields take EntityId, NodeId and Ref objects
             pub async fn create_one(
                 &self,
                 ctx: &::ankurah::core::context::Context,

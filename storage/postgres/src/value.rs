@@ -41,6 +41,7 @@ impl From<Value> for PGValue {
             Value::F64(float) => PGValue::DoublePrecision(float),
             Value::Bool(bool) => PGValue::Boolean(bool),
             Value::EntityId(entity_id) => PGValue::CharacterVarying(entity_id.to_base64()),
+            Value::NodeId(node_id) => PGValue::Bytea(node_id.to_bytes().to_vec()),
             Value::Object(items) => PGValue::Bytea(items),
             Value::Binary(items) => PGValue::Bytea(items),
             // Value::Json already contains serde_json::Value

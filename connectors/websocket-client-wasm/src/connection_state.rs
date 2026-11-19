@@ -48,6 +48,7 @@ impl ConnectionStateEnum {
                 Some(PeerConnectionError::InvalidSystem(_)) => "InvalidSystem",
                 Some(PeerConnectionError::SystemReset(_)) => "SystemReset",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",
+                Some(PeerConnectionError::UnprovenKey) => "UnprovenKey",
                 None => "Transport",
             }
             .into(),

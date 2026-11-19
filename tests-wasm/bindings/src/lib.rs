@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use ankurah::{policy::DEFAULT_CONTEXT, property::Json, Context, Model, Node, PermissiveAgent, Ref};
+use ankurah::{policy::DEFAULT_CONTEXT, property::Json, Context, EntityId, Model, Node, NodeId, PermissiveAgent, Ref};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -39,6 +39,13 @@ pub struct TestMessage {
     #[active_type(LWW)]
     pub room: Ref<TestRoom>,
     pub text: String,
+}
+
+/// Entity with plain EntityId and NodeId fields - tests base64 text in create() and id objects in query arguments
+#[derive(Model, Debug, Serialize, Deserialize, Clone)]
+pub struct TestEndorsement {
+    pub endorsed: NodeId,
+    pub subject: EntityId,
 }
 
 /// Entity with Json field - tests Json serialization to JS

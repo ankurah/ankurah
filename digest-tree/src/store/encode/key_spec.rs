@@ -102,6 +102,7 @@ fn value_type_byte(value_type: ValueType) -> u8 {
         ValueType::Object => 7,
         ValueType::Binary => 8,
         ValueType::Json => 9,
+        ValueType::NodeId => 10,
     }
 }
 
@@ -117,6 +118,7 @@ fn value_type_of(byte: u8) -> Result<ValueType, StoreError> {
         7 => ValueType::Object,
         8 => ValueType::Binary,
         9 => ValueType::Json,
+        10 => ValueType::NodeId,
         _ => return Err(StoreError::permanent("a key part's value type is unknown")),
     })
 }

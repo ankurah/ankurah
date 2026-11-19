@@ -512,7 +512,7 @@ async fn descriptor_reasserts_mutable_catalog_metadata() -> anyhow::Result<()> {
     let mut declaration = proto::RegisterModel::from(Widget::descriptor());
     declaration.name = "Temporary name".into();
     declaration.properties[0].optional = true;
-    client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: declaration }).await?;
+    client.request(server.id().unwrap(), &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: declaration }).await?;
 
     server.context(DEFAULT_CONTEXT)?.resolve_model_id::<Widget>().await?;
 

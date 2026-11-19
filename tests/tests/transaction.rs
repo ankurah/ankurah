@@ -56,7 +56,7 @@ impl PolicyAgent for WriteProbe {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from: &EntityId,
+        _from: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -67,7 +67,7 @@ impl PolicyAgent for WriteProbe {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from: &EntityId,
+        _from: &proto::NodeId,
         _state: &proto::Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -85,7 +85,7 @@ impl PolicyAgent for WriteProbe {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer: &EntityId,
+        _peer: &proto::NodeId,
         _assertion: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())

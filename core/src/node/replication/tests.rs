@@ -9,24 +9,22 @@ use ankurah_proto as proto;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
-struct Sender(EntityId, mpsc::UnboundedSender<proto::NodeMessage>);
+struct Sender(mpsc::UnboundedSender<proto::NodeMessage>);
 impl PeerSender for Sender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-        self.1.send(message).map_err(|_| SendError::ConnectionClosed)
+        self.0.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, EntityId, mpsc::UnboundedReceiver<proto::NodeMessage>)> {
+async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, NodeId, mpsc::UnboundedReceiver<proto::NodeMessage>)> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
     node.system.create().await?;
     node.wait_ready().await?;
-    let peer = EntityId::random();
+    let key = crate::node::NodeKey::generate();
+    let peer = key.public_key().node_id();
     let (sent, messages) = mpsc::unbounded_channel();
-    let mut presence = node.presence().await?;
-    presence.node_id = peer;
-    node.register_peer(presence, Box::new(Sender(peer, sent))).await?;
+    crate::test_utils::connect_peer(&node, &key, true, Sender(sent)).await?;
     Ok((node, peer, messages))
 }
 
@@ -42,11 +40,15 @@ fn request(message: proto::NodeMessage) -> proto::NodeRequest {
 
 async fn answer(
     node: &Node<TestStorage, PermissiveAgent>,
-    peer: EntityId,
+    peer: NodeId,
     request: proto::NodeRequest,
     body: proto::NodeResponseBody,
 ) -> anyhow::Result<()> {
-    node.handle_message(proto::NodeMessage::Response(proto::NodeResponse { from: peer, to: node.id, request_id: request.id, body })).await
+    node.handle_message(
+        node.connections_of(peer)[0],
+        proto::NodeMessage::Response(proto::NodeResponse { from: peer, to: node.id().unwrap(), request_id: request.id, body }),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -56,7 +58,7 @@ async fn only_the_last_handle_cancels_an_in_flight_comparison() -> anyhow::Resul
     let clone = handle.clone();
     let first = request(receive(&mut messages).await?);
     let proto::NodeRequestBody::Fetch { comparison, .. } = first.body else { unreachable!() };
-    let connection = node.peer_connections.get(&peer).unwrap();
+    let connection = node.peer_connections.get(&node.connections_of(peer)[0]).unwrap();
     assert_eq!(connection.pending_requests.len(), 1);
     drop(handle);
     tokio::task::yield_now().await;
@@ -106,7 +108,7 @@ async fn changing_sessions_cancels_the_old_request_before_sending_another() -> a
     assert!(matches!(receive(&mut messages).await?, proto::NodeMessage::ReleaseComparison { comparison, .. } if comparison == old));
     let second = request(receive(&mut messages).await?);
     assert!(matches!(second.body, proto::NodeRequestBody::Fetch { comparison, .. } if comparison != old));
-    let connection = node.peer_connections.get(&peer).unwrap();
+    let connection = node.peer_connections.get(&node.connections_of(peer)[0]).unwrap();
     assert_eq!(connection.pending_requests.len(), 1);
     assert!(!connection.pending_requests.contains_key(&first.id));
     Ok(())
@@ -116,7 +118,8 @@ async fn changing_sessions_cancels_the_old_request_before_sending_another() -> a
 async fn a_retained_interest_does_not_keep_an_unprovisioned_node_alive() -> anyhow::Result<()> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let weak = node.weak();
-    let handle = node.replicate_from(EntityId::random(), ankql::ast::Predicate::True.into(), DEFAULT_CONTEXT)?;
+    let handle =
+        node.replicate_from(crate::node::NodeKey::generate().public_key().node_id(), ankql::ast::Predicate::True.into(), DEFAULT_CONTEXT)?;
     tokio::task::yield_now().await;
     drop(node);
     assert!(matches!(tokio::time::timeout(Duration::from_secs(1), handle.wait_caught_up()).await?, Err(RetrievalError::NodeDropped(_))));
@@ -138,7 +141,7 @@ async fn unavailable_required_history_stops_after_bounded_capture_retries() -> a
     assert!(matches!(handle.wait_caught_up().await, Err(RetrievalError::StorageError(error))
         if error.downcast_ref::<ComparisonFailure>() == Some(&ComparisonFailure::MemberUnavailable)));
     assert!(tokio::time::timeout(Duration::from_millis(1100), messages.recv()).await.is_err());
-    assert!(node.peer_connections.get(&peer).unwrap().pending_requests.is_empty());
+    assert!(node.peer_connections.get(&node.connections_of(peer)[0]).unwrap().pending_requests.is_empty());
     Ok(())
 }
 
@@ -171,5 +174,32 @@ async fn retry_rejects_a_finished_sweeps_late_success_or_refusal() -> anyhow::Re
     assert!(progress.publish(current, ReplicationState::Comparing));
     assert!(matches!(handle.state().value(), ReplicationState::Connecting));
     assert!(!progress.publish(current, ReplicationState::CaughtUp(KnownState::empty())));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_newer_ephemeral_connection_with_the_same_key_does_not_displace_a_durable_source() -> anyhow::Result<()> {
+    let (node, _, _) = fixture().await?;
+    let key = crate::node::NodeKey::generate();
+    let peer = key.public_key().node_id();
+    let (sent, mut durable_messages) = mpsc::unbounded_channel();
+    let durable = crate::test_utils::connect_peer(&node, &key, true, Sender(sent)).await?;
+    let (sent, mut ephemeral_messages) = mpsc::unbounded_channel();
+    crate::test_utils::connect_peer(&node, &key, false, Sender(sent)).await?;
+    let handle = node.replicate_from(peer, ankql::ast::Predicate::False.into(), DEFAULT_CONTEXT)?;
+    let request = request(receive(&mut durable_messages).await?);
+    let proto::NodeRequestBody::Fetch { comparison, key_spec, known_state, .. } = request.body else { unreachable!() };
+    node.handle_message(
+        durable,
+        proto::NodeMessage::Response(proto::NodeResponse {
+            from: peer,
+            to: node.id().unwrap(),
+            request_id: request.id,
+            body: proto::NodeResponseBody::Fetch(proto::ComparisonTarget { id: comparison, key_spec, known_state, page: None }),
+        }),
+    )
+    .await?;
+    assert_eq!(handle.wait_caught_up().await?, KnownState::empty());
+    assert!(ephemeral_messages.try_recv().is_err());
     Ok(())
 }

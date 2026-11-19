@@ -75,7 +75,7 @@ impl PolicyAgent for OwnerOnlyAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &Attested<Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -84,7 +84,7 @@ impl PolicyAgent for OwnerOnlyAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &Attested<EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -93,7 +93,7 @@ impl PolicyAgent for OwnerOnlyAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())

@@ -232,6 +232,7 @@ impl SqlBuilder {
             Value::I16(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
             Value::I32(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
             Value::EntityId(id) => self.push_param(rusqlite::types::Value::Text(id.to_base64())),
+            Value::NodeId(id) => self.push_param(rusqlite::types::Value::Blob(id.to_bytes().to_vec())),
             Value::Object(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
             Value::Binary(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
             // For JSON literals, extract the raw SQL value since json_extract() returns SQL types.

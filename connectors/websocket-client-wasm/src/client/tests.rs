@@ -1,6 +1,9 @@
 use super::*;
 use ankurah::signals::Signal;
-use ankurah_core::{connector::PeerSender, error::NodeHaltReason};
+use ankurah_core::{
+    connector::{ConnectionId, PeerSender},
+    error::NodeHaltReason,
+};
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -51,6 +54,19 @@ impl Drop for RestoreWebSockets {
     fn drop(&mut self) { restore_websockets(); }
 }
 
+/// A presence with a zeroed signature for handshake tests. `HeldAdmission` skips signature verification.
+fn unsigned_presence(key: [u8; 32], durable: bool) -> proto::SignedPresence {
+    proto::SignedPresence {
+        presence: proto::Presence {
+            key: proto::PublicKey::Ed25519(key),
+            durable,
+            system_root: None,
+            protocol_version: proto::PROTOCOL_VERSION,
+        },
+        signature: proto::Signature::Ed25519 { r: [0; 32], s: [0; 32] },
+    }
+}
+
 #[derive(Clone)]
 struct HeldAdmission(Arc<AdmissionState>);
 
@@ -66,23 +82,29 @@ struct AdmissionState {
 
 #[async_trait]
 impl NodeComms for HeldAdmission {
-    fn id(&self) -> proto::EntityId { proto::EntityId::from_bytes([1; 32]) }
-    async fn presence(&self) -> Result<proto::Presence, NodeHaltReason> {
+    fn id(&self) -> Option<proto::NodeId> { Some(proto::NodeId::from_bytes([1; 32])) }
+    async fn presence(&self, _: proto::ConnectionSide, _: &proto::Challenge) -> Result<proto::SignedPresence, NodeHaltReason> {
         let release = self.0.release_presence.lock().unwrap().take().unwrap();
         self.0.presence_started.set(true);
         release.await.map_err(|_| NodeHaltReason::SystemLoad("presence cancelled".into()))?;
-        Ok(proto::Presence { node_id: self.id(), durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION })
+        Ok(unsigned_presence(self.id().unwrap().to_bytes(), false))
     }
-    async fn register_peer(&self, _: proto::Presence, _: Box<dyn PeerSender>) -> Result<(), PeerConnectionError> {
+    async fn register_peer(
+        &self,
+        _: proto::ConnectionSide,
+        _: &proto::Challenge,
+        _: proto::SignedPresence,
+        _: Box<dyn PeerSender>,
+    ) -> Result<ConnectionId, PeerConnectionError> {
         let release = self.0.release.lock().unwrap().take().unwrap();
         self.0.started.set(true);
         release.await.map_err(|_| PeerConnectionError::MissingSystem)?;
         self.0.published.set(true);
-        Ok(())
+        Ok(ConnectionId(0))
     }
     fn state(&self) -> Read<NodeState> { self.0.node_state.read() }
-    fn deregister_peer(&self, _: proto::EntityId) { self.0.published.set(false); }
-    async fn handle_message(&self, _: proto::NodeMessage) -> anyhow::Result<()> {
+    fn deregister_peer(&self, _: ConnectionId) { self.0.published.set(false); }
+    async fn handle_message(&self, _: ConnectionId, _: proto::NodeMessage) -> anyhow::Result<()> {
         self.0.handled.set(self.0.handled.value() + 1);
         Ok(())
     }
@@ -157,23 +179,15 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
             client.connect().unwrap();
             client.state.set(ConnectionState::Error { message: "transient transport error".into(), cause: None });
             assert!(futures::poll!(&mut ready).is_pending());
-            let peer = proto::EntityId::from_bytes([2; 32]);
-            deliver(
-                socket,
-                &bincode::serialize(&proto::Message::Presence(proto::Presence {
-                    node_id: peer,
-                    durable: true,
-                    system_root: None,
-                    protocol_version: proto::PROTOCOL_VERSION,
-                }))
-                .unwrap(),
-            );
+            let peer = proto::NodeId::from_bytes([2; 32]);
+            deliver(socket, &bincode::serialize(&proto::Message::Challenge(proto::Challenge::random())).unwrap());
+            deliver(socket, &bincode::serialize(&proto::Message::Presence(unsigned_presence(peer.to_bytes(), true))).unwrap());
             deliver(
                 socket,
                 &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(proto::NodeResponse {
                     request_id: proto::RequestId::new(),
                     from: peer,
-                    to: node.id(),
+                    to: node.id().unwrap(),
                     body: proto::NodeResponseBody::Success,
                 })))
                 .unwrap(),
@@ -181,7 +195,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
             node.0.started.read().wait_for(|started| *started).await;
             assert!(!node.0.published.value());
             assert_eq!(node.0.handled.value(), 0, "the following frame must wait for admission");
-            assert_eq!(sent_count(socket), 0, "client presence must wait for admission");
+            assert_eq!(sent_count(socket), 1, "the client has sent its challenge, and its presence must wait for admission");
 
             let release = if close_before_admission {
                 release
@@ -190,7 +204,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 node.0.presence_started.read().wait_for(|started| *started).await;
                 assert!(node.0.published.value());
                 assert_eq!(node.0.handled.value(), 0, "the following frame must wait for presence");
-                assert_eq!(sent_count(socket), 0);
+                assert_eq!(sent_count(socket), 1);
                 release_presence
             };
 
@@ -208,7 +222,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 sleep(Duration::ZERO).await;
                 assert!(!node.0.published.value());
                 assert_eq!(node.0.handled.value(), 0);
-                assert_eq!(sent_count(socket), 0);
+                assert_eq!(sent_count(socket), 1);
                 assert_eq!(connected_notifications.load(Ordering::Relaxed), 0, "the old connection must never publish Connected");
                 if matches!(stop, Stop::Drop) {
                     assert!(is_closed(socket), "dropping the connection owner must close the socket");
@@ -241,7 +255,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 state.wait_for(|state| matches!(state, ConnectionState::Connected { .. })).await;
                 node.0.handled.read().wait_for(|count| *count == 1).await;
                 assert!(node.0.published.value());
-                assert_eq!(sent_count(socket), 1);
+                assert_eq!(sent_count(socket), 2);
                 assert_eq!(connected_notifications.load(Ordering::Relaxed), 1);
                 assert!(matches!(futures::poll!(&mut ready), std::task::Poll::Ready(Ok(()))));
                 if matches!(stop, Stop::Drop) {

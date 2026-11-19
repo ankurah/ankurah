@@ -16,7 +16,7 @@ async fn test_websocket_client_server_fetch() -> Result<()> {
     // Start websocket server
     let (server_node, server_url, server_task) = start_test_server().await?;
 
-    info!("Server node ID: {}", server_node.id);
+    info!("Server node: {}", server_node);
 
     // Get server context
     let server_ctx = server_node.context(c)?;
@@ -34,7 +34,7 @@ async fn test_websocket_client_server_fetch() -> Result<()> {
     let client_storage = Arc::new(SledStorageEngine::new_test()?);
     let client_node = Node::new(client_storage, PermissiveAgent::new());
 
-    info!("Client node ID: {}", client_node.id);
+    info!("Client node: {}", client_node);
 
     // Create websocket client and connect
     let client = WebsocketClient::new(client_node.clone(), &server_url).await?;

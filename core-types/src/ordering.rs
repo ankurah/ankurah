@@ -57,6 +57,7 @@ fn type_order(value: &Value) -> u8 {
         Value::Object(_) => 5,
         Value::Binary(_) => 6,
         Value::Json(_) => 7,
+        Value::NodeId(_) => 8,
     }
 }
 
@@ -77,7 +78,13 @@ pub fn append_key_part<K>(part: &IndexKeyPart<K>, value: Option<&Value>, key: &m
             key.push(1);
             let bytes = value_bytes(value);
             match part.value_type {
-                ValueType::I16 | ValueType::I32 | ValueType::I64 | ValueType::F64 | ValueType::Bool | ValueType::EntityId => {
+                ValueType::I16
+                | ValueType::I32
+                | ValueType::I64
+                | ValueType::F64
+                | ValueType::Bool
+                | ValueType::EntityId
+                | ValueType::NodeId => {
                     key.extend_from_slice(&bytes);
                 }
                 ValueType::String | ValueType::Object | ValueType::Binary | ValueType::Json => frame(key, &bytes),

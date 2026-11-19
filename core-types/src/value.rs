@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 
-use crate::{EntityId, ValueType};
+use crate::{EntityId, NodeId, ValueType};
 
 mod collatable;
 
@@ -45,6 +45,9 @@ pub enum Value {
     /// A structured JSON value.
     #[serde(with = "json_as_bytes")]
     Json(serde_json::Value),
+    // bincode records variant positions in events and stores, so additional variants belong at the end.
+    /// A node id.
+    NodeId(NodeId),
 }
 
 impl From<&Value> for Value {
@@ -67,6 +70,7 @@ from_value_variant!(f64, F64);
 from_value_variant!(bool, Bool);
 from_value_variant!(Vec<u8>, Binary);
 from_value_variant!(EntityId, EntityId);
+from_value_variant!(NodeId, NodeId);
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self { Self::String(value.to_owned()) }
@@ -174,6 +178,7 @@ impl Value {
             Self::Object(_) => ValueType::Object,
             Self::Binary(_) => ValueType::Binary,
             Self::Json(_) => ValueType::Json,
+            Self::NodeId(_) => ValueType::NodeId,
         }
     }
 
@@ -193,6 +198,10 @@ impl Value {
                 EntityId::from_base64(s).map(Self::EntityId).map_err(|_| CastError::InvalidFormat { value: s.clone(), target_type })
             }
             (Self::EntityId(id), ValueType::String) => Ok(Self::String(id.to_base64())),
+            (Self::String(s), ValueType::NodeId) => {
+                NodeId::from_base64(s).map(Self::NodeId).map_err(|_| CastError::InvalidFormat { value: s.clone(), target_type })
+            }
+            (Self::NodeId(id), ValueType::String) => Ok(Self::String(id.to_base64())),
 
             (Self::I16(n), ValueType::I32) => Ok(Self::I32(*n as i32)),
             (Self::I16(n), ValueType::I64) => Ok(Self::I64(*n as i64)),
@@ -303,6 +312,7 @@ impl PartialOrd for Value {
             (Self::Bool(a), Self::Bool(b)) => a.partial_cmp(b),
             (Self::String(a), Self::String(b)) => a.partial_cmp(b),
             (Self::EntityId(a), Self::EntityId(b)) => a.to_bytes().partial_cmp(&b.to_bytes()),
+            (Self::NodeId(a), Self::NodeId(b)) => a.to_bytes().partial_cmp(&b.to_bytes()),
             (Self::Object(a), Self::Object(b)) | (Self::Binary(a), Self::Binary(b)) => a.partial_cmp(b),
             (Self::Json(a), Self::Json(b)) => a.to_string().partial_cmp(&b.to_string()),
             _ => None,
@@ -320,6 +330,7 @@ impl fmt::Display for Value {
             Self::Bool(v) => write!(f, "{v:?}"),
             Self::String(v) => write!(f, "{v:?}"),
             Self::EntityId(v) => fmt::Display::fmt(v, f),
+            Self::NodeId(v) => fmt::Display::fmt(v, f),
             Self::Object(v) | Self::Binary(v) => write!(f, "{v:?}"),
             Self::Json(v) => fmt::Display::fmt(v, f),
         }
@@ -368,6 +379,7 @@ mod wasm {
                 Value::F64(v) => JsValue::from_f64(*v),
                 Value::Bool(v) => JsValue::from_bool(*v),
                 Value::EntityId(v) => JsValue::from_str(&v.to_base64()),
+                Value::NodeId(v) => JsValue::from_str(&v.to_base64()),
                 Value::Object(v) | Value::Binary(v) => js_sys::Uint8Array::from(v.as_slice()).into(),
                 Value::Json(v) => serde_wasm_bindgen::to_value(v).unwrap_or(JsValue::NULL),
             }
@@ -421,13 +433,14 @@ mod tests {
             Value::Bool(true),
             Value::String("1".into()),
             Value::EntityId(crate::EntityId::random()),
+            Value::NodeId(crate::NodeId::from_bytes([7; 32])),
             Value::Object(vec![]),
             Value::Binary(vec![1]),
             Value::Json(serde_json::json!(1)),
             Value::Json(serde_json::json!("s")),
             Value::Json(serde_json::json!(true)),
         ];
-        let types = [I16, I32, I64, F64, Bool, String, EntityId, Object, Binary, Json];
+        let types = [I16, I32, I64, F64, Bool, String, EntityId, Object, Binary, Json, NodeId];
         for source in types {
             let values: Vec<_> = representatives.iter().filter(|value| value.value_type() == source).collect();
             for target in types {
@@ -461,6 +474,36 @@ mod tests {
         assert_eq!(Value::String(id.to_base64()).cast_to(ValueType::EntityId).unwrap(), Value::EntityId(id));
         assert_eq!(Value::EntityId(id).cast_to(ValueType::String).unwrap(), Value::String(id.to_base64()));
         assert!(matches!(Value::String("invalid-entity-id".to_owned()).cast_to(ValueType::EntityId), Err(CastError::InvalidFormat { .. })));
+    }
+
+    #[test]
+    fn node_id_appends_to_the_persisted_value_and_type_tags() {
+        let values = [
+            Value::I16(0),
+            Value::I32(0),
+            Value::I64(0),
+            Value::F64(0.0),
+            Value::Bool(false),
+            Value::String(String::new()),
+            Value::EntityId(EntityId::from_bytes([0; 32])),
+            Value::Object(vec![]),
+            Value::Binary(vec![]),
+            Value::Json(serde_json::Value::Null),
+            Value::NodeId(NodeId::from_bytes([7; 32])),
+        ];
+        for (tag, value) in values.into_iter().enumerate() {
+            let tag = (tag as u32).to_le_bytes();
+            assert_eq!(&bincode::serialize(&value).unwrap()[..4], &tag);
+            assert_eq!(bincode::serialize(&value.value_type()).unwrap(), tag);
+        }
+    }
+
+    #[test]
+    fn node_ids_convert_to_and_from_base64_text() {
+        let id = NodeId::from_bytes([7; 32]);
+        assert_eq!(Value::String(id.to_base64()).cast_to(ValueType::NodeId).unwrap(), Value::NodeId(id));
+        assert_eq!(Value::NodeId(id).cast_to(ValueType::String).unwrap(), Value::String(id.to_base64()));
+        assert!(matches!(Value::String("invalid-node-id".to_owned()).cast_to(ValueType::NodeId), Err(CastError::InvalidFormat { .. })));
     }
 
     #[test]

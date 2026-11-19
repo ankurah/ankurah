@@ -76,7 +76,7 @@ impl PolicyAgent for Policy {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &Attested<Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -85,7 +85,7 @@ impl PolicyAgent for Policy {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &Attested<EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -94,7 +94,7 @@ impl PolicyAgent for Policy {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -298,10 +298,9 @@ fn authorization_limits_include_member_identity_and_canonical_state_bytes() -> a
 async fn requester_rechecks_capture_authority_before_disclosing_its_initial_digest() -> anyhow::Result<()> {
     use crate::connector::{PeerSender, SendError};
     #[derive(Clone)]
-    struct Closed(EntityId);
+    struct Closed;
     impl PeerSender for Closed {
         fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Err(SendError::ConnectionClosed) }
-        fn recipient_node_id(&self) -> EntityId { self.0 }
         fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
     }
     let storage = Arc::new(TestStorage::default());
@@ -309,12 +308,7 @@ async fn requester_rechecks_capture_authority_before_disclosing_its_initial_dige
     let mut policy = Policy::new(Predicate::True, false);
     policy.revoke_after = Some(1);
     let node = Node::new_durable(storage, policy);
-    let peer = EntityId::random();
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(Closed(peer)),
-    )
-    .await?;
+    let peer = crate::test_utils::connect_peer(&node, &crate::node::NodeKey::generate(), false, Closed).await?;
     let result = node.reconcile_query(peer, Predicate::MemberOf(model()).into(), &vec![DEFAULT_CONTEXT], None).await;
     failure(result, ComparisonFailure::AuthorizationChanged);
     assert!(node.policy_agent.checks.load(Ordering::SeqCst) >= 2, "the captured permission must be checked again before sending");

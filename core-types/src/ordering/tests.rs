@@ -80,11 +80,12 @@ fn floats_have_a_total_order_with_canonical_nan_and_zero() {
 
 #[test]
 fn tuple_components_reverse_without_prefix_ambiguity_and_honor_null_placement() {
-    for value_type in [ValueType::String, ValueType::Json] {
+    for value_type in [ValueType::String, ValueType::Json, ValueType::NodeId] {
         let values = match value_type {
             ValueType::String => {
                 vec![Value::String("".into()), Value::String("\0".into()), Value::String("a".into()), Value::String("aa".into())]
             }
+            ValueType::NodeId => [0, 16, 64, 208, 240, 255].map(|byte| Value::NodeId(crate::NodeId::from_bytes([byte; 32]))).to_vec(),
             _ => ["[]", "null", "\"a\"", "1", "1.01", "true", "[0]", "{}"].map(json).to_vec(),
         };
         for direction in [IndexDirection::Asc, IndexDirection::Desc] {

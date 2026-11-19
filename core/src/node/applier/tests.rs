@@ -65,7 +65,7 @@ impl Fixture {
     async fn apply_snapshot(&self, ingress: SnapshotIngress, state: State, event: Event) -> Result<(), MutationError> {
         let states = LocalStateGetter::new(self.storage.clone());
         let state = proto::StateFragment { state, attestations: Default::default() };
-        let peer = EntityId::from_bytes([5; 32]);
+        let peer = proto::NodeId::from_bytes([5; 32]);
         match ingress {
             SnapshotIngress::Snapshot => {
                 let delta = proto::EntityDelta { entity_id: self.entity.id(), content: proto::DeltaContent::StateSnapshot { state } };
@@ -102,7 +102,7 @@ enum EventIngress {
 impl Fixture {
     /// Deliver `events` for the fixture's entity through `ingress`, a state update carrying the current state.
     async fn deliver(&self, ingress: EventIngress, events: Vec<Event>) -> Result<(), MutationError> {
-        let peer = EntityId::from_bytes([5; 32]);
+        let peer = proto::NodeId::from_bytes([5; 32]);
         let states = LocalStateGetter::new(self.storage.clone());
         let fragments = events.into_iter().map(|event| Attested::opt(event, None).into()).collect();
         let content = match ingress {
@@ -142,7 +142,7 @@ async fn durable_nodes_refuse_bare_snapshots_for_new_and_existing_entities() -> 
         let before = resident.as_ref().map(Entity::to_state).transpose()?;
         let state = proto::StateFragment { state: snapshot.clone(), attestations: Default::default() };
         let delta = proto::EntityDelta { entity_id: source.entity.id(), content: proto::DeltaContent::StateSnapshot { state } };
-        let error = NodeApplier::apply_delta(&node, &EntityId::random(), delta, &events, &states).await.unwrap_err();
+        let error = NodeApplier::apply_delta(&node, &proto::NodeId::from_bytes([5; 32]), delta, &events, &states).await.unwrap_err();
         assert!(matches!(error, MutationError::InvalidUpdate("durable nodes require event-backed state")), "{error}");
         assert_eq!(resident.as_ref().map(Entity::to_state).transpose()?, before);
         if let Some(before) = before {
@@ -171,7 +171,7 @@ async fn durable_state_and_events_reconstructs_history_before_publishing() -> an
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
     node.system.wait_loaded().await?;
     let states = LocalStateGetter::new(storage.clone());
-    let peer = EntityId::random();
+    let peer = proto::NodeId::from_bytes([5; 32]);
     let update = |events: Vec<Event>| proto::SubscriptionUpdateItem {
         entity_id: source.entity.id(),
         content: proto::UpdateContent::StateAndEvent(
@@ -219,7 +219,7 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
     storage.fail_next_commit();
     let failed = NodeApplier::apply_delta(
         &node,
-        &EntityId::from_bytes([5; 32]),
+        &proto::NodeId::from_bytes([5; 32]),
         delta.clone(),
         &LocalEventGetter::new(storage.clone(), false),
         &LocalStateGetter::new(storage.clone()),
@@ -231,7 +231,7 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
 
     let change = NodeApplier::apply_delta(
         &node,
-        &EntityId::from_bytes([5; 32]),
+        &proto::NodeId::from_bytes([5; 32]),
         delta,
         &LocalEventGetter::new(storage.clone(), false),
         &LocalStateGetter::new(storage.clone()),
@@ -320,7 +320,7 @@ async fn first_snapshot_checks_cargo_against_local_or_carried_parents_but_allows
         // A first snapshot must not ask its event getter for missing history; the generation check is local-only.
         let result = NodeApplier::apply_update(
             &node,
-            &EntityId::from_bytes([5; 32]),
+            &proto::NodeId::from_bytes([5; 32]),
             update,
             &NoEventReads,
             &LocalStateGetter::new(storage.clone()),
@@ -387,7 +387,7 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
         // The stray event is a sibling of first, so the snapshot does not include it.
         let error = NodeApplier::apply_update(
             &node,
-            &EntityId::from_bytes([5; 32]),
+            &proto::NodeId::from_bytes([5; 32]),
             update(vec![tip.clone().into(), stray.clone().into(), first.clone().into()]),
             &events,
             &states,
@@ -408,7 +408,7 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
         // A carried ancestor is valid even though only its descendant remains in the head.
         let change = NodeApplier::apply_update(
             &node,
-            &EntityId::from_bytes([5; 32]),
+            &proto::NodeId::from_bytes([5; 32]),
             update(vec![tip.clone().into(), first.clone().into()]),
             &events,
             &states,
@@ -528,7 +528,7 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
     let mut applying = Box::pin(async {
         NodeApplier::apply_update(
             &fixture.node,
-            &EntityId::from_bytes([5; 32]),
+            &proto::NodeId::from_bytes([5; 32]),
             update,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
@@ -586,7 +586,7 @@ async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_a
     let mut applying = Box::pin(async {
         NodeApplier::apply_update(
             &fixture.node,
-            &EntityId::from_bytes([5; 32]),
+            &proto::NodeId::from_bytes([5; 32]),
             update,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
@@ -628,7 +628,7 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     let mut applying = Box::pin(async {
         NodeApplier::apply_delta(
             &fixture.node,
-            &EntityId::from_bytes([5; 32]),
+            &proto::NodeId::from_bytes([5; 32]),
             delta,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
@@ -678,7 +678,7 @@ async fn unchanged_bare_snapshots_do_not_write_storage() -> anyhow::Result<()> {
         };
         assert!(NodeApplier::apply_delta(
             &fixture.node,
-            &EntityId::from_bytes([5; 32]),
+            &proto::NodeId::from_bytes([5; 32]),
             delta,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
@@ -787,7 +787,7 @@ async fn event_only_discards_the_batch_without_partial_failed_operations() -> an
     };
     let error = NodeApplier::apply_update(
         &fixture.node,
-        &EntityId::from_bytes([5; 32]),
+        &proto::NodeId::from_bytes([5; 32]),
         update,
         &getter,
         &LocalStateGetter::new(fixture.storage.clone()),
@@ -924,7 +924,7 @@ async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_
     assert_eq!((newer.generation(), older.generation()), (5, 2));
     let head = Clock::from_events([&newer, &older]);
 
-    let peer = EntityId::from_bytes([5; 32]);
+    let peer = proto::NodeId::from_bytes([5; 32]);
     let events = LocalEventGetter::new(storage.clone(), false);
     let states = LocalStateGetter::new(storage.clone());
     let snapshot = State { memberships: [model_a()].into(), head: head.clone(), ..State::default() };
@@ -1078,7 +1078,7 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     // Falsify P's generation below its own, within the bound: its payload derives 2.
     let update = over(&parent, 1);
 
-    let peer = EntityId::from_bytes([5; 32]);
+    let peer = proto::NodeId::from_bytes([5; 32]);
     let events = LocalEventGetter::new(storage.clone(), false);
     let states = LocalStateGetter::new(storage.clone());
     let snapshot = State { memberships: [model_a()].into(), head: Clock::singleton(&tip), ..State::default() };
@@ -1134,7 +1134,7 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
         // Falsify P's generation below its own, within the bound: its payload derives 2.
         let update = over(&parent, 1);
 
-        let peer = EntityId::from_bytes([5; 32]);
+        let peer = proto::NodeId::from_bytes([5; 32]);
         let events = LocalEventGetter::new(storage.clone(), false);
         let states = LocalStateGetter::new(storage.clone());
         let snapshot = State { memberships: [model_a()].into(), head: Clock::singleton(&tip), ..State::default() };
@@ -1315,7 +1315,7 @@ async fn one_comparison_prepares_and_persists_a_concurrent_batch() -> anyhow::Re
     };
     let change = NodeApplier::apply_update(
         &fixture.node,
-        &EntityId::from_bytes([5; 32]),
+        &proto::NodeId::from_bytes([5; 32]),
         update,
         &getter,
         &LocalStateGetter::new(fixture.storage.clone()),

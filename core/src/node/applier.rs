@@ -1,3 +1,4 @@
+use crate::connector::ConnectionId;
 use crate::entity::RemoteTrxEntity;
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
@@ -17,7 +18,8 @@ impl NodeApplier {
     /// we also don't need to fan events out to peers because we're receiving them from a peer
     pub(crate) async fn apply_updates<SE, PA>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        connection: &ConnectionId,
+        from_peer_id: &proto::NodeId,
         items: Vec<proto::SubscriptionUpdateItem>,
     ) -> Result<(), ApplyError>
     where
@@ -33,10 +35,10 @@ impl NodeApplier {
         };
         // A peer may push only what we asked it for, so a push is admissible
         // only against a standing query of ours with that peer.
-        if !relay.has_subscription_with_peer(from_peer_id) {
+        if !relay.has_subscription_with_peer(connection) {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription with").into());
         }
-        let cdata = relay.get_contexts_for_peer(from_peer_id);
+        let cdata = relay.get_contexts_for_peer(connection);
 
         // Apply all updates. One bad item must not poison the batch: failures
         // are collected per item, the remaining items still apply, and the
@@ -69,7 +71,7 @@ impl NodeApplier {
     /// stage it for causal comparison. Application checks its lineage later.
     fn validate_and_stage<SE, PA, E>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         entity_id: proto::EntityId,
         event_fragments: Vec<proto::EventFragment>,
         event_getter: &E,
@@ -97,7 +99,7 @@ impl NodeApplier {
 
     async fn apply_update<SE, PA, E, S>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         update: proto::SubscriptionUpdateItem,
         event_getter: &E,
         state_getter: &S,
@@ -361,7 +363,7 @@ impl NodeApplier {
     /// Collects all errors and returns them at the end - caller decides whether to fail or log
     pub(crate) async fn apply_deltas<SE, PA, E, S>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         deltas: Vec<proto::EntityDelta>,
         event_getter: &E,
         state_getter: &S,
@@ -415,7 +417,7 @@ impl NodeApplier {
     /// Returns Some(EntityChange) if the delta resulted in a change, None otherwise
     async fn apply_delta<SE, PA, E, S>(
         node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
+        from_peer_id: &proto::NodeId,
         delta: proto::EntityDelta,
         event_getter: &E,
         state_getter: &S,

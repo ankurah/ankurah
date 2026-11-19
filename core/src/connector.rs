@@ -18,18 +18,25 @@ pub enum PeerConnectionError {
     SystemReset(String),
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
+    #[error("peer did not prove that it holds the key of its presence")]
+    UnprovenKey,
+}
+
+/// A number a node assigns to one of its own open connections, so peers with the same node id keep separate connections.
+/// The node never sends this number to another node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConnectionId(pub u64);
+
+impl std::fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "connection {}", self.0) }
 }
 
 // TODO redesign this such that:
 // - the sender and receiver are disconnected at the same time
-// - a connection id or dyn Ord/Eq/Hash is used to identify the connection for deregistration
-//   so that we can have multiple connections to the same node without things getting mixed up
 
 #[async_trait]
 pub trait PeerSender: Send + Sync {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
-    /// The node ID of the recipient of this message
-    fn recipient_node_id(&self) -> proto::EntityId;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }
 
@@ -51,31 +58,55 @@ impl From<anyhow::Error> for SendError {
 
 #[async_trait]
 pub trait NodeComms: Send + Sync {
-    fn id(&self) -> proto::EntityId;
-    /// Build our handshake identity after local system storage loads; an unadopted node has no root.
-    async fn presence(&self) -> Result<proto::Presence, crate::error::NodeHaltReason>;
-    async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError>;
+    /// The node's id, or `None` while the node is unkeyed.
+    fn id(&self) -> Option<proto::NodeId>;
+    /// A signed presence for the peer's `challenge`, using this node's `side` of the connection.
+    /// The node waits for its keypair, and for system storage to load so its presence includes any stored system root.
+    async fn presence(
+        &self,
+        side: proto::ConnectionSide,
+        challenge: &proto::Challenge,
+    ) -> Result<proto::SignedPresence, crate::error::NodeHaltReason>;
+    async fn register_peer(
+        &self,
+        side: proto::ConnectionSide,
+        challenge: &proto::Challenge,
+        presence: proto::SignedPresence,
+        sender: Box<dyn PeerSender>,
+    ) -> Result<ConnectionId, PeerConnectionError>;
     fn state(&self) -> ankurah_signals::Read<NodeState>;
-    fn deregister_peer(&self, node_id: proto::EntityId);
-    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
+    fn deregister_peer(&self, connection: ConnectionId);
+    async fn handle_message(&self, connection: ConnectionId, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
-    fn id(&self) -> proto::EntityId { self.id }
-    async fn presence(&self) -> Result<proto::Presence, crate::error::NodeHaltReason> { self.presence().await }
-    async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError> {
-        self.register_peer(presence, sender).await
+    fn id(&self) -> Option<proto::NodeId> { self.0.id() }
+    async fn presence(
+        &self,
+        side: proto::ConnectionSide,
+        challenge: &proto::Challenge,
+    ) -> Result<proto::SignedPresence, crate::error::NodeHaltReason> {
+        self.presence(side, challenge).await
+    }
+    async fn register_peer(
+        &self,
+        side: proto::ConnectionSide,
+        challenge: &proto::Challenge,
+        presence: proto::SignedPresence,
+        sender: Box<dyn PeerSender>,
+    ) -> Result<ConnectionId, PeerConnectionError> {
+        self.register_peer(side, challenge, presence, sender).await
     }
     fn state(&self) -> ankurah_signals::Read<NodeState> { self.state() }
-    fn deregister_peer(&self, node_id: proto::EntityId) {
+    fn deregister_peer(&self, connection: ConnectionId) {
         //
-        self.deregister_peer(node_id);
+        self.deregister_peer(connection);
     }
-    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+    async fn handle_message(&self, connection: ConnectionId, message: proto::NodeMessage) -> anyhow::Result<()> {
         //
-        self.handle_message(message).await
+        self.handle_message(connection, message).await
     }
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }

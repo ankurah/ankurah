@@ -83,11 +83,11 @@ fn encode_value_component(value: &Value, expected_type: ValueType, descending: b
             let b = value.to_bytes()[0];
             Ok(vec![if !descending { b } else { 0xFFu8.wrapping_sub(b) }])
         }
-        (Value::EntityId(entity_id), ValueType::EntityId) => {
-            // Fixed-width EntityId: no terminator needed
-            let bytes = entity_id.to_bytes();
+        (Value::EntityId(_), ValueType::EntityId) | (Value::NodeId(_), ValueType::NodeId) => {
+            // Entity ids and node ids each occupy 32 bytes, so neither needs a terminator.
+            let bytes = value.to_bytes();
             if !descending {
-                Ok(bytes.to_vec())
+                Ok(bytes)
             } else {
                 Ok(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)).collect())
             }

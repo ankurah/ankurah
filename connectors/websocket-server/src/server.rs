@@ -1,6 +1,6 @@
 use ankurah_core::storage::StorageEngine;
 use ankurah_core::{connector::PeerConnectionError, signals::Wait};
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, ConnectionSide::Accepting};
 use anyhow::Result;
 use axum::{
     extract::{
@@ -28,7 +28,7 @@ use crate::{client_ip::SmartClientIp, OptionalUserAgent};
 
 use super::state::Connection;
 
-// A peer that cannot decode our Presence will never send its own, so the
+// A peer that cannot decode the challenge may never send its presence, so the
 // pre-establishment state must not be allowed to live for the socket lifetime.
 const INITIAL_PRESENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -118,21 +118,13 @@ where
 {
     info!("Websocket server connected to {}", client_ip);
 
-    let presence = match node.presence().await {
-        Ok(presence) => presence,
-        Err(error) => {
-            warn!("Cannot admit websocket peer at {client_ip}: {error}");
-            return;
-        }
-    };
-
     let (sender, mut receiver) = socket.split();
     let mut conn = Connection::Initial(Some(sender));
     let initial_presence_deadline = tokio::time::Instant::now() + INITIAL_PRESENCE_TIMEOUT;
 
-    // Immediately send server presence after connection
-    if let Err(e) = conn.send(proto::Message::Presence(presence)).await {
-        debug!("Error sending presence to {client_ip}: {:?}", e);
+    let challenge = proto::Challenge::random();
+    if let Err(e) = conn.send(proto::Message::Challenge(challenge)).await {
+        debug!("Error sending challenge to {client_ip}: {:?}", e);
         return;
     }
 
@@ -153,7 +145,7 @@ where
             let Some(msg) = next else { break };
 
             if let Ok(msg) = msg {
-                if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
+                if process_message(msg, client_ip, &challenge, &mut conn, node.clone()).await.is_break() {
                     break;
                 }
             } else {
@@ -169,9 +161,8 @@ where
     }
 
     // Clean up peer registration if we had registered one
-    if let Connection::Established(peer_sender) = conn {
-        use ankurah_core::connector::PeerSender;
-        node.deregister_peer(peer_sender.recipient_node_id());
+    if let Connection::Established(_, connection) = conn {
+        node.deregister_peer(connection);
     }
 
     debug!("Websocket context {client_ip} destroyed");
@@ -181,6 +172,7 @@ where
 async fn process_message<SE, PA>(
     msg: axum::extract::ws::Message,
     client_ip: IpAddr,
+    challenge: &proto::Challenge,
     state: &mut Connection,
     node: Node<SE, PA>,
 ) -> ControlFlow<(), ()>
@@ -194,13 +186,26 @@ where
 
             if let Ok(message) = deserialize::<proto::Message>(&d) {
                 match message {
-                    proto::Message::Presence(presence) => {
+                    proto::Message::Challenge(client_challenge) => {
+                        let presence = match node.presence(Accepting, &client_challenge).await {
+                            Ok(presence) => presence,
+                            Err(error) => {
+                                warn!("Cannot admit websocket peer at {client_ip}: {error}");
+                                return ControlFlow::Break(());
+                            }
+                        };
+                        if let Err(e) = state.send(proto::Message::Presence(presence)).await {
+                            debug!("Error sending presence to {client_ip}: {:?}", e);
+                            return ControlFlow::Break(());
+                        }
+                    }
+                    proto::Message::Presence(signed) => {
                         // Pre-check the version while we can still reply through the
                         // connection and await the flush; register_peer re-enforces
                         // this for every transport.
-                        if !proto::protocol_compatible(presence.protocol_version) {
+                        if !proto::protocol_compatible(signed.presence.protocol_version) {
                             let rejection =
-                                proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
+                                proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: signed.presence.protocol_version };
                             warn!("Refusing peer at {client_ip}: {rejection}");
                             let _ = state.send(proto::Message::PresenceRejected(rejection)).await;
                             return ControlFlow::Break(());
@@ -212,10 +217,10 @@ where
 
                                     use super::sender::WebSocketClientSender;
                                     // Register peer sender for this client
-                                    let sender = WebSocketClientSender::new(presence.node_id, sender);
+                                    let sender = WebSocketClientSender::new(signed.presence.node_id(), sender);
 
-                                    match node.register_peer(presence, Box::new(sender.clone())).await {
-                                        Ok(()) => *state = Connection::Established(sender),
+                                    match node.register_peer(Accepting, challenge, signed, Box::new(sender.clone())).await {
+                                        Ok(connection) => *state = Connection::Established(sender, connection),
                                         Err(rejection) => {
                                             warn!("Refusing peer at {client_ip}: {rejection}");
                                             if let PeerConnectionError::Protocol(rejection) = rejection {
@@ -230,9 +235,9 @@ where
                         }
                     }
                     proto::Message::PeerMessage(msg) => {
-                        if let Connection::Established(_) = state {
+                        if let Connection::Established(_, connection) = *state {
                             tokio::spawn(async move {
-                                if let Err(e) = node.handle_message(msg).await {
+                                if let Err(e) = node.handle_message(connection, msg).await {
                                     error!("Error handling message from {}: {:?}", client_ip, e);
                                 }
                             });

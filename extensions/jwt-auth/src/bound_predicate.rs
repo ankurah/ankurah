@@ -1,6 +1,6 @@
 use ankql::ast::{Expr, Predicate, Resolved};
 use ankurah_core::policy::AccessDenied;
-use ankurah_core_types::ValueType;
+use ankurah_core_types::{Value, ValueType};
 use ankurah_proto::ModelId;
 
 use crate::{JwtClaims, PolicyCatalog};
@@ -33,12 +33,14 @@ impl BoundPredicate {
             .iter()
             .map(|(variable, target)| {
                 let value = crate::variables::resolve_variable(variable, claims)?;
-                let Expr::Literal(value) = crate::variables::typed_expr::<Resolved>(value) else { unreachable!() };
                 let value = match target {
-                    Some(target) => {
-                        value.cast_to(*target).map_err(|_| AccessDenied::ByPolicy("claim value does not match policy property type"))?
+                    Some(target) => Value::String(value)
+                        .cast_to(*target)
+                        .map_err(|_| AccessDenied::ByPolicy("claim value does not match policy property type"))?,
+                    None => {
+                        let Expr::Literal(value) = crate::variables::typed_expr::<Resolved>(value) else { unreachable!() };
+                        value
                     }
-                    None => value,
                 };
                 Ok(Expr::Literal(value))
             })
@@ -98,4 +100,30 @@ fn expression_parameters(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ankql::ast::ComparisonOperator;
+    use ankurah_core_types::{EntityId, NodeId, PropertyId};
+
+    /// The claim is cast to the type of the property, so a claim holding a node id is not read as an entity id.
+    #[test]
+    fn node_id_claims_produce_node_id_literals_for_node_id_properties() {
+        let property = PropertyId::EntityId(EntityId::from_bytes([1; 32]));
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::Path(property.into())),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Placeholder),
+        };
+        let bound = BoundPredicate::from_stored(predicate, vec![("$jwt.custom.node".to_owned(), Some(ValueType::NodeId))]).unwrap();
+        let node = NodeId::from_bytes([7; 32]);
+        let custom = serde_json::Map::from_iter([("node".to_owned(), serde_json::Value::String(node.to_base64()))]);
+        let claims = JwtClaims { sub: String::new(), roles: vec![], email: String::new(), name: None, custom };
+        let Predicate::Comparison { right, .. } = bound.populate(&claims).unwrap() else {
+            panic!("the populated predicate is not a comparison")
+        };
+        assert_eq!(*right, Expr::Literal(Value::NodeId(node)));
+    }
 }

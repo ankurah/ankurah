@@ -84,7 +84,7 @@ fn expect_error(resp: proto::NodeResponseBody, needle: &str) {
 async fn register_schema_creates_catalog_entities() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    let models = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let models = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     assert_eq!(models.properties.len(), 1);
     let (model_id, property_id, membership_id) = (models.id, models.properties[0].id, models.properties[0].membership_id);
     assert_eq!(models.properties[0].minted_for, Some(model_id), "provenance scope is the request's model");
@@ -113,7 +113,7 @@ async fn register_schema_creates_catalog_entities() -> anyhow::Result<()> {
 async fn registration_is_idempotent() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let (model_id, property_id, membership_id) = (first.id, first.properties[0].id, first.properties[0].membership_id);
 
     let heads_before = (
@@ -122,7 +122,7 @@ async fn registration_is_idempotent() -> anyhow::Result<()> {
         catalog_head(&server, MEMBERSHIP, membership_id).await?,
     );
 
-    let second = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let second = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     assert_eq!(
         (second.id, second.properties[0].id, second.properties[0].membership_id),
         (model_id, property_id, membership_id),
@@ -145,19 +145,19 @@ async fn registration_is_idempotent() -> anyhow::Result<()> {
 async fn renamed_from_moves_the_lineage() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let property_id = first.properties[0].id;
 
     // Rename: "name" -> "title", hinted.
     let rename = || proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("title", Some("name"), "yrs", "string")]) };
-    let renamed = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename()).await?);
+    let renamed = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename()).await?);
     assert_eq!(renamed.properties[0].id, property_id, "the hint preserves the lineage id");
     let values = catalog_values(&server, PROPERTY, property_id).await?;
     assert_eq!(values.get("name"), Some(&Some(Value::String("title".into()))), "display name follows the rename");
 
     // Applied hint no-ops: same id, head unchanged.
     let head_before = catalog_head(&server, PROPERTY, property_id).await?;
-    let again = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename()).await?);
+    let again = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename()).await?);
     assert_eq!(again.properties[0].id, property_id);
     assert_eq!(catalog_head(&server, PROPERTY, property_id).await?, head_before, "an applied hint is a pure no-op");
 
@@ -173,18 +173,18 @@ async fn renamed_from_moves_the_lineage() -> anyhow::Result<()> {
 async fn rename_hint_guard_and_stale_writer_fork() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let lineage = first.properties[0].id;
 
     // Rename "name" -> "title".
     let rename = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("title", Some("name"), "yrs", "string")]) };
-    assert_eq!(expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?).properties[0].id, lineage);
+    assert_eq!(expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename).await?).properties[0].id, lineage);
 
     // A stale writer (pre-rename code) re-registers the retired name with
     // no hint: on this permissive system it allocates a fresh identity --
     // the visible fork, never a silent resurrection of the lineage.
     let stale = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("name", None, "yrs", "string")]) };
-    let fork = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, stale).await?).properties[0].id;
+    let fork = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, stale).await?).properties[0].id;
     assert_ne!(fork, lineage, "a hintless retired-name registration allocates fresh (the policy-governed fork)");
 
     // A later hinted registration must NOT hijack the fork: the
@@ -192,7 +192,7 @@ async fn rename_hint_guard_and_stale_writer_fork() -> anyhow::Result<()> {
     // and the fork keeps its name.
     let hinted_again =
         proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("title", Some("name"), "yrs", "string")]) };
-    assert_eq!(expect_registered(client.request(server.id, &DEFAULT_CONTEXT, hinted_again).await?).properties[0].id, lineage);
+    assert_eq!(expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, hinted_again).await?).properties[0].id, lineage);
     let fork_values = catalog_values(&server, PROPERTY, fork).await?;
     assert_eq!(fork_values.get("name"), Some(&Some(Value::String("name".into()))), "the guard never renames the fork");
 
@@ -205,13 +205,13 @@ async fn rename_hint_guard_and_stale_writer_fork() -> anyhow::Result<()> {
 #[tokio::test]
 async fn chained_renames_win_by_recency_not_tiebreak() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let property_id = first.properties[0].id;
 
     let mut last_head = catalog_head(&server, PROPERTY, property_id).await?;
     for (from, to) in [("name", "title"), ("title", "caption"), ("caption", "headline")] {
         let rename = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property(to, Some(from), "yrs", "string")]) };
-        let resolved = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
+        let resolved = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename).await?);
         assert_eq!(resolved.properties[0].id, property_id, "the lineage id never changes across the chain");
         let values = catalog_values(&server, PROPERTY, property_id).await?;
         assert_eq!(values.get("name"), Some(&Some(Value::String((*to).into()))), "latest rename must win");
@@ -230,12 +230,12 @@ async fn castable_retype_is_rejected() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
     let first = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("name", None, "lww", "string")]) };
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, first).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, first).await?);
     let string_id = first.properties[0].id;
     assert_eq!(first.properties[0].value_type, "string");
 
     let retype = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("name", None, "lww", "i64")]) };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, retype).await?, "must match exactly");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, retype).await?, "must match exactly");
 
     let values = catalog_values(&server, PROPERTY, string_id).await?;
     assert_eq!(values.get("value_type"), Some(&Some(Value::String("string".into()))), "the canonical type never changes");
@@ -250,11 +250,11 @@ async fn incompatible_retype_refuses_registration() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
     let first = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("name", None, "lww", "string")]) };
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, first).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, first).await?);
     let string_id = first.properties[0].id;
 
     let retype = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("name", None, "lww", "binary")]) };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, retype).await?, "must match exactly");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, retype).await?, "must match exactly");
 
     let values = catalog_values(&server, PROPERTY, string_id).await?;
     assert_eq!(values.get("value_type"), Some(&Some(Value::String("string".into()))), "the refusal changes nothing");
@@ -271,7 +271,7 @@ async fn duplicate_descriptors_coalesce_or_reject() -> anyhow::Result<()> {
     let duplicate = proto::NodeRequestBody::RegisterSchema {
         model: album_model(vec![property("year", None, "lww", "string"), property("year", None, "lww", "string")]),
     };
-    let registered = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, duplicate).await?);
+    let registered = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, duplicate).await?);
     assert_eq!(registered.properties.len(), 1, "duplicates coalesce onto one property");
     assert_eq!(registered.properties[0].value_type, "string", "the first occurrence fixes the canonical type");
     assert_eq!(count_rows(&server, MODEL).await?, 1, "exactly one model row durable");
@@ -281,13 +281,13 @@ async fn duplicate_descriptors_coalesce_or_reject() -> anyhow::Result<()> {
     let conflicting = proto::NodeRequestBody::RegisterSchema {
         model: album_model(vec![property("length", None, "lww", "string"), property("length", None, "lww", "binary")]),
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, conflicting).await?, "conflicting metadata");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, conflicting).await?, "conflicting metadata");
 
     let mut optional = property("format", None, "lww", "string");
     optional.optional = true;
     let conflicting =
         proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("format", None, "lww", "string"), optional]) };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, conflicting).await?, "conflicting metadata");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, conflicting).await?, "conflicting metadata");
 
     Ok(())
 }
@@ -297,11 +297,11 @@ async fn duplicate_descriptors_coalesce_or_reject() -> anyhow::Result<()> {
 async fn backend_change_refuses_registration() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let yrs_id = first.properties[0].id;
 
     let rebackend = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("name", None, "lww", "string")]) };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, rebackend).await?, "must match exactly");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rebackend).await?, "must match exactly");
 
     let values = catalog_values(&server, PROPERTY, yrs_id).await?;
     assert_eq!(values.get("backend"), Some(&Some(Value::String("yrs".into()))), "the refusal changes nothing");
@@ -321,11 +321,11 @@ async fn membership_optional_flip_updates() -> anyhow::Result<()> {
         proto::NodeRequestBody::RegisterSchema { model: album_model(vec![entry]) }
     };
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, request(false)).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, request(false)).await?);
     let membership_id = first.properties[0].membership_id;
 
     for expected in [true, false, true] {
-        let resolved = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, request(expected)).await?);
+        let resolved = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, request(expected)).await?);
         assert_eq!(resolved.properties[0].membership_id, membership_id, "the membership id is stable across flips");
         let membership = catalog_values(&server, MEMBERSHIP, membership_id).await?;
         assert_eq!(membership.get("optional"), Some(&Some(Value::Bool(expected))), "the newest optionality stance must win");
@@ -340,7 +340,7 @@ async fn membership_optional_flip_updates() -> anyhow::Result<()> {
 #[tokio::test]
 async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let model_id = first.id;
 
     let model = catalog_values(&server, MODEL, model_id).await?;
@@ -356,13 +356,13 @@ async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
         },
     };
 
-    let resolved = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename("Discography")).await?);
+    let resolved = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename("Discography")).await?);
     assert_eq!(resolved.id, model_id, "the model id is stable across display renames");
     let model = catalog_values(&server, MODEL, model_id).await?;
     assert_eq!(model.get("name"), Some(&Some(Value::String("Discography".into()))));
 
     // Revert to the collection name itself.
-    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename("album")).await?);
+    expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename("album")).await?);
     let model = catalog_values(&server, MODEL, model_id).await?;
     assert_eq!(model.get("name"), Some(&Some(Value::String("album".into()))), "display name reverts to the collection name");
 
@@ -375,7 +375,7 @@ async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
 async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let property_id = first.properties[0].id;
 
     // Model B shares album's property by explicit id, with its own
@@ -397,7 +397,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             }],
         },
     };
-    let shared = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, share).await?);
+    let shared = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, share).await?);
     assert_eq!(shared.properties[0].id, property_id, "binding resolves to the shared property, never mints");
     let membership_id = shared.properties[0].membership_id;
 
@@ -417,7 +417,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             optional: false,
         }]),
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, missing).await?, "does not exist");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, missing).await?, "does not exist");
 
     // A backend change is always incompatible, regardless of value_type.
     let mismatch = proto::NodeRequestBody::RegisterSchema {
@@ -431,7 +431,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
             optional: false,
         }]),
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, mismatch).await?, "must match exactly");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, mismatch).await?, "must match exactly");
 
     Ok(())
 }
@@ -439,7 +439,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
 #[tokio::test]
 async fn explicit_property_id_cannot_create_ambiguous_membership() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
 
     let source = proto::RegisterModel {
         label: "source".into(),
@@ -448,14 +448,16 @@ async fn explicit_property_id_cannot_create_ambiguous_membership() -> anyhow::Re
         build_id: [1; 16],
         properties: vec![property("name", None, "yrs", "string")],
     };
-    let source =
-        expect_registered(client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: source }).await?);
+    let source = expect_registered(
+        client.request(server.id().unwrap(), &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: source }).await?,
+    );
     let memberships_before = count_rows(&server, MEMBERSHIP).await?;
 
     let mut colliding = property("name", None, "yrs", "string");
     colliding.explicit_id = Some(source.properties[0].id);
-    let response =
-        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: album_model(vec![colliding]) }).await?;
+    let response = client
+        .request(server.id().unwrap(), &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model: album_model(vec![colliding]) })
+        .await?;
 
     expect_error(response, "already bound to another identity");
     assert_eq!(count_rows(&server, MEMBERSHIP).await?, memberships_before);
@@ -465,7 +467,7 @@ async fn explicit_property_id_cannot_create_ambiguous_membership() -> anyhow::Re
 #[tokio::test]
 async fn one_request_cannot_bind_the_same_explicit_property_twice() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    let registered = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let registered = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let property_id = registered.properties[0].id;
     let memberships_before = count_rows(&server, MEMBERSHIP).await?;
 
@@ -480,7 +482,7 @@ async fn one_request_cannot_bind_the_same_explicit_property_twice() -> anyhow::R
         build_id: [2; 16],
         properties: vec![first, second],
     };
-    let response = client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model }).await?;
+    let response = client.request(server.id().unwrap(), &DEFAULT_CONTEXT, proto::NodeRequestBody::RegisterSchema { model }).await?;
 
     expect_error(response, "declared more than once");
     assert_eq!(count_rows(&server, MEMBERSHIP).await?, memberships_before);
@@ -512,7 +514,7 @@ async fn explicit_id_binding_rejects_non_catalog_entities() -> anyhow::Result<()
             optional: false,
         }]),
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, property_binding).await?, "does not exist");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, property_binding).await?, "does not exist");
 
     let model_binding = proto::NodeRequestBody::RegisterSchema {
         model: proto::RegisterModel {
@@ -523,7 +525,7 @@ async fn explicit_id_binding_rejects_non_catalog_entities() -> anyhow::Result<()
             properties: vec![],
         },
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, model_binding).await?, "does not exist");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, model_binding).await?, "does not exist");
 
     Ok(())
 }
@@ -535,7 +537,7 @@ async fn explicit_id_binding_rejects_type_drift() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
     let canonical = proto::NodeRequestBody::RegisterSchema { model: album_model(vec![property("year", None, "lww", "i32")]) };
-    let property_id = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, canonical).await?).properties[0].id;
+    let property_id = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, canonical).await?).properties[0].id;
 
     let drifted = proto::NodeRequestBody::RegisterSchema {
         model: proto::RegisterModel {
@@ -554,7 +556,7 @@ async fn explicit_id_binding_rejects_type_drift() -> anyhow::Result<()> {
             }],
         },
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, drifted).await?, "must match exactly");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, drifted).await?, "must match exactly");
     let values = catalog_values(&server, PROPERTY, property_id).await?;
     assert_eq!(values.get("value_type"), Some(&Some(Value::String("i32".into()))));
 
@@ -587,7 +589,7 @@ async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()
         },
     };
 
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, request).await?, "does not exist");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, request).await?, "does not exist");
     assert_eq!(server.catalog.model_id_for("dangling").unwrap(), None, "planned model creation must not commit on refusal");
 
     Ok(())
@@ -598,7 +600,7 @@ async fn dangling_explicit_property_refuses_before_writes() -> anyhow::Result<()
 #[tokio::test]
 async fn explicit_model_id_binding() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
-    let first = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let first = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     let album_model = first.id;
 
     let bind = |label: &str, explicit_id, properties| proto::NodeRequestBody::RegisterSchema {
@@ -606,10 +608,13 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
     };
 
     // Binding an id that does not exist never mints.
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(EntityId::random()), vec![])).await?, "does not exist");
+    expect_error(
+        client.request(server.id().unwrap(), &DEFAULT_CONTEXT, bind("album", Some(EntityId::random()), vec![])).await?,
+        "does not exist",
+    );
 
     // A binding by id succeeds whatever label it declares.
-    let by_id = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, bind("albumx", Some(album_model), vec![])).await?);
+    let by_id = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, bind("albumx", Some(album_model), vec![])).await?);
     assert_eq!(by_id.id, album_model);
 
     // A matching binding succeeds, and a property in the same request
@@ -623,7 +628,8 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
         build_id: [0u8; 16],
         optional: false,
     };
-    let bound = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(album_model), vec![genre])).await?);
+    let bound =
+        expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, bind("album", Some(album_model), vec![genre])).await?);
     assert_eq!(bound.properties[0].minted_for, Some(album_model), "the property minted under the bound model id");
     let values = catalog_values(&server, PROPERTY, bound.properties[0].id).await?;
     assert_eq!(values.get("name"), Some(&Some(Value::String("genre".into()))));
@@ -637,7 +643,7 @@ async fn explicit_model_id_binding() -> anyhow::Result<()> {
 async fn ephemeral_node_refuses_execution() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     // server -> client direction: the ephemeral node is asked to execute.
-    let resp = server.request(client.id, &DEFAULT_CONTEXT, album_request()).await?;
+    let resp = server.request(client.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?;
     expect_error(resp, "durable");
     Ok(())
 }
@@ -705,7 +711,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_received_event<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
@@ -722,7 +728,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_received_state<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &proto::Attested<proto::EntityState>,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
@@ -745,7 +751,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_causal_assertion<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
@@ -780,11 +786,11 @@ async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
             properties: vec![],
         },
     };
-    expect_error(client.request(server.id, &DEFAULT_CONTEXT, forbidden).await?, "policy");
+    expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, forbidden).await?, "policy");
     assert!(server.catalog.model_by_label("forbidden").unwrap().is_none(), "a refused plan emits nothing");
 
     // An unrelated collection passes the same gate.
-    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     assert!(server.catalog.model_by_label("album").unwrap().is_some());
 
     Ok(())
@@ -814,10 +820,10 @@ async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
 
-    let models1 = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let models1 = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     assert_eq!(count.load(Ordering::SeqCst), 1, "a plan with creates consults the agent exactly once");
 
-    let models2 = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let models2 = expect_registered(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, album_request()).await?);
     assert_eq!(count.load(Ordering::SeqCst), 1, "a pure no-op re-registration skips the policy verb");
     assert_eq!(models1.id, models2.id, "the skipped no-op still returns the same ids");
     assert_eq!(models1.properties[0].id, models2.properties[0].id, "the skipped no-op still returns the same ids");
@@ -848,7 +854,7 @@ async fn reserved_collection_prefix_refuses_registration() -> anyhow::Result<()>
                 properties: vec![],
             },
         };
-        expect_error(client.request(server.id, &DEFAULT_CONTEXT, as_model).await?, "reserved prefix");
+        expect_error(client.request(server.id().unwrap(), &DEFAULT_CONTEXT, as_model).await?, "reserved prefix");
     }
 
     assert_eq!(count_rows(&server, MODEL).await?, 0, "no model row survives a refused request");

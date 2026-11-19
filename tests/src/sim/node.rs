@@ -32,7 +32,7 @@ pub struct SimNode {
 }
 
 impl SimNode {
-    pub fn id(&self) -> proto::EntityId { self.node.id }
+    pub fn id(&self) -> proto::NodeId { self.node.id().expect("build_nodes waits for each node's keypair") }
 
     /// Register `peer` as a connected peer of this node, installing a
     /// `SimSender` so anything this node sends *to* `peer` is captured for the
@@ -40,16 +40,10 @@ impl SimNode {
     /// would, including initial system adoption from a durable peer.
     pub async fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
+        let challenge = proto::Challenge::random();
+        let presence = peer.node.presence(proto::ConnectionSide::Dialing, &challenge).await.expect("a sim peer is never halted");
         self.node
-            .register_peer(
-                proto::Presence {
-                    node_id: peer.id(),
-                    durable: peer.durable,
-                    system_root: peer.node.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
-                Box::new(sender),
-            )
+            .register_peer(proto::ConnectionSide::Accepting, &challenge, presence, Box::new(sender))
             .await
             .expect("sim peers share this build's protocol version");
     }
@@ -142,6 +136,7 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     // Nodes 1..n: ephemeral.
     for index in 1..n {
         let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+        node.wait_id().await?;
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 

@@ -1,11 +1,11 @@
-use ankurah_core::connector::SendError;
+use ankurah_core::connector::{ConnectionId, SendError};
 use ankurah_proto as proto;
 use axum::extract::ws::WebSocket;
 use futures_util::stream::SplitSink;
 
 pub enum Connection {
     Initial(Option<SplitSink<WebSocket, axum::extract::ws::Message>>),
-    Established(super::sender::WebSocketClientSender),
+    Established(super::sender::WebSocketClientSender, ConnectionId),
 }
 
 impl Connection {
@@ -24,7 +24,7 @@ impl Connection {
                     Err(SendError::from(anyhow::anyhow!("Serialization error")))
                 }
             }
-            Connection::Established(peer_sender) => peer_sender.send_message(message),
+            Connection::Established(peer_sender, _) => peer_sender.send_message(message),
         }
     }
 }

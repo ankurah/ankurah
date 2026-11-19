@@ -9,7 +9,7 @@ use std::{
 };
 
 use ankql::ast::{Resolved, Selection};
-use ankurah_proto::{ComparisonFailure, EntityId, KnownState};
+use ankurah_proto::{ComparisonFailure, KnownState, NodeId};
 use ankurah_signals::{Mut, Read, Subscribe, Wait};
 
 use super::Node;
@@ -123,7 +123,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     /// are never persisted by this handle.
     pub fn replicate_from(
         &self,
-        peer: EntityId,
+        peer: NodeId,
         selection: Selection<Resolved>,
         sessions: impl Into<SessionSet<PA::ContextData>>,
     ) -> Result<Replication, RetrievalError> {
@@ -131,9 +131,6 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
             return Err(MutationError::NotDurable.into());
         }
         self.system.check_not_halted()?;
-        if peer == self.id {
-            return Err(RetrievalError::Other("replication source must be another node".into()));
-        }
         let sessions = sessions.into();
         self.sessions.attach(&sessions);
         let progress = Arc::new(Progress {
@@ -176,17 +173,25 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 let attempt = async {
                     let node = weak.upgrade().ok_or(NodeDropped)?;
                     node.check_ready()?;
-                    let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
-                    if !connection.durable {
-                        return Err(RetrievalError::Other("replication source must be durable".into()));
-                    }
-                    drop(connection);
+                    let connections = node.connections_of(peer);
+                    let connection_id = connections
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|id| node.peer_connections.get(id).is_some_and(|connection| connection.durable))
+                        .ok_or_else(|| {
+                            if connections.is_empty() {
+                                RetrievalError::from(RequestError::PeerNotConnected)
+                            } else {
+                                RetrievalError::Other("replication source must be durable".into())
+                            }
+                        })?;
                     let credentials = sessions.current();
                     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
                     let mut scoped = selection.clone();
                     scoped.predicate = policy.filter_predicate(scoped.predicate)?;
                     progress.publish(revision, ReplicationState::Comparing);
-                    node.reconcile_selection(peer, scoped, &credentials, None).await
+                    node.reconcile_selection(connection_id, scoped, &credentials, None).await
                 };
                 let result = tokio::select! {
                     biased;

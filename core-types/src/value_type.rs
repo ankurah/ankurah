@@ -26,6 +26,8 @@ pub enum ValueType {
     Binary,
     /// A structured JSON value.
     Json,
+    /// A node id.
+    NodeId,
 }
 
 impl ValueType {
@@ -42,6 +44,7 @@ impl ValueType {
             "object" => Self::Object,
             "binary" => Self::Binary,
             "json" => Self::Json,
+            "nodeid" => Self::NodeId,
             _ => return None,
         })
     }
@@ -57,6 +60,8 @@ impl ValueType {
             (self, target),
             (String, EntityId)
                 | (EntityId, String)
+                | (String, NodeId)
+                | (NodeId, String)
                 | (I16, I32)
                 | (I16, I64)
                 | (I16, F64)
@@ -117,9 +122,11 @@ mod tests {
         assert!(ValueType::mutually_castable(I32, I64));
         assert!(ValueType::mutually_castable(Bool, String));
         assert!(ValueType::mutually_castable(String, EntityId));
+        assert!(ValueType::mutually_castable(String, NodeId));
         assert!(!ValueType::mutually_castable(String, Binary));
         assert!(!ValueType::mutually_castable(EntityId, I64));
         assert!(!ValueType::mutually_castable(Object, Json));
         assert!(!ValueType::mutually_castable(EntityId, Json));
+        assert!(!ValueType::mutually_castable(EntityId, NodeId));
     }
 }

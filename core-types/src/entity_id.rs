@@ -35,14 +35,11 @@ impl EntityId {
     /// Draw 32 random bytes as an identity.
     ///
     /// This value names no genesis event, so no entity can ever carry it. It
-    /// exists for the two identities that are not entities: a node's own id
-    /// and test ids that deliberately name nothing. Creating an entity derives
-    /// its id instead.
+    /// exists for test ids that deliberately name nothing. Creating an entity
+    /// derives its id instead.
     ///
-    /// TODO make this test-only. It cannot be `#[cfg(test)]` yet because a
-    /// node draws its own id from here in production. That use migrates when
-    /// the deferred node-identity work gives nodes their own key-derived type,
-    /// and this becomes a test affordance and nothing else.
+    /// TODO make this test-only. It cannot be `#[cfg(test)]`, because tests in
+    /// other crates call it.
     pub fn random() -> Self {
         let mut bytes = [0u8; Self::BYTE_LEN];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);

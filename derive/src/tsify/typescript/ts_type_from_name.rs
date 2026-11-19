@@ -132,6 +132,9 @@ impl TsType {
                 }
             }
 
+            // EntityId → string, NodeId → string: serde_wasm_bindgen reads and writes an id as its base64 text
+            "EntityId" | "NodeId" if args.is_empty() => Self::STRING,
+
             _ => {
                 let type_params = args.into_iter().map(|ty| Self::from_syn_type(config, ty)).collect();
                 Self::Ref { name: config.format_name(ident.to_string()), type_params }

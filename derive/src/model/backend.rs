@@ -410,7 +410,7 @@ impl ActiveTypeDesc {
 
     /// UniFFI methods - generates methods with PropertyError for error handling.
     /// PropertyError has #[uniffi(flat_error)] so it serializes via ToString.
-    /// Entity ids (EntityId or Ref<T>, optional or not) cross as the objects `IdBinding` describes,
+    /// Ids (EntityId, NodeId or Ref<T>, optional or not) cross as the objects `IdBinding` describes,
     /// as in the Input record.
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
     fn uniffi_methods(&self, context: &str) -> Vec<TokenStream> {
@@ -421,7 +421,7 @@ impl ActiveTypeDesc {
         self.value_config.methods.iter().filter(|method| method.uniffi).map(|method| {
             let method_name = format_ident!("{}", method.name);
 
-            // Special case: set with an entity id, optional or not, which arrives as its object
+            // Special case: set with an id, optional or not, which arrives as its object
             if method.name == "set" {
                 let id_arg = method.args.iter().find_map(|(_, arg_type)| {
                     let arg_type: Type = syn::parse_str(&substitute_fn(self, arg_type)).expect("Failed to parse arg type");

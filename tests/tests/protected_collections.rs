@@ -29,7 +29,7 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
         );
         let resp = client
             .request(
-                server.id,
+                server.id().unwrap(),
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::CommitTransaction {
                     id: proto::TransactionId::new(),

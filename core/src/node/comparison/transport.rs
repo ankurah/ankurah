@@ -12,6 +12,7 @@ use web_time::Instant;
 
 use super::{ComparisonBudget, RepairReceipt};
 use crate::{
+    connector::ConnectionId,
     error::{RequestError, RetrievalError},
     node::{Node, PeerState},
     policy::{ComparisonLimits, PolicyAgent},
@@ -56,7 +57,7 @@ struct Delivery {
 
 struct Active<CD: ContextData> {
     connection: Weak<PeerState<CD>>,
-    from: EntityId,
+    from: proto::NodeId,
     id: ComparisonId,
 }
 
@@ -83,19 +84,19 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     /// versions. One budget bounds all attempts, including initialization.
     pub(crate) async fn reconcile_query(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         selection: Selection<Resolved>,
         credentials: &Vec<PA::ContextData>,
         subscription: Option<(proto::QueryId, u32)>,
     ) -> Result<(), RetrievalError> {
-        self.reconcile_selection(peer, selection, credentials, subscription).await.map(|_| ())
+        self.reconcile_selection(connection_id, selection, credentials, subscription).await.map(|_| ())
     }
 
     /// Keep the managed tree alive with the completed source coverage. Durable
     /// interests retain this owner between sweeps without retaining entity views.
     pub(in crate::node) async fn reconcile_selection(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         selection: Selection<Resolved>,
         credentials: &Vec<PA::ContextData>,
         subscription: Option<(proto::QueryId, u32)>,
@@ -106,9 +107,9 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
             let result = async {
                 let id = ComparisonId::new();
                 let active = {
-                    let connection = self.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
+                    let connection = self.peer_connections.get(&connection_id).ok_or(RequestError::PeerNotConnected)?;
                     connection.comparisons.admit(id, credentials.clone(), limits)?;
-                    Active { connection: Arc::downgrade(&connection), from: self.id, id }
+                    Active { connection: Arc::downgrade(&connection), from: self.keyed_id(), id }
                 };
                 let (owner, local, discovery) =
                     budget.wait(self.capture_comparison(selection.clone(), credentials)).await.map_err(super::serve::restart)?;
@@ -123,7 +124,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     )
                     .await?;
                 let key_spec = super::wire::key_spec_to_wire(local.key_spec());
-                let current = self.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
+                let current = self.peer_connections.get(&connection_id).ok_or(RequestError::PeerNotConnected)?;
                 if !Weak::ptr_eq(&active.connection, &Arc::downgrade(&current)) {
                     return Err(failure(ComparisonFailure::Expired));
                 }
@@ -139,7 +140,8 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     },
                     None => proto::NodeRequestBody::Fetch { selection: selection.clone(), comparison: id, key_spec, known_state },
                 };
-                let response = budget.wait(async { self.request(peer, credentials, request).await.map_err(RetrievalError::from) }).await?;
+                let response =
+                    budget.wait(async { self.request_on(connection_id, credentials, request).await.map_err(RetrievalError::from) }).await?;
                 let target = match (subscription, response) {
                     (None, proto::NodeResponseBody::Fetch(target)) => target,
                     (Some((expected, _)), proto::NodeResponseBody::QuerySubscribed { query_id, target }) if query_id == expected => target,
@@ -151,7 +153,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                     return Err(failure(ComparisonFailure::InvalidRequest("unexpected comparison identity".into())));
                 }
                 let coverage = target.known_state.clone();
-                self.compare_query(peer, &selection, &local, target, credentials, &mut budget).await?;
+                self.compare_query(connection_id, &selection, &local, target, credentials, &mut budget).await?;
                 Ok((coverage, owner))
             }
             .await
@@ -179,7 +181,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
 
     pub(in crate::node) async fn request_comparison_repair(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         comparison: ComparisonId,
         selection: &Selection<Resolved>,
         members: Vec<proto::RepairMember>,
@@ -188,7 +190,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     ) -> Result<RepairReceipt, RetrievalError> {
         let incoming = self
             .peer_connections
-            .get(&peer)
+            .get(&connection_id)
             .and_then(|connection| connection.comparisons.get(&comparison))
             .ok_or_else(|| failure(ComparisonFailure::Expired))?;
         let delivery = proto::UpdateId::new();
@@ -200,8 +202,8 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
         incoming.deliveries.insert(delivery.clone(), Delivery { entities: entities.clone(), done });
         let _pending = PendingDelivery { incoming, id: delivery.clone() };
         let response = self
-            .request(
-                peer,
+            .request_on(
+                connection_id,
                 credentials,
                 proto::NodeRequestBody::Compare {
                     comparison,
@@ -230,7 +232,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
 
     pub(in crate::node) async fn handle_comparison(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         comparison: ComparisonId,
         selection: &Selection<Resolved>,
         request: proto::ComparisonRequest,
@@ -238,17 +240,18 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     ) -> Result<proto::ComparisonReply, RetrievalError> {
         match request {
             proto::ComparisonRequest::Pages { spans } => {
-                Ok(proto::ComparisonReply::Pages(self.comparison_pages(peer, comparison, selection, spans, credentials).await?))
+                Ok(proto::ComparisonReply::Pages(self.comparison_pages(connection_id, comparison, selection, spans, credentials).await?))
             }
             proto::ComparisonRequest::Repair { delivery, members, events_only } => {
-                let prepared = self.prepare_comparison_repair(peer, comparison, selection, members, events_only, credentials).await?;
+                let prepared =
+                    self.prepare_comparison_repair(connection_id, comparison, selection, members, events_only, credentials).await?;
                 let connection = prepared.connection()?;
                 prepared.revalidate(self, credentials).await?;
                 connection
                     .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
                         id: delivery.clone(),
-                        from: self.id,
-                        to: peer,
+                        from: self.keyed_id(),
+                        to: connection.node_id,
                         body: proto::NodeUpdateBody::Comparison { comparison, deltas: prepared.deltas },
                     }))
                     .map_err(RequestError::from)?;
@@ -259,14 +262,14 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
 
     pub(in crate::node) async fn receive_comparison_repair(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         comparison: ComparisonId,
         delivery: proto::UpdateId,
         deltas: Vec<proto::EntityDelta>,
     ) -> Result<(), RetrievalError> {
         let incoming = self
             .peer_connections
-            .get(&peer)
+            .get(&connection_id)
             .and_then(|connection| connection.comparisons.get(&comparison))
             .ok_or_else(|| failure(ComparisonFailure::Expired))?;
         let requested = incoming
@@ -301,7 +304,14 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
             }
             let event_getter = crate::retrieval::CachedEventGetter::new(self, &incoming.credentials);
             let state_getter = crate::retrieval::LocalStateGetter::new(self.storage.clone());
-            super::super::applier::NodeApplier::apply_deltas(self, &peer, deltas, &event_getter, &state_getter).await?;
+            super::super::applier::NodeApplier::apply_deltas(
+                self,
+                &self.peer_node_id(connection_id)?,
+                deltas,
+                &event_getter,
+                &state_getter,
+            )
+            .await?;
             Ok((bytes, events))
         };
         let result = tokio::select! {

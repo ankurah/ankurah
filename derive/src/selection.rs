@@ -517,6 +517,14 @@ fn generate_literal_code_with_replacements(
                 ))
             }
         }
+        Value::NodeId(id) => {
+            let bytes = id.to_bytes();
+            quote! {
+                ::ankql::ast::Expr::Literal(::ankql::ast::Value::NodeId(
+                    ::ankql::ast::NodeId::from_bytes([#(#bytes),*])
+                ))
+            }
+        }
         Value::Object(_items) => {
             todo!("Object literals");
             // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Value::Object(#items)) }

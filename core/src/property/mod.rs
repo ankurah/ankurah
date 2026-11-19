@@ -2,7 +2,7 @@ pub mod backend;
 pub mod traits;
 pub mod value;
 
-use ankurah_proto::EntityId;
+use ankurah_proto::{EntityId, NodeId};
 
 pub use traits::{ActiveType, FromLocalTrxEntity, InitializeWith, PropertyError};
 pub use value::{Json, Ref, YrsStringMut};
@@ -69,6 +69,7 @@ impl_property!(i64 => I64, "i64");
 impl_property!(f64 => F64, "f64");
 impl_property!(bool => Bool, "bool");
 impl_property!(EntityId => EntityId, "entityid");
+impl_property!(NodeId => NodeId, "nodeid");
 impl_property!(Vec<u8> => Binary, "binary");
 
 impl<'a> Property for std::borrow::Cow<'a, str> {

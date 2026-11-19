@@ -83,7 +83,7 @@ pub struct Scheduler {
     faults: FaultConfig,
     /// Node id per logical index, used to resolve the recipient index of
     /// captured (node-emitted) messages whose routing carries only the id.
-    node_ids: Vec<proto::EntityId>,
+    node_ids: Vec<proto::NodeId>,
     /// Cap on delivery rounds so a harness bug (e.g. an unhealed partition
     /// starving a load-bearing message) surfaces as a loud failure rather than
     /// an infinite loop.
@@ -98,7 +98,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(captured: Captured, faults: FaultConfig, node_ids: Vec<proto::EntityId>) -> Self {
+    pub fn new(captured: Captured, faults: FaultConfig, node_ids: Vec<proto::NodeId>) -> Self {
         Self {
             inflight: Vec::new(),
             partitions: std::collections::BTreeSet::new(),
@@ -116,7 +116,7 @@ impl Scheduler {
     fn node_count(&self) -> usize { self.node_ids.len() }
 
     /// Logical index of the node whose id is `id`, if any.
-    fn index_of(&self, id: &proto::EntityId) -> Option<usize> { self.node_ids.iter().position(|nid| nid == id) }
+    fn index_of(&self, id: &proto::NodeId) -> Option<usize> { self.node_ids.iter().position(|nid| nid == id) }
 
     pub fn faults(&self) -> FaultConfig { self.faults }
 
@@ -236,7 +236,8 @@ impl Scheduler {
     /// the message's acceptance target (if any) is now satisfied.
     async fn deliver(&mut self, item: &InFlight, nodes: &[SimNode], rng: &mut SimRng, trace: &mut Trace, duplicate: bool) -> bool {
         trace.record(TraceEvent::Deliver { src: item.src, dst: item.dst, digest: item.digest.clone(), duplicate });
-        let handling = nodes[item.dst].node.handle_message(clone_message(&item.message));
+        let Some(&connection) = nodes[item.dst].node.connections_of(nodes[item.src].id()).first() else { return false };
+        let handling = nodes[item.dst].node.handle_message(connection, clone_message(&item.message));
         tokio::pin!(handling);
         let mut rounds = 0;
         loop {
@@ -431,7 +432,7 @@ impl Scheduler {
 
 /// The recipient node id carried by a `NodeMessage`, if it targets a specific
 /// node. Used to route node-emitted (captured) traffic to a logical index.
-fn recipient_id(message: &proto::NodeMessage) -> Option<proto::EntityId> {
+fn recipient_id(message: &proto::NodeMessage) -> Option<proto::NodeId> {
     match message {
         proto::NodeMessage::Request { request, .. } => Some(request.to),
         proto::NodeMessage::Response(response) => Some(response.to),

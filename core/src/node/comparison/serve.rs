@@ -12,7 +12,7 @@ use std::{
 use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_core_types::{key_spec::KeySpec, PropertyId};
 use ankurah_digest_tree::{Page, Span};
-use ankurah_proto::{ComparisonFailure, ComparisonId, ComparisonPage, ComparisonTarget, EntityId, KnownState};
+use ankurah_proto::{ComparisonFailure, ComparisonId, ComparisonPage, ComparisonTarget, KnownState};
 use serde::Serialize;
 use web_time::Instant;
 
@@ -21,13 +21,14 @@ use super::super::{
     Node, PeerState,
 };
 use crate::{
+    connector::ConnectionId,
     error::{MutationError, RetrievalError},
     policy::{ComparisonLimits, ContextPolicy, PolicyAgent},
     session::ContextData,
     storage::StorageEngine,
 };
 
-type Key = (EntityId, ComparisonId);
+type Key = (ConnectionId, ComparisonId);
 type Registry<SE, CD> = Mutex<HashMap<Key, Arc<Slot<SE, CD>>>>;
 
 pub(in crate::node) struct Captures<SE, CD: ContextData> {
@@ -135,7 +136,7 @@ impl<SE: StorageEngine + 'static, CD: ContextData> Captures<SE, CD> {
             if limits.lifetime.is_zero()
                 || limits.max_steps == 0
                 || limits.max_bytes == 0
-                || entries.keys().filter(|(peer, _)| *peer == key.0).count() >= limits.max_captures
+                || entries.keys().filter(|(connection_id, _)| *connection_id == key.0).count() >= limits.max_captures
             {
                 return Err(failure(ComparisonFailure::LimitExceeded));
             }
@@ -156,17 +157,17 @@ impl<SE: StorageEngine + 'static, CD: ContextData> Captures<SE, CD> {
         Ok(Reservation { registry, key, slot, installed: false })
     }
 
-    pub(in crate::node) fn release(&self, peer: EntityId, id: ComparisonId) {
-        if let Some(slot) = self.inner.lock().unwrap().remove(&(peer, id)) {
+    pub(in crate::node) fn release(&self, connection_id: ConnectionId, id: ComparisonId) {
+        if let Some(slot) = self.inner.lock().unwrap().remove(&(connection_id, id)) {
             slot.active.store(false, Ordering::Release);
             slot.cancel_expiry.notify_waiters();
             slot.cancel_expiry.notify_one();
         }
     }
 
-    pub(in crate::node) fn release_peer(&self, peer: EntityId) {
+    pub(in crate::node) fn release_peer(&self, connection_id: ConnectionId) {
         self.inner.lock().unwrap().retain(|(owner, _), slot| {
-            if *owner != peer {
+            if *owner != connection_id {
                 return true;
             }
             slot.active.store(false, Ordering::Release);
@@ -176,11 +177,16 @@ impl<SE: StorageEngine + 'static, CD: ContextData> Captures<SE, CD> {
         });
     }
 
-    fn get(&self, peer: EntityId, id: ComparisonId, limits: ComparisonLimits) -> Result<CheckedCapture<SE, CD>, RetrievalError> {
-        let slot = self.inner.lock().unwrap().get(&(peer, id)).cloned().ok_or_else(|| failure(ComparisonFailure::Expired))?;
+    fn get(
+        &self,
+        connection_id: ConnectionId,
+        id: ComparisonId,
+        limits: ComparisonLimits,
+    ) -> Result<CheckedCapture<SE, CD>, RetrievalError> {
+        let slot = self.inner.lock().unwrap().get(&(connection_id, id)).cloned().ok_or_else(|| failure(ComparisonFailure::Expired))?;
         let checked = CheckedCapture {
             registry: Arc::downgrade(&self.inner),
-            key: (peer, id),
+            key: (connection_id, id),
             limits: Mutex::new(restrict(slot.limits, limits)),
             slot,
         };
@@ -261,7 +267,7 @@ impl<SE, CD: ContextData> CheckedCapture<SE, CD> {
 impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     pub(in crate::node) async fn begin_comparison(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         id: ComparisonId,
         selection: Selection<Resolved>,
         key_spec: KeySpec<PropertyId>,
@@ -270,16 +276,16 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     ) -> Result<ComparisonTarget, RetrievalError> {
         let mut scoped = selection.clone();
         scoped.predicate = ContextPolicy::from_credentials(&self.policy_agent, credentials).filter_predicate(scoped.predicate)?;
-        self.begin_scoped_comparison(peer, id, selection, scoped, key_spec, known_state, credentials).await
+        self.begin_scoped_comparison(connection_id, id, selection, scoped, key_spec, known_state, credentials).await
     }
 
-    pub(crate) fn release_comparison(&self, peer: EntityId, id: ComparisonId) { self.captures.release(peer, id); }
+    pub(crate) fn release_comparison(&self, connection_id: ConnectionId, id: ComparisonId) { self.captures.release(connection_id, id); }
 
     /// Bind the request spelling while capturing the same scoped query that
     /// the subscription installed in Reactor.
     pub(crate) async fn begin_scoped_comparison(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         id: ComparisonId,
         selection: Selection<Resolved>,
         scoped: Selection<Resolved>,
@@ -289,11 +295,11 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
     ) -> Result<ComparisonTarget, RetrievalError> {
         self.system.check_not_halted()?;
         let limits = self.policy_agent.comparison_limits(credentials);
-        let connection = self.peer_connections.get(&peer).ok_or_else(|| failure(ComparisonFailure::Expired))?;
-        let mut reservation = self.captures.reserve((peer, id), &connection, selection.clone(), credentials.clone(), limits)?;
+        let connection = self.peer_connections.get(&connection_id).ok_or_else(|| failure(ComparisonFailure::Expired))?;
+        let mut reservation = self.captures.reserve((connection_id, id), &connection, selection.clone(), credentials.clone(), limits)?;
         let checked = CheckedCapture {
             registry: reservation.registry.clone(),
-            key: (peer, id),
+            key: (connection_id, id),
             slot: reservation.slot.clone(),
             limits: Mutex::new(limits),
         };
@@ -337,13 +343,13 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
 
     pub(in crate::node) async fn checked_comparison(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         id: ComparisonId,
         selection: &Selection<Resolved>,
         credentials: &Vec<PA::ContextData>,
         work: usize,
     ) -> Result<CheckedCapture<SE, PA::ContextData>, RetrievalError> {
-        let checked = self.captures.get(peer, id, self.policy_agent.comparison_limits(credentials))?;
+        let checked = self.captures.get(connection_id, id, self.policy_agent.comparison_limits(credentials))?;
         if checked.slot.selection != *selection || checked.slot.credentials != *credentials {
             remove(&checked.registry, checked.key, &checked.slot);
             return Err(failure(ComparisonFailure::AuthorizationChanged));
@@ -382,7 +388,7 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
                 *current = restrict(*current, limits);
             }
             checked.check_active()?;
-            let captures = self.captures.inner.lock().unwrap().keys().filter(|(peer, _)| *peer == checked.key.0).count();
+            let captures = self.captures.inner.lock().unwrap().keys().filter(|(connection_id, _)| *connection_id == checked.key.0).count();
             if checked.slot.steps.load(Ordering::Acquire) > limits.max_steps || captures > limits.max_captures {
                 return Err(failure(ComparisonFailure::LimitExceeded));
             }
@@ -425,14 +431,14 @@ impl<SE: StorageEngine + 'static, PA: PolicyAgent> Node<SE, PA> {
 
     pub(in crate::node) async fn comparison_pages(
         &self,
-        peer: EntityId,
+        connection_id: ConnectionId,
         id: ComparisonId,
         selection: &Selection<Resolved>,
         spans: Vec<Span>,
         credentials: &Vec<PA::ContextData>,
     ) -> Result<Vec<ComparisonPage>, RetrievalError> {
         validate_spans(&spans, self.policy_agent.comparison_limits(credentials))?;
-        let checked = self.checked_comparison(peer, id, selection, credentials, spans.len()).await?;
+        let checked = self.checked_comparison(connection_id, id, selection, credentials, spans.len()).await?;
         let requested = spans.len();
         let work = async {
             validate_spans(&spans, checked.limits())?;

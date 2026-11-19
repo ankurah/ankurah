@@ -4,39 +4,45 @@ use crate::node::handler::commit_transaction;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
 use crate::test_utils::TestStorage;
 use ankurah_signals::Subscribe;
+use proto::ConnectionSide::{Accepting, Dialing};
 
 mod commit;
+mod keypair;
 mod trees;
 
 #[derive(Clone)]
-struct ClosedSender(proto::EntityId);
+struct ClosedSender;
 
 impl PeerSender for ClosedSender {
     fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Err(SendError::ConnectionClosed) }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 #[derive(Clone)]
-struct RecordingSender(proto::EntityId, std::sync::mpsc::Sender<proto::NodeMessage>);
+struct RecordingSender(std::sync::mpsc::Sender<proto::NodeMessage>);
 
 impl PeerSender for RecordingSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-        self.1.send(message).map_err(|_| SendError::ConnectionClosed)
+        self.0.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-fn presence(id: proto::EntityId) -> proto::Presence {
-    proto::Presence { node_id: id, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION }
+type TestNode = Node<TestStorage, PermissiveAgent>;
+
+/// A peer connection for tests that use `node` as the accepting side.
+async fn connect(node: &TestNode, peer: &TestNode, sender: impl PeerSender + 'static) -> ConnectionId {
+    let challenge = proto::Challenge::random();
+    node.register_peer(Accepting, &challenge, peer.presence(Dialing, &challenge).await.unwrap(), Box::new(sender)).await.unwrap()
 }
 
 #[tokio::test]
 async fn presence_does_not_require_an_adopted_system_but_rejects_a_halted_node() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence()).await.unwrap().unwrap();
-    assert_eq!(presence.node_id, node.id);
+    let challenge = proto::Challenge::random();
+    let presence =
+        tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(Dialing, &challenge)).await.unwrap().unwrap().presence;
+    assert_eq!(Some(presence.node_id()), node.id());
     assert!(!presence.durable);
     assert!(presence.system_root.is_none());
     assert_eq!(presence.protocol_version, proto::PROTOCOL_VERSION);
@@ -45,7 +51,33 @@ async fn presence_does_not_require_an_adopted_system_but_rejects_a_halted_node()
 
     let halt_reason = node.system.halt(NodeHaltReason::SystemLoad("test failure".into()));
     assert_eq!(node.state().value(), NodeState::Halted(halt_reason.clone()));
-    assert_eq!(node.presence().await.unwrap_err(), halt_reason);
+    assert_eq!(node.presence(Dialing, &challenge).await.unwrap_err(), halt_reason);
+}
+
+#[tokio::test]
+async fn a_node_takes_its_id_from_the_keypair_its_application_supplies() {
+    let storage = Arc::new(TestStorage::default());
+    let key = NodeKey::generate();
+    assert_eq!(Node::new_with_key(storage.clone(), PermissiveAgent::new(), key.clone()).id(), Some(key.public_key().node_id()));
+    assert_eq!(Node::new_durable_with_key(storage, PermissiveAgent::new(), key.clone()).id(), Some(key.public_key().node_id()));
+}
+
+#[tokio::test]
+async fn a_peer_that_does_not_prove_its_key_on_this_connection_is_refused() {
+    let [node, peer, other] = [(); 3].map(|()| Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new()));
+    let challenge = proto::Challenge::random();
+
+    let signed_for_another_connection = peer.presence(Dialing, &proto::Challenge::random()).await.unwrap();
+    let mut claiming_the_peers_key = other.presence(Dialing, &challenge).await.unwrap();
+    claiming_the_peers_key.presence.key = signed_for_another_connection.presence.key;
+    let the_nodes_own_presence_sent_back = node.presence(Accepting, &challenge).await.unwrap();
+    for unproven in [signed_for_another_connection, claiming_the_peers_key, the_nodes_own_presence_sent_back] {
+        assert_eq!(
+            node.register_peer(Accepting, &challenge, unproven, Box::new(ClosedSender)).await,
+            Err(PeerConnectionError::UnprovenKey)
+        );
+    }
+    assert!(node.peer_connections.is_empty());
 }
 
 #[tokio::test]
@@ -129,12 +161,13 @@ async fn presence_waits_for_the_persisted_system_root() {
     storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::System), (entered, release_rx));
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
-    let presence = node.presence();
+    let challenge = proto::Challenge::random();
+    let presence = node.presence(Dialing, &challenge);
     tokio::pin!(presence);
     assert!(futures::poll!(&mut presence).is_pending());
     release.send(()).unwrap();
-    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), presence).await.unwrap().unwrap();
-    assert_eq!(presence.node_id, node.id);
+    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), presence).await.unwrap().unwrap().presence;
+    assert_eq!(Some(presence.node_id()), node.id());
     assert!(presence.durable);
     assert_eq!(presence.system_root, Some(root));
 }
@@ -142,15 +175,115 @@ async fn presence_waits_for_the_persisted_system_root() {
 #[tokio::test]
 async fn disconnect_releases_pending_requests() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    let peer = proto::EntityId::random();
+    let peer = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let (sent, _messages) = std::sync::mpsc::channel();
-    node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await.unwrap();
-    let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
+    let connection = connect(&node, &peer, RecordingSender(sent)).await;
+    let request = node.request_on(connection, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
     tokio::pin!(request);
     assert!(futures::poll!(&mut request).is_pending());
 
-    node.deregister_peer(peer);
+    node.deregister_peer(connection);
     assert!(matches!(futures::poll!(&mut request), std::task::Poll::Ready(Err(RequestError::InternalChannelClosed))));
+}
+
+#[tokio::test]
+async fn disconnect_releases_pending_requests_while_a_message_from_that_peer_is_being_handled() {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    node.system.create().await.unwrap();
+    node.wait_ready().await.unwrap();
+    let peer = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let (sent, _messages) = std::sync::mpsc::channel();
+    let connection = connect(&node, &peer, RecordingSender(sent)).await;
+
+    let model = ModelId::System(proto::SystemModel::Model);
+    let (entered, entered_rx) = oneshot::channel();
+    let (_release, release_rx) = oneshot::channel();
+    *storage.hold_state_snapshot.lock().unwrap() = Some((entered, release_rx));
+    let selection = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::MemberOf(model), order_by: None, limit: None };
+    let body = proto::NodeRequestBody::Fetch {
+        selection,
+        comparison: proto::ComparisonId::new(),
+        key_spec: ankurah_core_types::key_spec::KeySpec::new(vec![]),
+        known_state: proto::KnownState::empty(),
+    };
+    let fetch = proto::NodeRequest { id: proto::RequestId::new(), from: peer.id().unwrap(), to: node.id().unwrap(), body };
+    let handling = node.handle_message(connection, proto::NodeMessage::Request { auth: vec![], request: fetch });
+    tokio::pin!(handling);
+    assert!(futures::poll!(&mut handling).is_pending());
+    entered_rx.await.unwrap();
+
+    let request = node.request_on(connection, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    node.deregister_peer(connection);
+    assert!(matches!(futures::poll!(&mut request), std::task::Poll::Ready(Err(RequestError::InternalChannelClosed))));
+}
+
+#[tokio::test]
+async fn two_connections_of_one_node_id_each_keep_their_own_requests() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let key = NodeKey::generate();
+    let [first_peer, second_peer] =
+        [(); 2].map(|()| Node::new_with_key(Arc::new(TestStorage::default()), PermissiveAgent::new(), key.clone()));
+    let (sent_first, first_messages) = std::sync::mpsc::channel();
+    let (sent_second, second_messages) = std::sync::mpsc::channel();
+    let first = connect(&node, &first_peer, RecordingSender(sent_first)).await;
+    let second = connect(&node, &second_peer, RecordingSender(sent_second)).await;
+
+    let request = node.request_on(second, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    assert!(first_messages.try_recv().is_err());
+    let Ok(proto::NodeMessage::Request { request: sent, .. }) = second_messages.try_recv() else {
+        panic!("the request goes out on its own connection")
+    };
+    let response =
+        |body| proto::NodeMessage::Response(proto::NodeResponse { request_id: sent.id.clone(), from: sent.to, to: sent.from, body });
+
+    // A response on the first connection cannot complete the request on the second connection.
+    node.handle_message(first, response(proto::NodeResponseBody::Get(vec![]))).await.unwrap();
+    node.deregister_peer(first);
+    assert!(futures::poll!(&mut request).is_pending());
+
+    node.handle_message(second, response(proto::NodeResponseBody::Get(vec![]))).await.unwrap();
+    assert!(matches!(request.await, Ok(proto::NodeResponseBody::Get(_))));
+}
+
+#[tokio::test]
+async fn a_request_addressed_by_node_id_goes_out_on_the_newest_connection_of_that_id() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let key = NodeKey::generate();
+    let peers = [(); 2].map(|()| Node::new_with_key(Arc::new(TestStorage::default()), PermissiveAgent::new(), key.clone()));
+    let (sent_older, older_messages) = std::sync::mpsc::channel();
+    let (sent_newer, newer_messages) = std::sync::mpsc::channel();
+    let older = connect(&node, &peers[0], RecordingSender(sent_older)).await;
+    let newer = connect(&node, &peers[1], RecordingSender(sent_newer)).await;
+    assert_eq!(node.connections_of(key.public_key().node_id()), [older, newer]);
+
+    let request = node.request(key.public_key().node_id(), &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    assert!(older_messages.try_recv().is_err());
+    assert!(matches!(newer_messages.try_recv(), Ok(proto::NodeMessage::Request { .. })));
+}
+
+#[tokio::test]
+async fn a_message_that_names_another_sender_than_its_connection_is_refused() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let [peer, other] = [(); 2].map(|()| Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new()));
+    let connection = connect(&node, &peer, ClosedSender).await;
+    connect(&node, &other, ClosedSender).await;
+
+    let unsubscribe = |from| proto::NodeMessage::UnsubscribeQuery { from, query_id: proto::QueryId::new() };
+    assert!(node.handle_message(connection, unsubscribe(other.id().unwrap())).await.is_err());
+    // The peer's own unsubscribe reaches its handler, which holds no such query.
+    assert!(node
+        .handle_message(connection, unsubscribe(peer.id().unwrap()))
+        .await
+        .unwrap_err()
+        .downcast_ref::<crate::error::SubscriptionError>()
+        .is_some());
 }
 
 #[tokio::test]
@@ -162,8 +295,8 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let transaction = node.privileged_context().begin();
     let id = transaction.create(&crate::schema::catalog::SysModelRow { label: "test".into(), name: "Test".into() }).await.unwrap().id();
     transaction.commit().await.unwrap();
-    let peer = proto::EntityId::random();
-    node.register_peer(presence(peer), Box::new(ClosedSender(peer))).await.unwrap();
+    let peer = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let connection = connect(&node, &peer, ClosedSender).await;
 
     let model = ModelId::System(proto::SystemModel::Model);
     let (entered, entered_rx) = oneshot::channel();
@@ -180,10 +313,13 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     assert_eq!(read.await.unwrap().iter().map(Entity::id).collect::<Vec<_>>(), vec![id]);
     assert!(matches!(node.fetch_entities_from_local(&selection).await, Err(RetrievalError::NodeHalted(error)) if error == reason));
     assert!(matches!(
-        node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id] }).await,
+        node.request_on(connection, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id] }).await,
         Err(RequestError::NodeHalted(error)) if error == reason
     ));
-    assert!(node.handle_message(proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() }).await.is_err());
+    assert!(node
+        .handle_message(connection, proto::NodeMessage::UnsubscribeQuery { from: peer.id().unwrap(), query_id: proto::QueryId::new() })
+        .await
+        .is_err());
 }
 
 #[tokio::test]

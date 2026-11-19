@@ -22,10 +22,11 @@ where PA: PolicyAgent
         }
     }
 
-    pub fn node_id(&self) -> proto::EntityId {
+    /// The node's id, or `None` while the node is unkeyed.
+    pub fn node_id(&self) -> Option<proto::NodeId> {
         match self {
             Self::Weak(node) => node.node_id(),
-            Self::Strong(node) => node.id,
+            Self::Strong(node) => node.id(),
         }
     }
 }

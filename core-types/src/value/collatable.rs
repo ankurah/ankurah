@@ -14,6 +14,7 @@ impl Collatable for Value {
             Value::F64(f) => f.to_bytes(),
             Value::Bool(b) => vec![*b as u8],
             Value::EntityId(entity_id) => entity_id.to_bytes().to_vec(),
+            Value::NodeId(node_id) => node_id.to_bytes().to_vec(),
             // For binary/object, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
             Value::Object(bytes) | Value::Binary(bytes) => bytes.clone(),
             // For JSON, serialize to bytes
@@ -51,8 +52,8 @@ impl Collatable for Value {
                     Some(vec![1])
                 }
             }
-            Value::EntityId(entity_id) => {
-                let mut bytes = entity_id.to_bytes();
+            Value::EntityId(_) | Value::NodeId(_) => {
+                let mut bytes = self.to_bytes();
                 // Increment the byte array (big-endian arithmetic)
                 for i in (0..bytes.len()).rev() {
                     if bytes[i] == 0xFF {
@@ -101,8 +102,8 @@ impl Collatable for Value {
                     None
                 }
             }
-            Value::EntityId(entity_id) => {
-                let mut bytes = entity_id.to_bytes();
+            Value::EntityId(_) | Value::NodeId(_) => {
+                let mut bytes = self.to_bytes();
                 if bytes == [0u8; EntityId::BYTE_LEN] {
                     None // Already at minimum
                 } else {
@@ -131,6 +132,7 @@ impl Collatable for Value {
             Value::F64(f) => *f == f64::NEG_INFINITY,
             Value::Bool(b) => !b,
             Value::EntityId(entity_id) => entity_id.to_bytes() == [0u8; EntityId::BYTE_LEN],
+            Value::NodeId(node_id) => node_id.to_bytes() == [0u8; 32],
             Value::Object(_) | Value::Binary(_) | Value::Json(_) => false,
         }
     }
@@ -144,6 +146,7 @@ impl Collatable for Value {
             Value::F64(f) => *f == f64::INFINITY,
             Value::Bool(b) => *b,
             Value::EntityId(entity_id) => entity_id.to_bytes() == [0xFFu8; EntityId::BYTE_LEN],
+            Value::NodeId(node_id) => node_id.to_bytes() == [0xFFu8; 32],
             Value::Object(_) | Value::Binary(_) | Value::Json(_) => false,
         }
     }

@@ -72,6 +72,7 @@ impl From<Value> for SqliteValue {
             Value::F64(f) => SqliteValue::Real(f),
             Value::Bool(b) => SqliteValue::Integer(if b { 1 } else { 0 }),
             Value::EntityId(id) => SqliteValue::Text(id.to_base64()),
+            Value::NodeId(id) => SqliteValue::Blob(id.to_bytes().to_vec()),
             Value::Object(bytes) => SqliteValue::Blob(bytes),
             Value::Binary(bytes) => SqliteValue::Blob(bytes),
             Value::Json(json) => SqliteValue::Jsonb(json),

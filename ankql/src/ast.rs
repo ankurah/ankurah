@@ -1,6 +1,6 @@
 use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
-pub use ankurah_core_types::{EntityId, ModelId, PropertyId, PropertyPath, SystemModel, SystemProperty, Value};
+pub use ankurah_core_types::{EntityId, ModelId, NodeId, PropertyId, PropertyPath, SystemModel, SystemProperty, Value};
 use serde::{Deserialize, Serialize};
 
 mod stage;
@@ -788,6 +788,14 @@ impl<S: Stage> From<EntityId> for Expr<S> {
 
 impl<S: Stage> From<&EntityId> for Expr<S> {
     fn from(id: &EntityId) -> Self { Expr::Literal(Value::EntityId(*id)) }
+}
+
+impl<S: Stage> From<NodeId> for Expr<S> {
+    fn from(id: NodeId) -> Self { Expr::Literal(Value::NodeId(id)) }
+}
+
+impl<S: Stage> From<&NodeId> for Expr<S> {
+    fn from(id: &NodeId) -> Self { Expr::Literal(Value::NodeId(*id)) }
 }
 
 // These create Expr::ExprList for use in IN clauses

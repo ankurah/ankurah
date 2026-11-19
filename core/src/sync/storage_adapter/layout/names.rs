@@ -18,14 +18,8 @@
 
 use std::fmt;
 
+use crate::storage::names::{TREES, TREE_HISTORY, TREE_LOCK, TREE_LOG, TREE_MEMBERS, TREE_ROWS};
 use crate::storage::{LockName, MapId};
-
-const TREES: u8 = b't';
-const ROWS: u8 = b'r';
-const LOG: u8 = b'l';
-const MEMBERS: u8 = b'm';
-const HISTORY: u8 = b'h';
-const LOCK: u8 = b'k';
 
 /// A tree's name among one engine's digest trees, which its owner chooses.
 /// Ids order as their text's bytes do, and so do the trees' locks.
@@ -41,7 +35,7 @@ impl TreeId {
 
     /// The lock a storage transaction takes before it reads or writes the
     /// tree's entry, rows or change log.
-    pub(in crate::sync::storage_adapter) fn lock(&self) -> LockName { LockName::new(tagged(LOCK, self.0.as_bytes())) }
+    pub(in crate::sync::storage_adapter) fn lock(&self) -> LockName { LockName::new(tagged(TREE_LOCK, self.0.as_bytes())) }
 
     /// The key of the tree's entry in the trees map.
     pub(in crate::sync::storage_adapter) fn entry_key(&self) -> Vec<u8> { self.0.as_bytes().to_vec() }
@@ -66,16 +60,16 @@ impl Incarnation {
     pub(in crate::sync::storage_adapter) fn mint() -> Self { Self(rand::random()) }
 
     /// The map that holds the tree's rows.
-    pub(in crate::sync::storage_adapter) fn rows(self) -> MapId { MapId::new(tagged(ROWS, &self.to_bytes())) }
+    pub(in crate::sync::storage_adapter) fn rows(self) -> MapId { MapId::new(tagged(TREE_ROWS, &self.to_bytes())) }
 
     /// The map that holds the tree's change log.
-    pub(in crate::sync::storage_adapter) fn log(self) -> MapId { MapId::new(tagged(LOG, &self.to_bytes())) }
+    pub(in crate::sync::storage_adapter) fn log(self) -> MapId { MapId::new(tagged(TREE_LOG, &self.to_bytes())) }
 
     /// The manager's member keys, heads and continuation cursor.
-    pub(in crate::sync::storage_adapter) fn members(self) -> MapId { MapId::new(tagged(MEMBERS, &self.to_bytes())) }
+    pub(in crate::sync::storage_adapter) fn members(self) -> MapId { MapId::new(tagged(TREE_MEMBERS, &self.to_bytes())) }
 
     /// Before-images retained for captured comparison versions.
-    pub(in crate::sync::storage_adapter) fn history(self) -> MapId { MapId::new(tagged(HISTORY, &self.to_bytes())) }
+    pub(in crate::sync::storage_adapter) fn history(self) -> MapId { MapId::new(tagged(TREE_HISTORY, &self.to_bytes())) }
 
     /// Its eight bytes, big-endian.
     pub(in crate::sync::storage_adapter) fn to_bytes(self) -> [u8; 8] { self.0.to_be_bytes() }

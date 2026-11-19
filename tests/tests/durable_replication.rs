@@ -149,7 +149,7 @@ async fn cold_replication_keeps_complete_history_and_is_one_way() -> anyhow::Res
     assert_absent(&target, id).await?;
     let (local, _) = create(&target, "local only", "target").await?;
     let _connection = LocalProcessConnection::new(&source, &target).await?;
-    let replication = target.replicate_from(source.id, selection(&target, "true").await?, DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selection(&target, "true").await?, DEFAULT_CONTEXT)?;
     let covered = within(replication.wait_caught_up()).await?;
     assert_eq!(covered.digest.count(), 1);
     assert_eq!(target.storage.get_state(id).await?.payload.state, source.storage.get_state(id).await?.payload.state);
@@ -172,9 +172,10 @@ async fn multiple_directional_interests_can_use_asymmetric_selections() -> anyho
     let (to_left, leftward) = create(&right, "to left", "right record").await?;
     let (right_only, _) = create(&right, "right private", "stay right").await?;
     let _connection = LocalProcessConnection::new(&left, &right).await?;
-    let left_to_right = right.replicate_from(left.id, selection(&right, "artist = 'to right'").await?, DEFAULT_CONTEXT)?;
-    let another_left_to_right = right.replicate_from(left.id, selection(&right, "artist = 'also right'").await?, DEFAULT_CONTEXT)?;
-    let right_to_left = left.replicate_from(right.id, selection(&left, "title = 'to left'").await?, DEFAULT_CONTEXT)?;
+    let left_to_right = right.replicate_from(left.id().unwrap(), selection(&right, "artist = 'to right'").await?, DEFAULT_CONTEXT)?;
+    let another_left_to_right =
+        right.replicate_from(left.id().unwrap(), selection(&right, "artist = 'also right'").await?, DEFAULT_CONTEXT)?;
+    let right_to_left = left.replicate_from(right.id().unwrap(), selection(&left, "title = 'to left'").await?, DEFAULT_CONTEXT)?;
     assert_eq!(within(left_to_right.wait_caught_up()).await?.digest.count(), 1);
     assert_eq!(within(another_left_to_right.wait_caught_up()).await?.digest.count(), 1);
     assert_eq!(within(right_to_left.wait_caught_up()).await?.digest.count(), 1);
@@ -193,8 +194,8 @@ async fn reconnect_merges_offline_edits_and_recovers_a_missed_creation() -> anyh
     let (id, genesis) = create(&left, "original title", "original artist").await?;
     let connection = LocalProcessConnection::new(&left, &right).await?;
     let selected = selection(&left, "true").await?;
-    let left_to_right = right.replicate_from(left.id, selected.clone(), DEFAULT_CONTEXT)?;
-    let right_to_left = left.replicate_from(right.id, selected, DEFAULT_CONTEXT)?;
+    let left_to_right = right.replicate_from(left.id().unwrap(), selected.clone(), DEFAULT_CONTEXT)?;
+    let right_to_left = left.replicate_from(right.id().unwrap(), selected, DEFAULT_CONTEXT)?;
     within(left_to_right.wait_caught_up()).await?;
     within(right_to_left.wait_caught_up()).await?;
     drop(connection);
@@ -227,7 +228,7 @@ async fn departures_retain_history_and_reentry_recovers_intervening_events() -> 
     let target = replica(&source).await?;
     let (id, genesis) = create(&source, "included", "first").await?;
     let connection = LocalProcessConnection::new(&source, &target).await?;
-    let replication = target.replicate_from(source.id, selection(&target, "title = 'included'").await?, DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selection(&target, "title = 'included'").await?, DEFAULT_CONTEXT)?;
     within(replication.wait_caught_up()).await?;
     drop(connection);
 
@@ -256,7 +257,7 @@ async fn reopening_storage_and_recreating_an_interest_repairs_only_missing_histo
     let (id, genesis) = create(&source, "before restart", "source").await?;
     let selected = selection(&target, "true").await?;
     let connection = LocalProcessConnection::new(&source, &target).await?;
-    let replication = target.replicate_from(source.id, selected.clone(), DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selected.clone(), DEFAULT_CONTEXT)?;
     within(replication.wait_caught_up()).await?;
     assert_history(&target, id, &[genesis.id()].into_iter().collect()).await?;
     drop(replication);
@@ -291,7 +292,7 @@ async fn reopening_storage_and_recreating_an_interest_repairs_only_missing_histo
         false
     })
     .await;
-    let replication = reopened.replicate_from(source.id, selected, DEFAULT_CONTEXT)?;
+    let replication = reopened.replicate_from(source.id().unwrap(), selected, DEFAULT_CONTEXT)?;
     within(replication.wait_caught_up()).await?;
     assert_eq!(reopened.storage.get_state(id).await?.payload.state.head, proto::Clock::singleton(&updated));
     assert_history(&reopened, id, &[genesis.id(), updated.id()].into_iter().collect()).await?;
@@ -325,7 +326,7 @@ async fn a_slow_replica_does_not_delay_local_durable_commits() -> anyhow::Result
         _ => false,
     })
     .await;
-    let replication = target.replicate_from(source.id, selection(&target, "true").await?, DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selection(&target, "true").await?, DEFAULT_CONTEXT)?;
     tokio::time::timeout(Duration::from_secs(5), received.recv()).await?.expect("a repair was held");
     assert_absent(&target, id).await?;
     let updated = tokio::time::timeout(Duration::from_secs(1), edit(&source, id, Some("committed locally"), None)).await??;
@@ -374,7 +375,7 @@ async fn cancelled_bootstrap_rejects_late_deliveries_and_resumes_committed_progr
         false
     })
     .await;
-    let replication = target.replicate_from(source.id, selected.clone(), DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selected.clone(), DEFAULT_CONTEXT)?;
     let first = next_delivery(&mut received).await?;
     let completed: HashSet<_> = repair_delivery(&first)?.1.into_iter().collect();
     assert!(!completed.is_empty() && completed.len() < ids.len());
@@ -396,7 +397,7 @@ async fn cancelled_bootstrap_rejects_late_deliveries_and_resumes_committed_progr
         loop {
             let reply = target
                 .request(
-                    source.id,
+                    source.id().unwrap(),
                     &DEFAULT_CONTEXT,
                     proto::NodeRequestBody::Compare {
                         comparison,
@@ -413,7 +414,7 @@ async fn cancelled_bootstrap_rejects_late_deliveries_and_resumes_committed_progr
     })
     .await?;
     let before_replay = storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?;
-    target.handle_message(bincode::deserialize(&first)?).await?;
+    target.handle_message(target.connections_of(source.id().unwrap())[0], bincode::deserialize(&first)?).await?;
     gate.release_held(&target).await;
     assert_eq!(storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?, before_replay);
     for id in &outstanding {
@@ -445,7 +446,7 @@ async fn cancelled_bootstrap_rejects_late_deliveries_and_resumes_committed_progr
         false
     })
     .await;
-    let replication = target.replicate_from(source.id, selected, DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selected, DEFAULT_CONTEXT)?;
     assert_eq!(within(replication.wait_caught_up()).await?.digest.count() as usize, ids.len());
     let expected: HashSet<_> = ids.difference(&completed).copied().chain([changed]).collect();
     let received = repaired.lock().unwrap().clone();
@@ -467,7 +468,7 @@ async fn limited_replication_refills_order_gaps_without_discarding_departed_hist
     let (third, _) = create(&source, "included", "20").await?;
     let selected = selection(&target, "title = 'included' ORDER BY artist ASC LIMIT 2").await?;
     let _connection = LocalProcessConnection::new(&source, &target).await?;
-    let replication = target.replicate_from(source.id, selected.clone(), DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selected.clone(), DEFAULT_CONTEXT)?;
     assert_eq!(within(replication.wait_caught_up()).await?.digest.count(), 2);
     assert_absent(&target, third).await?;
 
@@ -504,7 +505,8 @@ async fn a_causally_newer_local_prefix_does_not_starve_a_missing_source_suffix()
     let ids = create_many(&source, 100).await?;
     let target = replica(&source).await?;
     let connection = LocalProcessConnection::new(&source, &target).await?;
-    let initial = target.replicate_from(source.id, selection(&target, "true ORDER BY artist ASC LIMIT 80").await?, DEFAULT_CONTEXT)?;
+    let initial =
+        target.replicate_from(source.id().unwrap(), selection(&target, "true ORDER BY artist ASC LIMIT 80").await?, DEFAULT_CONTEXT)?;
     assert_eq!(within(initial.wait_caught_up()).await?.digest.count(), 80);
     drop(initial);
     drop(connection);
@@ -529,7 +531,8 @@ async fn a_causally_newer_local_prefix_does_not_starve_a_missing_source_suffix()
         false
     })
     .await;
-    let replication = target.replicate_from(source.id, selection(&target, "true ORDER BY artist ASC").await?, DEFAULT_CONTEXT)?;
+    let replication =
+        target.replicate_from(source.id().unwrap(), selection(&target, "true ORDER BY artist ASC").await?, DEFAULT_CONTEXT)?;
     assert_eq!(within(replication.wait_caught_up()).await?.digest.count(), 100);
     let repaired = repaired.lock().unwrap().clone();
     assert_eq!(repaired.len(), 20, "covered local descendants need no history repair");
@@ -592,7 +595,7 @@ impl PolicyAgent for HiddenAncestor {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -603,7 +606,7 @@ impl PolicyAgent for HiddenAncestor {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &proto::Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -626,7 +629,7 @@ impl PolicyAgent for HiddenAncestor {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _: &Node<SE, Self>,
-        _: &EntityId,
+        _: &proto::NodeId,
         _: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -652,7 +655,7 @@ async fn a_denied_required_ancestor_stops_replication_without_persisting_partial
     let source = Node::new_durable(storage, HiddenAncestor { denied: genesis.id(), repairs: repairs.clone() });
     within(source.wait_ready()).await?;
     let _connection = LocalProcessConnection::new(&source, &target).await?;
-    let replication = target.replicate_from(source.id, selection(&target, "true").await?, DEFAULT_CONTEXT)?;
+    let replication = target.replicate_from(source.id().unwrap(), selection(&target, "true").await?, DEFAULT_CONTEXT)?;
     let refusal = tokio::time::timeout(Duration::from_secs(5), replication.wait_caught_up()).await?.unwrap_err();
     assert!(matches!(refusal, RetrievalError::StorageError(error)
         if error.downcast_ref::<proto::ComparisonFailure>() == Some(&proto::ComparisonFailure::MemberUnavailable)));
@@ -662,5 +665,27 @@ async fn a_denied_required_ancestor_stops_replication_without_persisting_partial
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(repairs.load(Ordering::SeqCst), 3, "a permanent refusal must not start a fresh polling budget");
     assert_absent(&target, id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn independent_durable_nodes_with_the_same_key_can_replicate() -> anyhow::Result<()> {
+    let initialized = seed().await?;
+    let provisioned = replica(&initialized).await?;
+    let key = ankurah::NodeKey::generate();
+    let source = Node::new_durable_with_key(initialized.storage.clone(), PermissiveAgent::new(), key.clone());
+    let target = Node::new_durable_with_key(provisioned.storage.clone(), PermissiveAgent::new(), key);
+    drop(initialized);
+    drop(provisioned);
+    within(source.wait_ready()).await?;
+    within(target.wait_ready()).await?;
+    assert_eq!(source.id(), target.id());
+    assert!(!Arc::ptr_eq(&source.storage, &target.storage));
+    let (id, genesis) = create(&source, "shared identity", "independent storage").await?;
+    let _connection = LocalProcessConnection::new(&source, &target).await?;
+    let replication = target.replicate_from(source.id().unwrap(), selection(&target, "true").await?, DEFAULT_CONTEXT)?;
+    within(replication.wait_caught_up()).await?;
+    assert_history(&target, id, &[genesis.id()].into_iter().collect()).await?;
+    assert_eq!(target.storage.get_state(id).await?.payload.state, source.storage.get_state(id).await?.payload.state);
     Ok(())
 }

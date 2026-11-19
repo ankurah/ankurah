@@ -15,7 +15,10 @@ use std::{
 
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, PropertyPath, Resolved, Selection};
 use ankurah_digest_tree::Ristretto255;
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers, SystemModel, SystemProperty};
+use ankurah_proto::{
+    Attested, Clock, EntityId, EntityState, ModelId, NodeId, PropertyId, State, StateBuffers, SystemModel, SystemProperty,
+};
+use anyhow::Context;
 use futures::TryStreamExt;
 
 use crate::{
@@ -36,6 +39,7 @@ fn group() -> PropertyId { PropertyId::EntityId(id(202)) }
 fn document() -> PropertyId { PropertyId::EntityId(id(203)) }
 fn active() -> PropertyId { PropertyId::EntityId(id(204)) }
 fn absent_document() -> PropertyId { PropertyId::EntityId(id(205)) }
+fn node_id() -> PropertyId { PropertyId::EntityId(id(206)) }
 
 /// Numeric ordering, absent values, raw ID ties and implicit ID ordering.
 pub async fn numeric_ordering<SE: StorageEngine + 'static>(storage: Arc<SE>) -> anyhow::Result<()> {
@@ -59,6 +63,72 @@ pub async fn numeric_ordering<SE: StorageEngine + 'static>(storage: Arc<SE>) -> 
     fixture.check("implicit ID order", None, &[1, 2, 3, 4, 5, 6, 7, 208]).await?;
     fixture
         .check("explicit descending ID", Some(vec![order(PropertyPath::id(), OrderDirection::Desc)]), &[208, 7, 6, 5, 4, 3, 2, 1])
+        .await?;
+    fixture.finish()
+}
+
+/// Node IDs sort by public-key bytes, including LIMIT and refill boundaries.
+pub async fn node_id_ordering<SE: StorageEngine + 'static>(storage: Arc<SE>) -> anyhow::Result<()> {
+    // Base64 text puts 0xD0 ("0N...") before 0x10 ("EB..."); bytes do the reverse.
+    let states = [(1, Some(240)), (2, Some(16)), (3, None), (4, Some(0)), (5, Some(64)), (6, Some(208)), (7, Some(255)), (208, Some(16))]
+        .into_iter()
+        .map(|(byte, key)| {
+            member(
+                byte,
+                key.map(|key| (node_id(), Value::NodeId(NodeId::from_bytes([key; 32]))))
+                    .into_iter()
+                    .chain([(score(), Value::I64(i64::from(byte)))]),
+            )
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let mut fixture = Fixture::new(storage, states).await?;
+    fixture.check("node ID ascending", Some(vec![order(node_id().into(), OrderDirection::Asc)]), &[4, 2, 208, 5, 6, 1, 7, 3]).await?;
+    fixture.check("node ID descending", Some(vec![order(node_id().into(), OrderDirection::Desc)]), &[3, 7, 1, 6, 5, 2, 208, 4]).await?;
+    for (operator, expected) in [
+        (ComparisonOperator::Equal, &[5][..]),
+        (ComparisonOperator::NotEqual, &[1, 2, 4, 6, 7, 208][..]),
+        (ComparisonOperator::LessThan, &[2, 4, 208][..]),
+        (ComparisonOperator::LessThanOrEqual, &[2, 4, 5, 208][..]),
+        (ComparisonOperator::GreaterThan, &[1, 6, 7][..]),
+        (ComparisonOperator::GreaterThanOrEqual, &[1, 5, 6, 7][..]),
+    ] {
+        let comparison = Predicate::Comparison {
+            left: Box::new(Expr::Path(node_id().into())),
+            operator,
+            right: Box::new(Expr::Literal(Value::NodeId(NodeId::from_bytes([64; 32])))),
+        };
+        fixture.check_predicate(comparison, expected).await?;
+    }
+    // An equality prefix followed by an unbounded range exercises IndexedDB's
+    // prefix guard with a binary NodeId key, rather than a text or number key.
+    fixture
+        .check_predicate(
+            Predicate::And(
+                Box::new(Predicate::Comparison {
+                    left: Box::new(Expr::Path(node_id().into())),
+                    operator: ComparisonOperator::Equal,
+                    right: Box::new(Expr::Literal(Value::NodeId(NodeId::from_bytes([16; 32])))),
+                }),
+                Box::new(Predicate::Comparison {
+                    left: Box::new(Expr::Path(score().into())),
+                    operator: ComparisonOperator::GreaterThanOrEqual,
+                    right: Box::new(Expr::Literal(Value::I64(2))),
+                }),
+            ),
+            &[2, 208],
+        )
+        .await?;
+    fixture
+        .check_predicate(
+            Predicate::Comparison {
+                left: Box::new(Expr::Path(node_id().into())),
+                operator: ComparisonOperator::In,
+                right: Box::new(Expr::ExprList(
+                    vec![16, 208].into_iter().map(|byte| Expr::Literal(Value::NodeId(NodeId::from_bytes([byte; 32])))).collect(),
+                )),
+            },
+            &[2, 6, 208],
+        )
         .await?;
     fixture.finish()
 }
@@ -314,6 +384,7 @@ impl<SE: StorageEngine + 'static> Fixture<SE> {
             (document(), "document", "json"),
             (active(), "active", "bool"),
             (absent_document(), "absent_document", "json"),
+            (node_id(), "node_id", "nodeid"),
         ] {
             let PropertyId::EntityId(entity_id) = property else { unreachable!() };
             let definition = state(
@@ -403,6 +474,42 @@ impl<SE: StorageEngine + 'static> Fixture<SE> {
         Ok(())
     }
 
+    async fn check_predicate(&mut self, predicate: Predicate<Resolved>, expected: &[u8]) -> anyhow::Result<()> {
+        let expected: Vec<_> = expected.iter().copied().map(id).collect();
+        for indexed in [false, true] {
+            // Unordered IndexedDB residual filters currently error on an absent
+            // operand. Keep these checks focused on NodeId operators; the order,
+            // LIMIT and refill checks above still include the missing NodeId.
+            let present = Predicate::Not(Box::new(Predicate::IsNull(Box::new(Expr::Path(node_id().into())))));
+            let mut predicate =
+                Predicate::And(Box::new(active_predicate()), Box::new(Predicate::And(Box::new(present), Box::new(predicate.clone()))));
+            if indexed {
+                predicate = Predicate::And(Box::new(Predicate::MemberOf(model())), Box::new(predicate));
+            }
+            let selection = Selection { predicate, order_by: None, limit: None };
+            let description = format!("node ID predicate {:?}, indexed={indexed}", selection.predicate);
+            let mut fetched = ids(&self.storage.fetch_states(&selection).await.with_context(|| format!("{description}: fetch"))?);
+            fetched.sort();
+            self.record(description.clone(), Ok(fetched), &expected);
+            let mut bounded = selection.clone();
+            bounded.limit = Some(self.members.len() as u64 + 1);
+            let mut snapshot = snapshot_order(self.storage.as_ref(), &bounded).await.with_context(|| format!("{description}: snapshot"))?;
+            snapshot.sort();
+            self.record(format!("{description}: snapshot"), Ok(snapshot), &expected);
+            let tree = self.manager.open(selection).await.with_context(|| format!("{description}: open tree"))?;
+            let mut members = tree
+                .view()
+                .range(..)?
+                .map_ok(|leaf| leaf.id.0)
+                .try_collect::<Vec<_>>()
+                .await
+                .with_context(|| format!("{description}: tree members"))?;
+            members.sort();
+            self.record(format!("{description}: tree"), Ok(members), &expected);
+        }
+        Ok(())
+    }
+
     async fn check_snapshot_boundaries(
         &mut self,
         name: &str,
@@ -446,7 +553,7 @@ impl<SE: StorageEngine + 'static> Fixture<SE> {
         }
         changed.sort();
         let mut expected_changes = expected.to_vec();
-        expected_changes.extend([id(201), id(202), id(203), id(204), id(205), id(250)]);
+        expected_changes.extend([id(201), id(202), id(203), id(204), id(205), id(206), id(250)]);
         expected_changes.sort();
         self.record(format!("{name}: complete independent change scan"), Ok(changed), &expected_changes);
         snapshot.finish().await?;

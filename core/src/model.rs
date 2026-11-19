@@ -187,10 +187,10 @@ pub fn js_preprocess_ref_field(obj: &wasm_bindgen::JsValue, field_name: &str) ->
 }
 
 // Populate AnkQL placeholders from variadic JS substitution values, mapping
-// EntityId instances to typed EntityId literals so Ref-field comparisons
+// EntityId and NodeId instances to typed literals so Ref-field comparisons
 // collate consistently across fetch and live-update paths
-// (https://github.com/ankurah/ankurah/issues/259). Other values use the
-// standard JsValue conversion (string/bool/number).
+// (https://github.com/ankurah/ankurah/issues/259), and a NodeId argument stays
+// a node id. Other values use the standard JsValue conversion (string/bool/number).
 #[doc(hidden)]
 #[cfg(feature = "wasm")]
 pub fn js_populate_predicate(
@@ -202,8 +202,8 @@ pub fn js_populate_predicate(
 
     let exprs = args_array
         .iter()
-        .map(|value| match js_entity_id(&value) {
-            Some(id) => Ok(ankql::ast::Expr::from(&id)),
+        .map(|value| match js_id_value(&value) {
+            Some(id) => Ok(ankql::ast::Expr::Literal(id)),
             None => ankql::ast::Expr::try_from(value),
         })
         .collect::<Result<Vec<_>, ankql::error::ParseError>>()
@@ -212,18 +212,37 @@ pub fn js_populate_predicate(
     predicate.populate(exprs).map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
 }
 
-// Duck-typed detection of a WASM EntityId instance: a non-string object with a
-// callable `to_base64` returning a parseable id (mirrors js_preprocess_ref_field).
+// Recognizes a WASM EntityId or NodeId instance and returns the id it holds as a typed value. Both classes
+// have a `to_base64` method, so the object's prototype tells an entity id from a node id.
 #[cfg(feature = "wasm")]
-fn js_entity_id(value: &wasm_bindgen::JsValue) -> Option<ankurah_proto::EntityId> {
-    use wasm_bindgen::JsCast;
-    if value.as_string().is_some() || !value.is_object() {
+fn js_id_value(value: &wasm_bindgen::JsValue) -> Option<crate::value::Value> {
+    use crate::value::Value;
+    use wasm_bindgen::{JsCast, JsValue};
+    thread_local! {
+        // One object of each class, made once per thread, gives that class's prototype.
+        static PROTOTYPES: (js_sys::Object, js_sys::Object) = (
+            js_sys::Object::get_prototype_of(&JsValue::from(EntityId::from_bytes([0; 32]))),
+            js_sys::Object::get_prototype_of(&JsValue::from(ankurah_proto::NodeId::from_bytes([0; 32]))),
+        );
+    }
+    if !value.is_object() {
         return None;
     }
-    let to_base64 = js_sys::Reflect::get(value, &wasm_bindgen::JsValue::from_str("to_base64")).ok()?;
-    let func = to_base64.dyn_ref::<js_sys::Function>()?;
-    let result = func.call0(value).ok()?;
-    ankurah_proto::EntityId::from_base64(result.as_string()?).ok()
+    // Reflect catches an exception from a proxy's getPrototypeOf trap, which leaves the value unrecognized.
+    let prototype = js_sys::Reflect::get_prototype_of(value).ok()?;
+    let text = || {
+        let to_base64 = js_sys::Reflect::get(value, &JsValue::from_str("to_base64")).ok()?;
+        to_base64.dyn_ref::<js_sys::Function>()?.call0(value).ok()?.as_string()
+    };
+    PROTOTYPES.with(|(entity_id, node_id)| {
+        if js_sys::Object::is(&prototype, entity_id) {
+            EntityId::from_base64(text()?).ok().map(Value::EntityId)
+        } else if js_sys::Object::is(&prototype, node_id) {
+            ankurah_proto::NodeId::from_base64(text()?).ok().map(Value::NodeId)
+        } else {
+            None
+        }
+    })
 }
 
 // Helper function for map implementations in generated WASM ResultSet wrappers

@@ -1,32 +1,36 @@
 use super::*;
 use crate::{
     connector::{PeerSender, SendError},
+    node::NodeKey,
     policy::{PermissiveAgent, DEFAULT_CONTEXT},
-    test_utils::TestStorage,
+    test_utils::{connect_peer, TestStorage},
 };
-use std::{sync::mpsc, time::Duration};
+use std::{
+    sync::{mpsc, OnceLock},
+    time::Duration,
+};
 
 #[derive(Clone)]
-struct Sender(EntityId, mpsc::Sender<proto::NodeMessage>);
+struct Sender(mpsc::Sender<proto::NodeMessage>);
 impl PeerSender for Sender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-        self.1.send(message).map_err(|_| SendError::ConnectionClosed)
+        self.0.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, EntityId, mpsc::Receiver<proto::NodeMessage>)> {
+async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, mpsc::Receiver<proto::NodeMessage>)> {
+    fixture_with_key(&NodeKey::generate()).await
+}
+
+async fn fixture_with_key(
+    key: &NodeKey,
+) -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, mpsc::Receiver<proto::NodeMessage>)> {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
     node.system.create().await?;
     node.wait_ready().await?;
-    let peer = EntityId::random();
     let (sent, messages) = mpsc::channel();
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(Sender(peer, sent)),
-    )
-    .await?;
+    let peer = connect_peer(&node, key, false, Sender(sent)).await?;
     Ok((node, peer, messages))
 }
 
@@ -77,12 +81,15 @@ async fn delivery_before_reply_is_admitted_once_and_cancelled_requests_leave_no_
         } else {
             node.receive_comparison_repair(peer, id, delivery.clone(), vec![]).await?;
             assert!(node.receive_comparison_repair(peer, id, delivery.clone(), vec![]).await.is_err());
-            node.handle_message(proto::NodeMessage::Response(proto::NodeResponse {
-                from: peer,
-                to: node.id,
-                request_id: sent.id,
-                body: proto::NodeResponseBody::Compared(Ok(proto::ComparisonReply::Repaired { delivery, unavailable: vec![] })),
-            }))
+            node.handle_message(
+                peer,
+                proto::NodeMessage::Response(proto::NodeResponse {
+                    from: node.peer_node_id(peer)?,
+                    to: node.keyed_id(),
+                    request_id: sent.id,
+                    body: proto::NodeResponseBody::Compared(Ok(proto::ComparisonReply::Repaired { delivery, unavailable: vec![] })),
+                }),
+            )
             .await?;
             let receipt = request.await?;
             assert_eq!(receipt.events, 0);
@@ -170,12 +177,15 @@ async fn transient_head_snapshot_conflict_restarts_the_query_and_completes_repai
             page: Some(Page::Members(vec![])),
         })
     };
-    node.handle_message(proto::NodeMessage::Response(proto::NodeResponse {
-        from: peer,
-        to: node.id,
-        request_id: first.id,
-        body: empty_target(first_id),
-    }))
+    node.handle_message(
+        peer,
+        proto::NodeMessage::Response(proto::NodeResponse {
+            from: node.peer_node_id(peer)?,
+            to: node.keyed_id(),
+            request_id: first.id,
+            body: empty_target(first_id),
+        }),
+    )
     .await?;
 
     // Inject the conflict after capture and before the differing member's head
@@ -209,12 +219,15 @@ async fn transient_head_snapshot_conflict_restarts_the_query_and_completes_repai
     };
     assert_ne!(first_id, second_id);
     assert_eq!(renewed.digest, known_state.digest);
-    node.handle_message(proto::NodeMessage::Response(proto::NodeResponse {
-        from: peer,
-        to: node.id,
-        request_id: second.id,
-        body: empty_target(second_id),
-    }))
+    node.handle_message(
+        peer,
+        proto::NodeMessage::Response(proto::NodeResponse {
+            from: node.peer_node_id(peer)?,
+            to: node.keyed_id(),
+            request_id: second.id,
+            body: empty_target(second_id),
+        }),
+    )
     .await?;
     assert!(futures::poll!(&mut query).is_pending());
     let proto::NodeMessage::Request { request: repair, .. } = messages.try_recv()? else { panic!("expected known-ID repair") };
@@ -231,12 +244,15 @@ async fn transient_head_snapshot_conflict_restarts_the_query_and_completes_repai
     assert_eq!(members[0].known.head, head);
     assert!(members[0].key.is_none());
     node.receive_comparison_repair(peer, second_id, delivery.clone(), vec![]).await?;
-    node.handle_message(proto::NodeMessage::Response(proto::NodeResponse {
-        from: peer,
-        to: node.id,
-        request_id: repair.id,
-        body: proto::NodeResponseBody::Compared(Ok(proto::ComparisonReply::Repaired { delivery, unavailable: vec![id] })),
-    }))
+    node.handle_message(
+        peer,
+        proto::NodeMessage::Response(proto::NodeResponse {
+            from: node.peer_node_id(peer)?,
+            to: node.keyed_id(),
+            request_id: repair.id,
+            body: proto::NodeResponseBody::Compared(Ok(proto::ComparisonReply::Repaired { delivery, unavailable: vec![id] })),
+        }),
+    )
     .await?;
     query.await?;
     assert!(connection.comparisons.0.lock().unwrap().is_empty());
@@ -256,21 +272,104 @@ fn snapshot_write_conflict_is_a_typed_restart_response() {
 
 #[tokio::test]
 async fn replacement_connection_rejects_old_deliveries_and_frees_pending_requests() -> anyhow::Result<()> {
-    let (node, peer, _) = fixture().await?;
+    let key = NodeKey::generate();
+    let (node, peer, _) = fixture_with_key(&key).await?;
     let old = node.peer_connections.get(&peer).unwrap();
     let id = ComparisonId::new();
     old.comparisons.admit(id, vec![DEFAULT_CONTEXT], ComparisonLimits::default())?;
     let (done, waiting) = oneshot::channel();
     old.pending_requests.insert(proto::RequestId::new(), done);
+    node.deregister_peer(peer);
     let (sent, _messages) = mpsc::channel();
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(Sender(peer, sent)),
-    )
-    .await?;
+    let replacement = connect_peer(&node, &key, false, Sender(sent)).await?;
+    assert_ne!(replacement, peer);
     assert!(waiting.await.is_err());
     assert!(old.comparisons.0.lock().unwrap().is_empty());
     assert!(node.receive_comparison_repair(peer, id, proto::UpdateId::new(), vec![]).await.is_err());
+    assert!(node.receive_comparison_repair(replacement, id, proto::UpdateId::new(), vec![]).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_key_connections_cannot_consume_each_others_deliveries() -> anyhow::Result<()> {
+    let key = NodeKey::generate();
+    let (node, first, first_messages) = fixture_with_key(&key).await?;
+    let (sent, second_messages) = mpsc::channel();
+    let second = connect_peer(&node, &key, false, Sender(sent)).await?;
+    assert_ne!(first, second);
+    assert_eq!(node.peer_node_id(first)?, node.peer_node_id(second)?);
+    let id = ComparisonId::new();
+    for connection in [first, second] {
+        node.peer_connections.get(&connection).unwrap().comparisons.admit(id, vec![DEFAULT_CONTEXT], ComparisonLimits::default())?;
+    }
+    let incoming = node.peer_connections.get(&first).unwrap().comparisons.get(&id).unwrap();
+    let delivery = proto::UpdateId::new();
+    let (done, received) = oneshot::channel();
+    incoming.deliveries.insert(delivery.clone(), Delivery { entities: HashSet::new(), done });
+    let update = || {
+        proto::NodeMessage::Update(proto::NodeUpdate {
+            from: key.public_key().node_id(),
+            to: node.keyed_id(),
+            id: delivery.clone(),
+            body: proto::NodeUpdateBody::Comparison { comparison: id, deltas: vec![] },
+        })
+    };
+    node.handle_message(second, update()).await?;
+    assert!(matches!(
+        second_messages.try_recv()?,
+        proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { body: proto::NodeUpdateAckBody::Error(_), .. })
+    ));
+    assert_eq!(incoming.deliveries.len(), 1, "the other connection cannot consume the requested delivery");
+    node.handle_message(first, update()).await?;
+    assert!(matches!(
+        first_messages.try_recv()?,
+        proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { body: proto::NodeUpdateAckBody::Success, .. })
+    ));
+    assert_eq!(received.await??.1, 0);
+    assert!(incoming.deliveries.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_key_connections_cannot_answer_each_others_requests_and_disconnect_independently() -> anyhow::Result<()> {
+    let key = NodeKey::generate();
+    let (node, first, first_messages) = fixture_with_key(&key).await?;
+    let (sent, second_messages) = mpsc::channel();
+    let second = connect_peer(&node, &key, false, Sender(sent)).await?;
+    let credentials = vec![DEFAULT_CONTEXT];
+    let id = ComparisonId::new();
+    let body = || proto::NodeRequestBody::Compare {
+        comparison: id,
+        selection: ankql::ast::Predicate::False.into(),
+        request: proto::ComparisonRequest::Pages { spans: vec![] },
+    };
+    let mut first_request = Box::pin(node.request_on(first, &credentials, body()));
+    assert!(futures::poll!(&mut first_request).is_pending());
+    let proto::NodeMessage::Request { request: first_sent, .. } = first_messages.try_recv()? else { panic!("expected request") };
+    let reply = |request_id| {
+        proto::NodeMessage::Response(proto::NodeResponse {
+            from: key.public_key().node_id(),
+            to: node.keyed_id(),
+            request_id,
+            body: proto::NodeResponseBody::Compared(Ok(proto::ComparisonReply::Pages(vec![]))),
+        })
+    };
+    node.handle_message(second, reply(first_sent.id)).await?;
+    assert!(futures::poll!(&mut first_request).is_pending(), "the same node id on another connection cannot answer this request");
+    assert_eq!(node.peer_connections.get(&first).unwrap().pending_requests.len(), 1);
+
+    let mut second_request = Box::pin(node.request_on(second, &credentials, body()));
+    assert!(futures::poll!(&mut second_request).is_pending());
+    let proto::NodeMessage::Request { request: second_sent, .. } = second_messages.try_recv()? else { panic!("expected request") };
+    node.deregister_peer(first);
+    assert!(matches!(first_request.await, Err(RequestError::InternalChannelClosed)));
+    assert!(futures::poll!(&mut second_request).is_pending());
+    assert_eq!(node.peer_connections.get(&second).unwrap().pending_requests.len(), 1);
+    node.handle_message(second, reply(second_sent.id)).await?;
+    assert!(
+        matches!(second_request.await?, proto::NodeResponseBody::Compared(Ok(proto::ComparisonReply::Pages(pages))) if pages.is_empty())
+    );
+    assert!(node.peer_connections.get(&second).unwrap().pending_requests.is_empty());
     Ok(())
 }
 
@@ -287,7 +386,7 @@ struct QueryGate {
 #[derive(Clone)]
 struct Forward {
     node: crate::node::WeakNode<TestStorage, PermissiveAgent>,
-    id: EntityId,
+    connection: Arc<OnceLock<ConnectionId>>,
     gate: Arc<QueryGate>,
 }
 
@@ -320,16 +419,16 @@ impl PeerSender for Forward {
             _ => {}
         }
         let node = self.node.upgrade().ok_or(SendError::ConnectionClosed)?;
+        let connection = *self.connection.get().ok_or(SendError::ConnectionClosed)?;
         let gate = self.gate.clone();
         tokio::spawn(async move {
-            node.handle_message(message).await.unwrap();
+            node.handle_message(connection, message).await.unwrap();
             if unsubscribing {
                 gate.unsubscribed.notify_one();
             }
         });
         Ok(())
     }
-    fn recipient_node_id(&self) -> EntityId { self.id }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -341,8 +440,28 @@ async fn dropping_a_query_during_comparison_never_reinstalls_its_remote_subscrip
     server.wait_ready().await?;
     let client = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let gate = Arc::new(QueryGate::default());
-    client.register_peer(server.presence().await?, Box::new(Forward { node: server.weak(), id: server.id, gate: gate.clone() })).await?;
-    server.register_peer(client.presence().await?, Box::new(Forward { node: client.weak(), id: client.id, gate: gate.clone() })).await?;
+    let on_client = Arc::new(OnceLock::new());
+    let on_server = Arc::new(OnceLock::new());
+    let challenge = proto::Challenge::random();
+    let server_connection = server
+        .register_peer(
+            proto::ConnectionSide::Accepting,
+            &challenge,
+            client.presence(proto::ConnectionSide::Dialing, &challenge).await?,
+            Box::new(Forward { node: client.weak(), connection: on_client.clone(), gate: gate.clone() }),
+        )
+        .await?;
+    on_server.set(server_connection).unwrap();
+    let challenge = proto::Challenge::random();
+    let client_connection = client
+        .register_peer(
+            proto::ConnectionSide::Dialing,
+            &challenge,
+            server.presence(proto::ConnectionSide::Accepting, &challenge).await?,
+            Box::new(Forward { node: server.weak(), connection: on_server, gate: gate.clone() }),
+        )
+        .await?;
+    on_client.set(client_connection).unwrap();
     client.wait_ready().await?;
     let model = proto::ModelId::EntityId(EntityId::random());
     server.storage.set_state(proto::Attested::opt(
@@ -368,16 +487,16 @@ async fn dropping_a_query_during_comparison_never_reinstalls_its_remote_subscrip
     // must not drive a fresh SubscribeQuery for the dropped local query.
     let held = gate.held.lock().unwrap().take().unwrap();
     *gate.comparison.lock().unwrap() = None;
-    server.handle_message(held).await?;
+    server.handle_message(server_connection, held).await?;
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
     assert_eq!(gate.subscriptions.load(Ordering::SeqCst), 1);
-    let peer = server.peer_connections.get(&client.id).unwrap();
+    let peer = server.peer_connections.get(&server_connection).unwrap();
     assert!(matches!(
         peer.subscription_handler.subscription().remove_predicate(query_id),
         Err(crate::error::SubscriptionError::PredicateNotFound)
     ));
-    assert!(client.peer_connections.get(&server.id).unwrap().comparisons.get(&old_comparison).is_none());
+    assert!(client.peer_connections.get(&client_connection).unwrap().comparisons.get(&old_comparison).is_none());
     Ok(())
 }

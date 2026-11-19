@@ -4,7 +4,7 @@ use std::{ops::Bound, time::Duration};
 
 use ankurah_core_types::{key_spec::IndexKeyPart, ValueType};
 use ankurah_digest_tree::{Digest, Ristretto255};
-use ankurah_proto::{Attested, Clock, EntityState, EventId, ModelId, State};
+use ankurah_proto::{Attested, Clock, EntityId, EntityState, EventId, ModelId, State};
 
 use crate::{
     connector::{PeerSender, SendError},
@@ -13,25 +13,25 @@ use crate::{
 };
 
 #[derive(Clone)]
-struct Sender(EntityId);
+struct Sender;
 
 impl PeerSender for Sender {
     fn send_message(&self, _: ankurah_proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
-    fn recipient_node_id(&self) -> EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-fn presence(peer: EntityId) -> ankurah_proto::Presence {
-    ankurah_proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: ankurah_proto::PROTOCOL_VERSION }
+async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, Selection<Resolved>)> {
+    fixture_with_key(&crate::node::NodeKey::generate()).await
 }
 
-async fn fixture() -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, EntityId, Selection<Resolved>)> {
+async fn fixture_with_key(
+    key: &crate::node::NodeKey,
+) -> anyhow::Result<(Node<TestStorage, PermissiveAgent>, ConnectionId, Selection<Resolved>)> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
     node.system.create().await?;
     node.wait_ready().await?;
-    let peer = EntityId::random();
-    node.register_peer(presence(peer), Box::new(Sender(peer))).await?;
+    let peer = crate::test_utils::connect_peer(&node, key, false, Sender).await?;
     let model = ModelId::EntityId(EntityId::from_bytes([70; 32]));
     storage.set_state(Attested::opt(
         EntityState {
@@ -129,9 +129,10 @@ async fn releasing_a_pending_begin_cancels_capture_without_waiting_for_expiry() 
     *node.storage.hold_state_snapshot.lock().unwrap() = Some((entered, resume));
     let worker = node.clone();
     let id = ComparisonId::new();
-    let task = tokio::spawn(async move {
-        worker.begin_comparison(peer, id, selection, KeySpec::new(vec![]), known(), &vec![DEFAULT_CONTEXT]).await
-    });
+    let task =
+        tokio::spawn(
+            async move { worker.begin_comparison(peer, id, selection, KeySpec::new(vec![]), known(), &vec![DEFAULT_CONTEXT]).await },
+        );
     entering.await?;
     node.release_comparison(peer, id);
     refusal(tokio::time::timeout(Duration::from_secs(1), task).await??, ComparisonFailure::Expired);
@@ -154,12 +155,39 @@ async fn pages_bind_credentials_selection_and_the_peer_connection() -> anyhow::R
         match changed {
             "credentials" => credentials.clear(),
             "selection" => requested.limit = Some(1),
-            "connection" => node.register_peer(presence(peer), Box::new(Sender(peer))).await?,
+            "connection" => node.deregister_peer(peer),
             _ => unreachable!(),
         }
         assert!(node.comparison_pages(peer, id, &requested, vec![Span::all()], &credentials).await.is_err());
         assert!(node.captures.inner.lock().unwrap().is_empty());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_key_connections_keep_independent_captures_through_release_and_disconnect() -> anyhow::Result<()> {
+    let key = crate::node::NodeKey::generate();
+    let (node, first, selection) = fixture_with_key(&key).await?;
+    let second = crate::test_utils::connect_peer(&node, &key, false, Sender).await?;
+    assert_ne!(first, second);
+    assert_eq!(node.peer_node_id(first)?, node.peer_node_id(second)?);
+    let id = ComparisonId::new();
+    let credentials = vec![DEFAULT_CONTEXT];
+    let target = node.begin_comparison(first, id, selection.clone(), KeySpec::new(vec![]), known(), &credentials).await?;
+    let expected = vec![target.page.expect("the capture contains one member")];
+    refusal(node.comparison_pages(second, id, &selection, vec![Span::all()], &credentials).await, ComparisonFailure::Expired);
+    node.handle_message(second, ankurah_proto::NodeMessage::ReleaseComparison { from: key.public_key().node_id(), comparison: id }).await?;
+    assert_eq!(node.comparison_pages(first, id, &selection, vec![Span::all()], &credentials).await?, expected);
+
+    // A repeated comparison id on another physical connection names its own capture.
+    node.begin_comparison(second, id, selection.clone(), KeySpec::new(vec![]), known(), &credentials).await?;
+    assert_eq!(node.captures.inner.lock().unwrap().len(), 2);
+    node.deregister_peer(first);
+    assert_eq!(node.captures.inner.lock().unwrap().len(), 1);
+    refusal(node.comparison_pages(first, id, &selection, vec![Span::all()], &credentials).await, ComparisonFailure::Expired);
+    assert_eq!(node.comparison_pages(second, id, &selection, vec![Span::all()], &credentials).await?, expected);
+    node.handle_message(second, ankurah_proto::NodeMessage::ReleaseComparison { from: key.public_key().node_id(), comparison: id }).await?;
+    assert!(node.captures.inner.lock().unwrap().is_empty());
     Ok(())
 }
 

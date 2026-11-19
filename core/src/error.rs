@@ -18,6 +18,8 @@ pub enum NodeHaltReason {
     CatalogLoad(String),
     #[error("failed to initialize policy: {0}")]
     PolicyAgentStartFailed(String),
+    #[error("failed to look up the node's keypair: {0}")]
+    KeypairLookup(String),
     #[error("system replacement requires a new node (current {current}, proposed {proposed})")]
     SystemReplacement { current: EntityId, proposed: EntityId },
 }

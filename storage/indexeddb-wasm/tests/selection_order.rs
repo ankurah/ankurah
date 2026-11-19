@@ -17,6 +17,16 @@ async fn numeric_order_matches_digest_trees() -> anyhow::Result<()> {
 }
 
 #[wasm_bindgen_test]
+async fn node_id_order_matches_digest_trees() -> anyhow::Result<()> {
+    let name = format!("node_id_selection_order_{}", ulid::Ulid::new());
+    let engine = Arc::new(IndexedDBStorageEngine::open(&name).await?);
+    let result = selection_conformance::node_id_ordering(engine.clone()).await;
+    engine.db.close().await;
+    IndexedDBStorageEngine::cleanup(&name).await?;
+    result
+}
+
+#[wasm_bindgen_test]
 async fn json_order_matches_digest_trees() -> anyhow::Result<()> {
     let name = format!("json_selection_order_{}", ulid::Ulid::new());
     let engine = Arc::new(IndexedDBStorageEngine::open(&name).await?);

@@ -51,9 +51,10 @@ and fall back to a durable peer: `CachedEventGetter::get_event` checks staging, 
 local storage, then `node.get_durable_peer_random()`.
 
 Peer class is **self-asserted, not authenticated**: `node.rs` `register_peer` inserts
-into `durable_peers` when `presence.durable` is true, with no signature. Any peer can
-advertise durable and be selected by `get_durable_peer_random`, which an ephemeral
-node then trusts for fetches (C4-16, gap G-8).
+into `durable_peers` when `presence.durable` is true. The presence's signature
+shows that the holder of the key it names signed it for this connection, and nothing
+about the peer's class. Any peer can advertise durable and be selected by
+`get_durable_peer_random`, which an ephemeral node then trusts for fetches (C4-16, gap G-8).
 
 ### 1.2 What peers are trusted with today
 
@@ -444,7 +445,7 @@ Invariant (desired): the peer an ephemeral node fetches authoritative events fro
 authenticated as genuinely durable, not merely self-asserting.
 Trust tier: currently trusted-peer.
 Enforcing seam: **none today.** `node.rs` `register_peer` inserts into
-`durable_peers` from `presence.durable` (self-asserted, no signature);
+`durable_peers` from `presence.durable` (self-asserted, signed only with the key the presence names);
 `get_durable_peer_random` picks from it; `CachedEventGetter::get_event` fetches
 there.
 Falsifying attack (T1): advertise `durable: true` in a `Presence` to become the fetch

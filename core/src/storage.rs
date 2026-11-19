@@ -42,6 +42,8 @@ pub use lock::LockName;
 mod map;
 pub use map::{MapId, MapRead, MapRows, MapWrite, ScanDirection};
 
+pub(crate) mod names;
+
 mod lock_table;
 pub use lock_table::{HeldLocks, LockTable};
 

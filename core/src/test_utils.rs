@@ -46,6 +46,7 @@ pub(crate) struct TestStorage {
     pub hold_map_call: Mutex<Option<(usize, Pause)>>,
     pub reject_state_read: Mutex<Option<EntityId>>,
     fail_next_commit: AtomicBool,
+    conflict_next_commit: AtomicBool,
     fail_next_map_write: AtomicBool,
     fail_next_snapshot_read: Arc<AtomicBool>,
 
@@ -103,6 +104,10 @@ impl TestStorage {
     }
 
     pub fn fail_next_commit(&self) { self.fail_next_commit.store(true, Ordering::SeqCst); }
+
+    /// Fail the next commit with a write conflict, as an engine fails a commit
+    /// whose lock another transaction's commit moved.
+    pub fn conflict_next_commit(&self) { self.conflict_next_commit.store(true, Ordering::SeqCst); }
 
     /// Fail the next map write part way, after the first of its writes.
     pub fn fail_next_map_write(&self) { self.fail_next_map_write.store(true, Ordering::SeqCst); }
@@ -181,6 +186,9 @@ impl StorageTransaction for TestStorageTransaction<'_> {
         }
         if self.storage.fail_next_commit.swap(false, Ordering::SeqCst) {
             return Err(MutationError::General("test storage commit failed".into()));
+        }
+        if self.storage.conflict_next_commit.swap(false, Ordering::SeqCst) {
+            return Err(MutationError::WriteConflict);
         }
         let storage = self.storage;
         let result = self.commit_to_storage()?;
@@ -371,4 +379,32 @@ impl StorageEngine for TestStorage {
             .into_iter()
             .collect())
     }
+}
+
+/// Register a simulated peer through the real signed handshake.
+pub(crate) async fn connect_peer<SE, PA>(
+    node: &crate::node::Node<SE, PA>,
+    key: &crate::node::NodeKey,
+    durable: bool,
+    sender: impl crate::connector::PeerSender + 'static,
+) -> anyhow::Result<crate::connector::ConnectionId>
+where
+    SE: crate::storage::StorageEngine + 'static,
+    PA: crate::policy::PolicyAgent,
+{
+    let challenge = ankurah_proto::Challenge::random();
+    let presence = ankurah_proto::Presence {
+        key: key.public_key(),
+        durable,
+        system_root: if durable { node.system.root() } else { None },
+        protocol_version: ankurah_proto::PROTOCOL_VERSION,
+    };
+    Ok(node
+        .register_peer(
+            ankurah_proto::ConnectionSide::Accepting,
+            &challenge,
+            presence.sign(ankurah_proto::ConnectionSide::Dialing, &challenge, |bytes| key.sign(bytes)),
+            Box::new(sender),
+        )
+        .await?)
 }

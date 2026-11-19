@@ -183,7 +183,7 @@ async fn delayed_and_duplicate_repairs_preserve_concurrent_offline_edits() -> an
     assert_eq!(client.storage.dump_entity_events(id).await?.into_iter().map(|event| event.payload.id()).collect::<HashSet<_>>(), expected);
 
     let before_duplicate = client.storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?;
-    client.handle_message(bincode::deserialize(&delivery)?).await?;
+    client.handle_message(client.connections_of(server.id().unwrap())[0], bincode::deserialize(&delivery)?).await?;
     assert_eq!(
         client.storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?,
         before_duplicate,
@@ -272,7 +272,7 @@ async fn cancelled_delivery_keeps_completed_batches_for_the_next_fetch() -> anyh
 
     let before_late_delivery = client.storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?;
     for old in [first, lost] {
-        client.handle_message(bincode::deserialize(&old)?).await?;
+        client.handle_message(client.connections_of(server.id().unwrap())[0], bincode::deserialize(&old)?).await?;
     }
     assert_eq!(client.storage.state_snapshot(StateScan::Changes(None)).await?.finish().await?, before_late_delivery);
     assert_eq!(client.storage.get_state(changed).await?.payload.state.head, proto::Clock::singleton(&update));

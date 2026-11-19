@@ -34,7 +34,7 @@ fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeReques
 /// Register a schema and index its allocated property ids by name.
 async fn register_and_map(
     client: &Node<SledStorageEngine, PermissiveAgent>,
-    server_id: EntityId,
+    server_id: proto::NodeId,
     request: proto::NodeRequestBody,
 ) -> anyhow::Result<BTreeMap<String, EntityId>> {
     match client.request(server_id, &DEFAULT_CONTEXT, request).await? {
@@ -70,7 +70,8 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
 
-    let ids = register_and_map(&client, server.id, register("album", &[("name", "yrs", "string"), ("payload", "lww", "json")])).await?;
+    let ids = register_and_map(&client, server.id().unwrap(), register("album", &[("name", "yrs", "string"), ("payload", "lww", "json")]))
+        .await?;
     let name_id = ids["name"];
     let payload_id = ids["payload"];
 
@@ -126,7 +127,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
 
-    register_and_map(&client, server.id, register("album", &[("name", "yrs", "string")])).await?;
+    register_and_map(&client, server.id().unwrap(), register("album", &[("name", "yrs", "string")])).await?;
     let collection = server.catalog.model_id_for("album").unwrap().expect("album model registered");
 
     let before = resolve_selection(&collection, server.catalog.as_ref(), ankql::parser::parse_selection("name = 'x' ORDER BY name")?)?;
@@ -156,7 +157,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
             }],
         },
     };
-    match client.request(server.id, &DEFAULT_CONTEXT, rename).await? {
+    match client.request(server.id().unwrap(), &DEFAULT_CONTEXT, rename).await? {
         proto::NodeResponseBody::SchemaRegistered { .. } => {}
         other => panic!("expected SchemaRegistered, got {other}"),
     }
@@ -182,7 +183,7 @@ async fn order_by_resolves_fail_closed() -> anyhow::Result<()> {
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
-    register_and_map(&client, server.id, register("album", &[("name", "yrs", "string")])).await?;
+    register_and_map(&client, server.id().unwrap(), register("album", &[("name", "yrs", "string")])).await?;
     let collection = server.catalog.model_id_for("album").unwrap().expect("album model registered");
 
     let known = resolve_selection(&collection, server.catalog.as_ref(), ankql::parser::parse_selection("true ORDER BY name")?)?;
@@ -215,7 +216,7 @@ async fn subpath_order_keys_and_id_subpaths_are_refused() -> anyhow::Result<()> 
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
-    register_and_map(&client, server.id, register("album", &[("payload", "lww", "json")])).await?;
+    register_and_map(&client, server.id().unwrap(), register("album", &[("payload", "lww", "json")])).await?;
     let collection = server.catalog.model_id_for("album").unwrap().expect("album model registered");
 
     let order = |steps: &[&str]| Selection::<Parsed> {

@@ -1,11 +1,11 @@
 use crate::sender::WebsocketPeerSender;
 use ankurah_core::{
-    connector::{PeerConnectionError, PeerSender},
+    connector::{ConnectionId, PeerConnectionError},
     policy::PolicyAgent,
     storage::StorageEngine,
     Node, NodeState,
 };
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, ConnectionSide::Dialing};
 use ankurah_signals::{Calculated, Get, Mut, Peek, Read, Wait};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -219,9 +219,9 @@ where
     }
 
     /// Get the node ID of the connected server (if connected)
-    pub fn server_node_id(&self) -> Option<proto::EntityId> {
+    pub fn server_node_id(&self) -> Option<proto::NodeId> {
         match self.state().get() {
-            ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id),
+            ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id()),
             _ => None,
         }
     }
@@ -273,7 +273,7 @@ where
             inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
         }
 
-        let mut peer_sender: Option<WebsocketPeerSender> = None;
+        let mut handshake = Handshake { challenge: proto::Challenge::random(), server_challenge: None, connection: None };
         let mut outgoing_rx: Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>> = None;
         let connection = async {
             let request = inner.server_url.as_str().into_client_request()?;
@@ -282,6 +282,7 @@ where
 
             let (mut sink, mut stream) = ws_stream.split();
             debug!("Starting connection handling");
+            sink.send(Message::Binary(bincode::serialize(&proto::Message::Challenge(handshake.challenge))?.into())).await?;
 
             loop {
                 select! {
@@ -296,7 +297,7 @@ where
                         }
                     }
                     msg = stream.next() => {
-                        match Self::handle_incoming_message(inner, msg, &mut peer_sender, &mut outgoing_rx, &mut sink).await? {
+                        match Self::handle_incoming_message(inner, msg, &mut handshake, &mut outgoing_rx, &mut sink).await? {
                             MessageResult::Continue => continue,
                             MessageResult::Break => break,
                         }
@@ -313,9 +314,9 @@ where
 
         // Cleanup
         inner.connected.store(false, Ordering::Release);
-        if let Some(sender) = peer_sender {
-            inner.node.deregister_peer(sender.recipient_node_id());
-            debug!("Deregistered peer {}", sender.recipient_node_id());
+        if let Some(connection) = handshake.connection {
+            inner.node.deregister_peer(connection);
+            debug!("Deregistered peer on {}", connection);
         }
         result
     }
@@ -342,7 +343,7 @@ where
     async fn handle_incoming_message(
         inner: &Arc<Inner<SE, PA>>,
         msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
-        peer_sender: &mut Option<WebsocketPeerSender>,
+        handshake: &mut Handshake,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
         sink: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -351,8 +352,12 @@ where
     ) -> Result<MessageResult> {
         match msg {
             Some(Ok(Message::Binary(data))) => match bincode::deserialize(&data) {
+                Ok(proto::Message::Challenge(server_challenge)) => {
+                    handshake.server_challenge = Some(server_challenge);
+                    Ok(MessageResult::Continue)
+                }
                 Ok(proto::Message::Presence(server_presence)) => {
-                    match Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx, sink).await {
+                    match Self::handle_server_presence(inner, server_presence, handshake, outgoing_rx, sink).await {
                         Ok(()) => Ok(MessageResult::Continue),
                         Err(rejection) => {
                             // Only protocol mismatches have a wire rejection.
@@ -368,17 +373,17 @@ where
                 }
                 Ok(proto::Message::PresenceRejected(rejection)) => Err(PeerConnectionError::Protocol(rejection).into()),
                 Ok(proto::Message::PeerMessage(node_msg)) => {
-                    if peer_sender.is_none() {
+                    let Some(connection) = handshake.connection else {
                         // Application traffic before a compatible Presence:
                         // negotiation has not admitted this server, so nothing
                         // it says may reach the node.
                         return Err(anyhow!("server {} sent application traffic before presence negotiation completed", inner.server_url));
-                    }
-                    Self::handle_peer_message(inner, node_msg).await;
+                    };
+                    Self::handle_peer_message(inner, connection, node_msg).await;
                     Ok(MessageResult::Continue)
                 }
                 Err(e) => {
-                    if peer_sender.is_none() {
+                    if handshake.connection.is_none() {
                         // A handshake we cannot read will never establish; close
                         // instead of idling on a dead connection.
                         return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
@@ -424,46 +429,62 @@ where
 
     async fn handle_server_presence(
         inner: &Arc<Inner<SE, PA>>,
-        server_presence: proto::Presence,
-        peer_sender: &mut Option<WebsocketPeerSender>,
+        server_presence: proto::SignedPresence,
+        handshake: &mut Handshake,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
         sink: &mut futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
             Message,
         >,
     ) -> Result<()> {
-        info!("Received server presence: {}", server_presence.node_id);
+        info!("Received server presence: {}", server_presence.presence.node_id());
 
-        if peer_sender.is_some() {
+        if handshake.connection.is_some() {
             warn!("Ignoring duplicate server presence");
             return Ok(());
         }
 
-        let (sender, rx) = WebsocketPeerSender::new(server_presence.node_id);
-        inner.node.register_peer(server_presence.clone(), Box::new(sender.clone())).await?;
+        let (sender, rx) = WebsocketPeerSender::new(server_presence.presence.node_id());
+        handshake.connection =
+            Some(inner.node.register_peer(Dialing, &handshake.challenge, server_presence.clone(), Box::new(sender)).await?);
 
         *outgoing_rx = Some(rx);
-        *peer_sender = Some(sender);
+        // register_peer runs first so the client rejects a server for an incompatible protocol version,
+        // even if the server sends no challenge.
+        let server_challenge =
+            handshake.server_challenge.ok_or_else(|| anyhow!("server {} sent its presence before its challenge", inner.server_url))?;
 
         // Advertise our system only after admission, so an old cached root cannot preempt adoption.
-        let presence = proto::Message::Presence(inner.node.presence().await.map_err(PeerConnectionError::from)?);
+        let presence = proto::Message::Presence(inner.node.presence(Dialing, &server_challenge).await.map_err(PeerConnectionError::from)?);
         sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
 
         inner.connected.store(true, Ordering::Release);
-        inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
+        inner
+            .connection_state
+            .set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence: server_presence.presence });
         info!("Successfully connected to server {}", inner.server_url);
         Ok(())
     }
 
-    async fn handle_peer_message(inner: &Arc<Inner<SE, PA>>, node_msg: proto::NodeMessage) {
+    async fn handle_peer_message(inner: &Arc<Inner<SE, PA>>, connection: ConnectionId, node_msg: proto::NodeMessage) {
         debug!("Received peer message");
         let node = inner.node.clone();
         tokio::spawn(async move {
-            if let Err(e) = node.handle_message(node_msg).await {
+            if let Err(e) = node.handle_message(connection, node_msg).await {
                 warn!("Error handling peer message: {}", e);
             }
         });
     }
+}
+
+/// The challenges and registered connection for one connection attempt.
+struct Handshake {
+    /// The challenge the server must include when signing its presence.
+    challenge: proto::Challenge,
+    /// The challenge this client includes when signing its presence.
+    server_challenge: Option<proto::Challenge>,
+    /// The node's connection to the server, once the node has registered it.
+    connection: Option<ConnectionId>,
 }
 
 #[derive(Debug)]

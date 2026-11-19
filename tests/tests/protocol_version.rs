@@ -16,19 +16,23 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 mod common;
 use common::{proto, start_test_server};
+use proto::ConnectionSide::{Accepting, Dialing};
 
 #[derive(Clone)]
-struct NullSender(proto::EntityId);
+struct NullSender;
 
 #[async_trait::async_trait]
 impl PeerSender for NullSender {
     fn send_message(&self, _message: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-fn presence(protocol_version: u32) -> proto::Presence {
-    proto::Presence { node_id: proto::EntityId::random(), durable: false, system_root: None, protocol_version }
+/// A presence with a zeroed signature for tests that reject malformed messages or incompatible protocol versions.
+fn unsigned_presence(durable: bool, protocol_version: u32) -> proto::SignedPresence {
+    proto::SignedPresence {
+        presence: proto::Presence { key: proto::PublicKey::Ed25519([7; 32]), durable, system_root: None, protocol_version },
+        signature: proto::Signature::Ed25519 { r: [0; 32], s: [0; 32] },
+    }
 }
 
 /// The core enforcement point: register_peer refuses incompatible versions
@@ -37,19 +41,22 @@ fn presence(protocol_version: u32) -> proto::Presence {
 async fn register_peer_refuses_incompatible_version() -> Result<()> {
     let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
+    let challenge = proto::Challenge::random();
+
     for bad_version in [0, proto::PROTOCOL_VERSION + 1] {
-        let p = presence(bad_version);
-        let peer_id = p.node_id;
-        let err = node.register_peer(p, Box::new(NullSender(peer_id))).await.expect_err("must refuse");
+        let err = node
+            .register_peer(Accepting, &challenge, unsigned_presence(false, bad_version), Box::new(NullSender))
+            .await
+            .expect_err("must refuse");
         assert_eq!(
             err,
             PeerConnectionError::Protocol(proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: bad_version })
         );
     }
 
-    let p = presence(proto::PROTOCOL_VERSION);
-    let peer_id = p.node_id;
-    node.register_peer(p, Box::new(NullSender(peer_id))).await.expect("current version must be accepted");
+    let peer = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let presence = peer.presence(Dialing, &challenge).await?;
+    node.register_peer(Accepting, &challenge, presence, Box::new(NullSender)).await.expect("current version must be accepted");
     Ok(())
 }
 
@@ -81,7 +88,7 @@ async fn server_refuses_unreadable_handshake() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let (_server_node, server_url, server_task) = start_test_server().await?;
 
-    let mut frame = bincode::serialize(&proto::Message::Presence(presence(proto::PROTOCOL_VERSION)))?;
+    let mut frame = bincode::serialize(&proto::Message::Presence(unsigned_presence(false, proto::PROTOCOL_VERSION)))?;
     frame.pop();
 
     exchange_until_close(&server_url, frame).await?;
@@ -96,7 +103,7 @@ async fn server_refuses_mismatched_version() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let (_server_node, server_url, server_task) = start_test_server().await?;
 
-    let frame = bincode::serialize(&proto::Message::Presence(presence(999)))?;
+    let frame = bincode::serialize(&proto::Message::Presence(unsigned_presence(false, 999)))?;
     let received = exchange_until_close(&server_url, frame).await?;
 
     let rejection = received
@@ -112,28 +119,24 @@ async fn server_refuses_mismatched_version() -> Result<()> {
     Ok(())
 }
 
-/// A legacy browser client waits for the server Presence before sending its
-/// own. A durable versioned Presence is undecodable by that client, so it remains
-/// silent; the server must still bound the incomplete handshake.
+/// The server closes connections whose peers do not answer the challenge before the handshake deadline.
 #[tokio::test(start_paused = true)]
-async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
+async fn server_closes_a_client_that_never_answers_its_challenge() -> Result<()> {
     let (_server_node, server_url, server_task) = start_test_server().await?;
     let (ws, _) = tokio_tungstenite::connect_async(format!("{}/ws", server_url)).await?;
     let (_sink, mut stream) = ws.split();
 
-    let server_presence = loop {
+    loop {
         match stream.next().await {
             Some(Ok(WsMessage::Binary(data))) => match bincode::deserialize::<proto::Message>(&data)? {
-                proto::Message::Presence(presence) => break presence,
-                other => panic!("server sent {other:?} before its presence"),
+                proto::Message::Challenge(_) => break,
+                other => panic!("server sent {other:?} before its challenge"),
             },
-            Some(Ok(other)) => panic!("server sent {other:?} before its presence"),
+            Some(Ok(other)) => panic!("server sent {other:?} before its challenge"),
             Some(Err(e)) => return Err(e.into()),
-            None => panic!("server closed before sending its presence"),
+            None => panic!("server closed before sending its challenge"),
         }
-    };
-    assert!(server_presence.durable, "test server must reproduce the durable Presence shape");
-    assert!(server_presence.system_root.is_some(), "durable Presence must carry the versioned system-root state");
+    }
 
     // Send nothing. Advancing beyond the production deadline keeps this test
     // deterministic and avoids adding ten seconds to the native test suite.
@@ -176,7 +179,7 @@ async fn client_refuses_peer_message_before_presence() -> Result<()> {
         let (mut sink, mut stream) = ws.split();
 
         let early = proto::Message::PeerMessage(proto::NodeMessage::UnsubscribeQuery {
-            from: proto::EntityId::random(),
+            from: proto::NodeId::from_bytes([7; 32]),
             query_id: proto::QueryId::new(),
         });
         sink.send(WsMessage::Binary(bincode::serialize(&early).unwrap().into())).await.expect("send");
@@ -188,10 +191,11 @@ async fn client_refuses_peer_message_before_presence() -> Result<()> {
             match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
                 Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) => break true,
                 Ok(Some(Ok(WsMessage::Binary(data)))) => {
-                    // The client's own Presence (and a possible rejection
-                    // notice) are handshake chatter, not session traffic.
+                    // The client's challenge, presence and rejection messages belong to the handshake.
                     match bincode::deserialize::<proto::Message>(&data) {
-                        Ok(proto::Message::Presence(_)) | Ok(proto::Message::PresenceRejected(_)) => continue,
+                        Ok(proto::Message::Challenge(_)) | Ok(proto::Message::Presence(_)) | Ok(proto::Message::PresenceRejected(_)) => {
+                            continue
+                        }
                         other => {
                             eprintln!("client continued the session instead of closing: {other:?}");
                             break false;
@@ -237,7 +241,7 @@ async fn client_refuses_mismatched_server_without_hot_loop() -> Result<()> {
         let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
         let (mut sink, mut stream) = ws.split();
 
-        let doctored = proto::Presence { node_id: proto::EntityId::random(), durable: true, system_root: None, protocol_version: 999 };
+        let doctored = unsigned_presence(true, 999);
         sink.send(WsMessage::Binary(bincode::serialize(&proto::Message::Presence(doctored)).unwrap().into())).await.expect("send");
 
         let mut saw_rejection = None;

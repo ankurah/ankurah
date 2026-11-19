@@ -139,7 +139,7 @@ pub use ankurah_derive as derive;
 pub use ankurah_proto as proto;
 pub use ankurah_signals as signals;
 
-pub use proto::{EntityId, ModelId, PropertyId};
+pub use proto::{EntityId, ModelId, NodeId, PropertyId};
 // Re-export commonly used types
 pub use ankurah_core::{
     changes,
@@ -149,7 +149,7 @@ pub use ankurah_core::{
     model,
     model::View,
     model::{Model, Mutable},
-    node::{CachePolicy, MatchArgs, Node, NodeState, Replication, ReplicationState},
+    node::{CachePolicy, MatchArgs, Node, NodeKey, NodeState, Replication, ReplicationState},
     policy::{self, PermissiveAgent},
     property::{self, Property, Ref},
     query_value::QueryValue,

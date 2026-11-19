@@ -24,7 +24,7 @@ pub struct Context(pub(crate) Arc<dyn DynContextInner + Send + Sync + 'static>);
 #[wasm_bindgen]
 impl Context {
     #[wasm_bindgen(js_name = "node_id")]
-    pub fn js_node_id(&self) -> proto::EntityId { self.0.node_id() }
+    pub fn js_node_id(&self) -> Option<proto::NodeId> { self.0.node_id() }
 }
 
 // Generic methods cannot cross the wasm_bindgen boundary; they live in this
@@ -69,7 +69,8 @@ impl Context {
         Self(Arc::new(ContextInner { node: NodeHandle::Weak(node.weak()), auth: ContextAuth::Sessions(sessions) }))
     }
 
-    pub fn node_id(&self) -> proto::EntityId { self.0.node_id() }
+    /// The node's id, or `None` while the node is unkeyed.
+    pub fn node_id(&self) -> Option<proto::NodeId> { self.0.node_id() }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         use crate::model::Model;

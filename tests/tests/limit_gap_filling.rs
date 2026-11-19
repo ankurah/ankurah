@@ -33,8 +33,12 @@ async fn ordered_queries_use_validated_bindings_before_catalog_subscription_deli
         if offline {
             assert_eq!(client_ctx.fetch::<AlbumView>("true").await?.len(), 5);
             drop(connection);
-            client.deregister_peer(server.id);
-            server.deregister_peer(client.id);
+            for connection in client.connections_of(server.id().unwrap()) {
+                client.deregister_peer(connection);
+            }
+            for connection in server.connections_of(client.id().unwrap()) {
+                server.deregister_peer(connection);
+            }
             let query = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 client_ctx.query_wait::<AlbumView>("true ORDER BY year DESC LIMIT 2"),

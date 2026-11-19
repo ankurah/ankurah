@@ -6,7 +6,7 @@
 //! model crate in the build UniFFI bindings, which need a scaffolding of their own. Run its tests
 //! with `cargo test -p ankurah-tests-uniffi`.
 
-use ankurah::{EntityId, Model, Ref};
+use ankurah::{EntityId, Model, NodeId, Ref};
 use serde::{Deserialize, Serialize};
 
 uniffi::setup_scaffolding!();
@@ -26,4 +26,10 @@ pub struct Album {
     pub producer: Option<Ref<Artist>>,
     pub label: EntityId,
     pub distributor: Option<EntityId>,
+}
+
+/// An endorsement names a node by its node id.
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Endorsement {
+    pub endorsed: NodeId,
 }

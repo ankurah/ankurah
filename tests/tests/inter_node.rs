@@ -289,7 +289,7 @@ async fn test_client_server_propagation() -> Result<()> {
     let client_a = client_a.context(c)?;
     let client_b = client_b.context(c)?;
 
-    info!("Server: {}, client_a: {}, client_b: {}", server.node_id(), client_a.node_id(), client_b.node_id());
+    info!("Server: {}, client_a: {}, client_b: {}", server.node_id().unwrap(), client_a.node_id().unwrap(), client_b.node_id().unwrap());
 
     // Create an entity on client_a
     {
