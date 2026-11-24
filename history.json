@@ -56760,9 +56760,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45074399584-1",
+        "id": "45380159710-1",
         "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-22T21:52:07.172592+00:00"
+        "recorded_at": "2026-11-24T11:01:25.783702+00:00"
       },
       "markers": [
         {
@@ -56771,7 +56771,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/537"
         }
       ],
-      "retry_after": "2026-11-23T21:52:07.172592+00:00",
+      "retry_after": "2026-11-25T11:01:25.783702+00:00",
       "source": {
         "committed_at": "2026-11-12T21:28:47-08:00",
         "label": "PR #537",
@@ -56785,9 +56785,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45074401973-1",
-        "reason": "Some benchmark targets remain incomplete",
-        "recorded_at": "2026-11-22T21:51:52.666056+00:00"
+        "id": "45380164251-1",
+        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
+        "recorded_at": "2026-11-24T11:01:33.488623+00:00"
       },
       "markers": [
         {
@@ -56796,7 +56796,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/538"
         }
       ],
-      "retry_after": "2026-11-23T21:51:52.666056+00:00",
+      "retry_after": "2026-11-25T11:01:33.488623+00:00",
       "source": {
         "committed_at": "2026-11-13T01:20:45-08:00",
         "label": "PR #538",
@@ -56810,9 +56810,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45074404083-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-22T21:52:01.852097+00:00"
+        "id": "45380168527-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-24T11:01:27.228822+00:00"
       },
       "markers": [
         {
@@ -56821,7 +56821,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/539"
         }
       ],
-      "retry_after": "2026-11-23T21:52:01.852097+00:00",
+      "retry_after": "2026-11-25T11:01:27.228822+00:00",
       "source": {
         "committed_at": "2026-11-13T16:34:41-08:00",
         "label": "PR #539",
@@ -56835,9 +56835,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45074405941-1",
+        "id": "45380173493-1",
         "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-22T21:51:57.899699+00:00"
+        "recorded_at": "2026-11-24T11:01:29.455651+00:00"
       },
       "markers": [
         {
@@ -56846,7 +56846,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/540"
         }
       ],
-      "retry_after": "2026-11-23T21:51:57.899699+00:00",
+      "retry_after": "2026-11-25T11:01:29.455651+00:00",
       "source": {
         "committed_at": "2026-11-16T18:58:44-08:00",
         "label": "PR #540",
@@ -56860,9 +56860,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45074408060-1",
+        "id": "45380177587-1",
         "reason": "Some benchmark targets remain incomplete",
-        "recorded_at": "2026-11-22T21:51:48.406620+00:00"
+        "recorded_at": "2026-11-24T11:01:40.771920+00:00"
       },
       "markers": [
         {
@@ -56871,7 +56871,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/542"
         }
       ],
-      "retry_after": "2026-11-23T21:51:48.406620+00:00",
+      "retry_after": "2026-11-25T11:01:40.771920+00:00",
       "source": {
         "committed_at": "2026-11-18T14:56:01-08:00",
         "label": "PR #542",
