@@ -25248,8 +25248,7 @@
     {
       "id": "ankurah-digest-tree/digest",
       "package": "ankurah-digest-tree",
-      "reason": "Cannot compile digest with this instrument/compiler; inspect durable diagnostics",
-      "status": "failed",
+      "status": "registered",
       "target": "digest",
       "workloads": [
         {
@@ -25307,8 +25306,7 @@
     {
       "id": "ankurah-digest-tree/tree",
       "package": "ankurah-digest-tree",
-      "reason": "Cannot compile tree with this instrument/compiler; inspect durable diagnostics",
-      "status": "failed",
+      "status": "registered",
       "target": "tree",
       "workloads": [
         {
