@@ -1,0 +1,10 @@
+{
+  "ankurah-digest-tree/digest": {
+    "build_log": "error: cannot specify features for packages outside of workspace\n",
+    "log_truncated": false
+  },
+  "ankurah-digest-tree/tree": {
+    "build_log": "error: cannot specify features for packages outside of workspace\n",
+    "log_truncated": false
+  }
+}
