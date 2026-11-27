@@ -25383,8 +25383,7 @@
     {
       "id": "ankurah-digest-tree/digest",
       "package": "ankurah-digest-tree",
-      "reason": "Cannot compile digest with this instrument/compiler; inspect durable diagnostics",
-      "status": "failed",
+      "status": "registered",
       "target": "digest",
       "workloads": [
         {
@@ -25442,8 +25441,7 @@
     {
       "id": "ankurah-digest-tree/tree",
       "package": "ankurah-digest-tree",
-      "reason": "Cannot compile tree with this instrument/compiler; inspect durable diagnostics",
-      "status": "failed",
+      "status": "registered",
       "target": "tree",
       "workloads": [
         {
@@ -59752,9 +59750,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793603388-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:36.292837+00:00"
+        "id": "45999694189-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:32.209129+00:00"
       },
       "markers": [
         {
@@ -59763,7 +59761,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/526"
         }
       ],
-      "retry_after": "2026-11-27T09:37:36.292837+00:00",
+      "retry_after": "2026-11-28T12:34:32.209129+00:00",
       "source": {
         "committed_at": "2026-10-13T13:36:22-07:00",
         "label": "PR #526",
@@ -59777,9 +59775,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793607155-1",
-        "reason": "Some benchmark targets remain incomplete",
-        "recorded_at": "2026-11-26T09:37:35.223393+00:00"
+        "id": "45999697270-1",
+        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
+        "recorded_at": "2026-11-27T12:34:40.372456+00:00"
       },
       "markers": [
         {
@@ -59788,7 +59786,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/527"
         }
       ],
-      "retry_after": "2026-11-27T09:37:35.223393+00:00",
+      "retry_after": "2026-11-28T12:34:40.372456+00:00",
       "source": {
         "committed_at": "2026-10-13T17:31:27-07:00",
         "label": "PR #527",
@@ -59802,9 +59800,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793610059-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:35.138625+00:00"
+        "id": "45999700701-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:45.340446+00:00"
       },
       "markers": [
         {
@@ -59813,7 +59811,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/528"
         }
       ],
-      "retry_after": "2026-11-27T09:37:35.138625+00:00",
+      "retry_after": "2026-11-28T12:34:45.340446+00:00",
       "source": {
         "committed_at": "2026-10-14T14:29:04-07:00",
         "label": "PR #528",
@@ -59827,9 +59825,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793613450-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:40.479068+00:00"
+        "id": "45999703611-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:42.325705+00:00"
       },
       "markers": [
         {
@@ -59838,7 +59836,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/530"
         }
       ],
-      "retry_after": "2026-11-27T09:37:40.479068+00:00",
+      "retry_after": "2026-11-28T12:34:42.325705+00:00",
       "source": {
         "committed_at": "2026-10-29T10:56:55-07:00",
         "label": "PR #530",
@@ -59852,9 +59850,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793617236-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:49.240680+00:00"
+        "id": "45999706507-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:49.678908+00:00"
       },
       "markers": [
         {
@@ -59863,7 +59861,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/531"
         }
       ],
-      "retry_after": "2026-11-27T09:37:49.240680+00:00",
+      "retry_after": "2026-11-28T12:34:49.678908+00:00",
       "source": {
         "committed_at": "2026-10-29T13:25:26-07:00",
         "label": "PR #531",
@@ -59877,9 +59875,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793620078-1",
+        "id": "45999709644-1",
         "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:42.623628+00:00"
+        "recorded_at": "2026-11-27T12:34:44.324772+00:00"
       },
       "markers": [
         {
@@ -59888,7 +59886,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/532"
         }
       ],
-      "retry_after": "2026-11-27T09:37:42.623628+00:00",
+      "retry_after": "2026-11-28T12:34:44.324772+00:00",
       "source": {
         "committed_at": "2026-11-05T13:29:34-08:00",
         "label": "PR #532",
@@ -59902,9 +59900,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793622933-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:39.468066+00:00"
+        "id": "45999712497-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:41.546593+00:00"
       },
       "markers": [
         {
@@ -59913,7 +59911,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/533"
         }
       ],
-      "retry_after": "2026-11-27T09:37:39.468066+00:00",
+      "retry_after": "2026-11-28T12:34:41.546593+00:00",
       "source": {
         "committed_at": "2026-11-06T02:03:47-08:00",
         "label": "PR #533",
@@ -59927,9 +59925,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793626449-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:49.464301+00:00"
+        "id": "45999715767-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:45.721756+00:00"
       },
       "markers": [
         {
@@ -59938,7 +59936,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/534"
         }
       ],
-      "retry_after": "2026-11-27T09:37:49.464301+00:00",
+      "retry_after": "2026-11-28T12:34:45.721756+00:00",
       "source": {
         "committed_at": "2026-11-08T13:52:12-08:00",
         "label": "PR #534",
@@ -59952,9 +59950,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793629431-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:50.103831+00:00"
+        "id": "45999719387-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:39.579617+00:00"
       },
       "markers": [
         {
@@ -59963,7 +59961,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/535"
         }
       ],
-      "retry_after": "2026-11-27T09:37:50.103831+00:00",
+      "retry_after": "2026-11-28T12:34:39.579617+00:00",
       "source": {
         "committed_at": "2026-11-10T12:38:30-08:00",
         "label": "PR #535",
@@ -59977,9 +59975,9 @@
       "harness_sha256": "b6389e106779cc88e06b5d67f25cfc30924d6b57487d9e6f5252d0f0419559c0",
       "kind": "hosted",
       "last_failure": {
-        "id": "45793632477-1",
-        "reason": "No benchmark target completed; inspect target results and durable diagnostics",
-        "recorded_at": "2026-11-26T09:37:47.507885+00:00"
+        "id": "45999722766-1",
+        "reason": "Some benchmark targets remain incomplete",
+        "recorded_at": "2026-11-27T12:34:48.876505+00:00"
       },
       "markers": [
         {
@@ -59988,7 +59986,7 @@
           "url": "https://github.com/ankurah/ankurah/pull/536"
         }
       ],
-      "retry_after": "2026-11-27T09:37:47.507885+00:00",
+      "retry_after": "2026-11-28T12:34:48.876505+00:00",
       "source": {
         "committed_at": "2026-11-10T19:49:05-08:00",
         "label": "PR #536",
